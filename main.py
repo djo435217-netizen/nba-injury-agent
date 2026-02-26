@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import requests
@@ -8,64 +9,54 @@ from twilio.rest import Client
 STATE_FILE = "state.json"
 ET = ZoneInfo("America/New_York")
 
-# ---------- REQUIRED ENV ----------
+# -------------------- REQUIRED ENV --------------------
 TWILIO_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 SPORTRADAR_KEY = os.environ["SPORTRADAR_API_KEY"]
-
-# NEW: BallDontLie API key (GOAT tier is perfect)
-BALLDONTLIE_API_KEY = os.environ.get("BALLDONTLIE_API_KEY", "").strip()
+BALLDONTLIE_API_KEY = os.environ["BALLDONTLIE_API_KEY"].strip()
 
 FROM_WHATSAPP = os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
 TO_WHATSAPP = f"whatsapp:{os.environ['MY_WHATSAPP_NUMBER']}"
 
 twilio = Client(TWILIO_SID, TWILIO_TOKEN)
 
-# ---------- TUNABLE ENV ----------
+# -------------------- CONFIG (ENV) --------------------
 TEST_MODE = os.environ.get("TEST_MODE", "0") == "1"
 MAX_BODY_CHARS = 1500
-MAX_PLAYERS_PER_TEAM = int(os.environ.get("MAX_PLAYERS_PER_TEAM", "50"))
 
-# Impact alerts
-IMPACT_STATUSES_RAW = os.environ.get("IMPACT_STATUSES", "out,doubtful,questionable")
+# Which injury statuses should trigger bet logic
+IMPACT_STATUSES_RAW = os.environ.get("IMPACT_STATUSES", "out,doubtful").strip()
 IMPACT_STATUSES = {x.strip().lower() for x in IMPACT_STATUSES_RAW.split(",") if x.strip()}
 IMPACT_ONLY_CHANGES = os.environ.get("IMPACT_ONLY_CHANGES", "1") == "1"
 
-# Summaries
-SUMMARY_TIMES_ET_RAW = os.environ.get("SUMMARY_TIMES_ET", "10:00,17:00").strip()
-SUMMARY_TIMES_ET = [t.strip() for t in SUMMARY_TIMES_ET_RAW.split(",") if t.strip()]
-SUMMARY_WINDOW_START_ET = int(os.environ.get("SUMMARY_WINDOW_START_ET", "0"))
-SUMMARY_WINDOW_END_ET = int(os.environ.get("SUMMARY_WINDOW_END_ET", "24"))
-FORCE_FULL = os.environ.get("FORCE_FULL", "0") == "1"
+# Betting / props
+BOOK_VENDOR = os.environ.get("BOOK_VENDOR", "fanduel").strip().lower()
+PROP_TYPE = os.environ.get("PROP_TYPE", "points").strip().lower()  # points only for now
+EDGE_THRESHOLD = float(os.environ.get("EDGE_THRESHOLD", "1.0"))     # proj - line >= this
+LOOKBACK_GAMES = int(os.environ.get("LOOKBACK_GAMES", "10"))
+TOPN_CANDIDATES = int(os.environ.get("TOPN_CANDIDATES", "4"))       # evaluate top N teammates
+MAX_BET_IDEAS = int(os.environ.get("MAX_BET_IDEAS", "8"))
 
-# Burst window
+# Candidate ranking weights (points-prop)
+W_PPM = float(os.environ.get("W_PPM", "1.0"))       # points-per-minute
+W_MIN = float(os.environ.get("W_MIN", "0.18"))      # minutes stability
+
+# Pre-tip burst ping if no edges (optional)
+SEND_NO_EDGE_PING = os.environ.get("SEND_NO_EDGE_PING", "0") == "1"
 BURST_START_ET = os.environ.get("BURST_START_ET", "17:00").strip()
 BURST_END_ET = os.environ.get("BURST_END_ET", "22:30").strip()
-BURST_FULL_SUMMARY_EVERY_MIN = int(os.environ.get("BURST_FULL_SUMMARY_EVERY_MIN", "60"))
 
-# Auto beneficiaries toggle (default ON if key exists)
-AUTO_BENEFICIARIES = os.environ.get("AUTO_BENEFICIARIES", "1") == "1"
-AUTO_BENEFICIARIES_TOPN = int(os.environ.get("AUTO_BENEFICIARIES_TOPN", "3"))
-AUTO_BENEFICIARIES_GAMES = int(os.environ.get("AUTO_BENEFICIARIES_GAMES", "10"))
+# Safety caps
+BDL_PER_PAGE = int(os.environ.get("BDL_PER_PAGE", "100"))
+BDL_MAX_PAGES = int(os.environ.get("BDL_MAX_PAGES", "10"))
 
-# Weighting for ranking (points-heavy since you bet points)
-BEN_PTS_W = float(os.environ.get("BEN_PTS_W", "1.0"))
-BEN_MIN_W = float(os.environ.get("BEN_MIN_W", "0.15"))
-
-# Safety caps (avoid runaway API calls)
-BDL_MAX_PAGES = int(os.environ.get("BDL_MAX_PAGES", "8"))
-BDL_PER_PAGE = int(os.environ.get("BDL_PER_PAGE", "100"))  # max 100 per docs
-
-
-# ---------- HELPERS ----------
-def _now_et():
+# -------------------- UTILS --------------------
+def _now_et() -> datetime:
     return datetime.now(ET)
-
 
 def _time_to_minutes(hhmm: str) -> int:
     h, m = hhmm.split(":")
     return int(h) * 60 + int(m)
-
 
 def _in_burst_window(now_et: datetime) -> bool:
     start = _time_to_minutes(BURST_START_ET)
@@ -73,36 +64,53 @@ def _in_burst_window(now_et: datetime) -> bool:
     cur = now_et.hour * 60 + now_et.minute
     return start <= cur <= end
 
-
-def _season_year_for_ball_dont_lie(now_et: datetime) -> int:
-    # NBA season year convention: Oct -> next spring, so Feb 2026 is season 2025
+def _season_year(now_et: datetime) -> int:
+    # Feb 2026 belongs to 2025 season
     return now_et.year if now_et.month >= 10 else now_et.year - 1
 
+def _parse_minutes(min_str) -> float:
+    if not min_str:
+        return 0.0
+    s = str(min_str)
+    if ":" in s:
+        try:
+            mm, ss = s.split(":", 1)
+            return float(mm) + float(ss) / 60.0
+        except Exception:
+            return 0.0
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+def _clean_name(s: str) -> str:
+    # Normalize suffixes + punctuation for matching
+    s = (s or "").strip()
+    s = re.sub(r"\.", "", s)
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace("’", "'")
+    return s.lower()
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {"__meta__": {}, "players": {}}
+        return {"players": {}}
     try:
         with open(STATE_FILE, "r") as f:
             raw = json.load(f)
         if isinstance(raw, dict) and "players" in raw:
-            raw.setdefault("__meta__", {})
             return raw
         if isinstance(raw, dict):
-            return {"__meta__": {}, "players": raw}
-        return {"__meta__": {}, "players": {}}
+            return {"players": raw}
+        return {"players": {}}
     except Exception:
-        return {"__meta__": {}, "players": {}}
-
+        return {"players": {}}
 
 def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2, sort_keys=True)
 
-
 def send_one(body: str):
     twilio.messages.create(from_=FROM_WHATSAPP, to=TO_WHATSAPP, body=body[:MAX_BODY_CHARS])
-
 
 def send_chunked(full_text: str):
     if len(full_text) <= MAX_BODY_CHARS:
@@ -111,7 +119,6 @@ def send_chunked(full_text: str):
 
     parts = []
     remaining = full_text
-
     while len(remaining) > MAX_BODY_CHARS:
         cut = remaining.rfind("\n", 0, MAX_BODY_CHARS)
         if cut < 200:
@@ -129,35 +136,25 @@ def send_chunked(full_text: str):
             p = p[: MAX_BODY_CHARS - len(header)]
         send_one(header + p)
 
-
+# -------------------- SPORTRADAR --------------------
 def fetch_sportradar_injuries():
     url = "https://api.sportradar.com/nba/trial/v8/en/league/injuries.json"
     r = requests.get(url, params={"api_key": SPORTRADAR_KEY}, timeout=20)
-
     if r.status_code != 200:
         raise RuntimeError(f"Sportradar error {r.status_code}: {r.text[:300]}")
-
-    content_type = (r.headers.get("Content-Type") or "").lower()
-    if "json" not in content_type:
-        raise RuntimeError(f"Unexpected content-type: {content_type}. Body: {r.text[:300]}")
-
+    ct = (r.headers.get("Content-Type") or "").lower()
+    if "json" not in ct:
+        raise RuntimeError(f"Unexpected content-type: {ct}. Body: {r.text[:300]}")
     return r.json()
 
-
-def parse_teams_and_injuries(data):
-    injuries_by_team = {}
+def parse_injuries(data):
     flat_by_player = {}
-
     for team in data.get("teams", []):
-        # Sportradar team usually has "name" like "Knicks"
         team_name = team.get("name") or team.get("market") or team.get("id", "TEAM")
-        injuries_by_team.setdefault(team_name, [])
-
         for p in team.get("players", []):
             injuries = p.get("injuries") or []
             if not injuries:
                 continue
-
             inj = injuries[-1]
             pid = p.get("id")
             if not pid:
@@ -167,263 +164,183 @@ def parse_teams_and_injuries(data):
             status = (inj.get("status") or "Unknown").strip()
             detail = (inj.get("comment") or inj.get("description") or "").strip()
 
-            player_obj = {"id": pid, "name": name, "team": team_name, "status": status, "detail": detail}
-            injuries_by_team[team_name].append(player_obj)
             flat_by_player[pid] = {"name": name, "team": team_name, "status": status, "detail": detail}
-
-    team_order = sorted(injuries_by_team.keys())
-    for t in team_order:
-        injuries_by_team[t].sort(key=lambda x: (x["name"] or ""))
-
-    return team_order, injuries_by_team, flat_by_player
-
-
-def format_team_summary(team_order, injuries_by_team):
-    lines = ["🏥 Full injury report (by team):"]
-    for team in team_order:
-        players = injuries_by_team.get(team, [])
-        if not players:
-            lines.append(f"\n{team}: No reported injuries")
-            continue
-
-        lines.append(f"\n{team}:")
-        for p in players[:MAX_PLAYERS_PER_TEAM]:
-            line = f"- {p['name']}: {p['status']}"
-            if p.get("detail"):
-                line += f" — {p['detail']}"
-            lines.append(line)
-
-        if len(players) > MAX_PLAYERS_PER_TEAM:
-            lines.append(f"- …and {len(players) - MAX_PLAYERS_PER_TEAM} more")
-
-    return "\n".join(lines)
-
+    return flat_by_player
 
 def status_in_scope(status: str) -> bool:
     return (status or "").strip().lower() in IMPACT_STATUSES
 
-
-def should_send_full_summary(meta, now_et: datetime) -> bool:
-    if FORCE_FULL:
-        return True
-
-    hour = now_et.hour
-    if not (SUMMARY_WINDOW_START_ET <= hour < SUMMARY_WINDOW_END_ET):
-        return False
-
-    hhmm = now_et.strftime("%H:%M")
-    if hhmm not in SUMMARY_TIMES_ET:
-        return False
-
-    sent = meta.get("sent_summaries", {})
-    today = now_et.strftime("%Y-%m-%d")
-    already = set(sent.get(today, []))
-    return hhmm not in already
-
-
-def mark_full_summary_sent(meta, now_et: datetime):
-    hhmm = now_et.strftime("%H:%M")
-    today = now_et.strftime("%Y-%m-%d")
-    meta.setdefault("sent_summaries", {})
-    meta["sent_summaries"].setdefault(today, [])
-    if hhmm not in meta["sent_summaries"][today]:
-        meta["sent_summaries"][today].append(hhmm)
-
-    keys = sorted(meta["sent_summaries"].keys())
-    if len(keys) > 7:
-        for k in keys[:-7]:
-            meta["sent_summaries"].pop(k, None)
-
-
-def should_send_burst_summary(meta, now_et: datetime) -> bool:
-    if BURST_FULL_SUMMARY_EVERY_MIN <= 0:
-        return False
-    if not _in_burst_window(now_et):
-        return False
-
-    key = "last_burst_summary_et"
-    last = meta.get(key)
-    cur_ts = int(now_et.timestamp())
-    if not last:
-        return True
-    return (cur_ts - int(last)) >= (BURST_FULL_SUMMARY_EVERY_MIN * 60)
-
-
-def mark_burst_summary_sent(meta, now_et: datetime):
-    meta["last_burst_summary_et"] = int(now_et.timestamp())
-
-
-def action_tag(prev_status: str | None, cur_status: str, now_et: datetime) -> str:
-    cs = (cur_status or "").strip().lower()
-    ps = (prev_status or "").strip().lower() if prev_status else ""
-
-    if ps == "questionable" and cs == "out":
-        return "HIT NOW (Q→OUT)"
-    if cs in {"out", "doubtful"} and _in_burst_window(now_et):
-        return "HIT NOW"
-    if not prev_status and cs == "questionable":
-        return "WATCH"
-    if cs == "questionable":
-        return "WATCH"
-    if cs == "doubtful":
-        return "LEAN (monitor)"
-    if cs == "out":
-        return "ACTION"
-    return ""
-
-
-# ---------- BALLDONTLIE (AUTO BENEFICIARIES) ----------
-_BDL_TEAMS_CACHE = None  # name->id
-_BDL_HEADERS = None
-
-
-def _bdl_headers():
-    global _BDL_HEADERS
-    if _BDL_HEADERS is None:
-        _BDL_HEADERS = {"Authorization": BALLDONTLIE_API_KEY}
-    return _BDL_HEADERS
-
+# -------------------- BALLDONTLIE (ROBUST ROUTING) --------------------
+BDL_HEADERS = {"Authorization": BALLDONTLIE_API_KEY}
+# Try NBA namespace first, then fall back to legacy.
+BDL_PREFIXES = ["/nba", ""]
 
 def _bdl_get(path: str, params: dict | None = None, timeout: int = 20) -> dict:
-    url = f"https://api.balldontlie.io{path}"
-    r = requests.get(url, headers=_bdl_headers(), params=params or {}, timeout=timeout)
-    if r.status_code != 200:
-        raise RuntimeError(f"BallDontLie error {r.status_code}: {r.text[:300]}")
-    # BallDontLie returns JSON
-    return r.json()
-
-
-def _bdl_load_team_name_to_id():
-    global _BDL_TEAMS_CACHE
-    if _BDL_TEAMS_CACHE is not None:
-        return _BDL_TEAMS_CACHE
-
-    # docs show /v1/teams list endpoint
-    data = _bdl_get("/v1/teams", params={"per_page": 100})
-    teams = data.get("data") or []
-    m = {}
-    for t in teams:
-        # key by short name like "Knicks"
-        name = (t.get("name") or "").strip()
-        if name:
-            m[name] = int(t["id"])
-    _BDL_TEAMS_CACHE = m
-    return _BDL_TEAMS_CACHE
-
-
-def _parse_minutes_to_float(min_str: str | None) -> float:
-    # min can be "30" or "30:12" depending on feed; handle both
-    if not min_str:
-        return 0.0
-    s = str(min_str)
-    if ":" in s:
+    """
+    Tries /nba-prefixed routes first (if supported), then falls back to legacy.
+    """
+    last_err = None
+    for pref in BDL_PREFIXES:
+        url = f"https://api.balldontlie.io{pref}{path}"
         try:
-            mm, ss = s.split(":", 1)
-            return float(mm) + float(ss) / 60.0
-        except Exception:
-            return 0.0
-    try:
-        return float(s)
-    except Exception:
-        return 0.0
+            r = requests.get(url, headers=BDL_HEADERS, params=params or {}, timeout=timeout)
+            if r.status_code == 404:
+                last_err = f"404 {url}"
+                continue
+            if r.status_code != 200:
+                raise RuntimeError(f"BallDontLie error {r.status_code}: {r.text[:300]}")
+            return r.json()
+        except Exception as e:
+            last_err = str(e)
+            continue
+    raise RuntimeError(f"BallDontLie request failed for {path}. Last error: {last_err}")
 
+_TEAM_CACHE = None
 
-def _auto_boost_candidates(team_short_name: str, exclude_names_lower: set[str], now_et: datetime) -> list[str]:
+def bdl_team_name_to_id():
+    global _TEAM_CACHE
+    if _TEAM_CACHE is not None:
+        return _TEAM_CACHE
+    data = _bdl_get("/v1/teams", params={"per_page": 100})
+    m = {}
+    for t in data.get("data", []):
+        nm = (t.get("name") or "").strip()  # "Hawks", "Knicks", ...
+        if nm and t.get("id") is not None:
+            m[nm] = int(t["id"])
+    _TEAM_CACHE = m
+    return _TEAM_CACHE
+
+def bdl_active_roster(team_short: str) -> list[dict]:
     """
-    Returns top N teammates ranked by last N games points + minutes.
-    exclude_names_lower: set of lower-cased full names to exclude (injured players, etc.)
+    Returns list of player dicts for that team, TEAM-CORRECT (hard checked).
     """
-    if not (AUTO_BENEFICIARIES and BALLDONTLIE_API_KEY):
-        return []
-
-    name_to_id = _bdl_load_team_name_to_id()
-    team_id = name_to_id.get(team_short_name)
+    team_map = bdl_team_name_to_id()
+    team_id = team_map.get(team_short)
     if not team_id:
         return []
 
-    # Active players for team
-    # docs show /v1/players/active supports team_ids[] filters
     players = []
     cursor = None
     pages = 0
-
-    while pages < 5:  # players list is small; keep it tight
-        params = {"per_page": 100, "team_ids[]": team_id}
+    while pages < 5:
+        params = {
+            "per_page": 100,
+            "team_ids[]": [team_id],  # IMPORTANT: array param
+        }
         if cursor is not None:
             params["cursor"] = cursor
         resp = _bdl_get("/v1/players/active", params=params)
         chunk = resp.get("data") or []
         players.extend(chunk)
+
         meta = resp.get("meta") or {}
         cursor = meta.get("next_cursor")
         pages += 1
         if not cursor:
             break
 
-    # Build list of (player_id, full_name)
-    roster = []
+    # HARD CHECK team correctness
+    out = []
     for p in players:
-        pid = p.get("id")
-        fn = (p.get("first_name") or "").strip()
-        ln = (p.get("last_name") or "").strip()
-        full = (fn + " " + ln).strip()
-        if not pid or not full:
+        team = p.get("team") or {}
+        if (team.get("name") or "").strip() != team_short:
             continue
-        if full.lower() in exclude_names_lower:
-            continue
-        roster.append((int(pid), full))
+        out.append(p)
+    return out
 
+def bdl_find_player_id_on_team(team_short: str, full_name: str) -> int | None:
+    """
+    Best-effort match injured player name to BDL player on that team roster.
+    Handles suffixes (III), punctuation differences, etc.
+    """
+    roster = bdl_active_roster(team_short)
     if not roster:
-        return []
+        return None
 
-    # Pull stats in bulk for this roster for current season
-    season_year = _season_year_for_ball_dont_lie(now_et)
-    player_ids = [pid for pid, _ in roster]
+    target = _clean_name(full_name)
 
-    # We paginate /v1/stats until each player has enough games or pages cap reached
-    games_by_player = {pid: [] for pid in player_ids}
+    # Common normalization: remove suffix tokens for matching
+    def strip_suffix(n: str) -> str:
+        n = _clean_name(n)
+        n = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", "", n).strip()
+        n = re.sub(r"\s+", " ", n)
+        return n
+
+    t0 = strip_suffix(target)
+
+    # Exact-ish matches first
+    for p in roster:
+        pid = p.get("id")
+        nm = f"{p.get('first_name','')} {p.get('last_name','')}".strip()
+        if not pid or not nm:
+            continue
+        if strip_suffix(nm) == t0:
+            return int(pid)
+
+    # Fuzzy: last name match + first initial
+    # (works well for “Murphy III” vs “Trey Murphy”)
+    try:
+        t_parts = t0.split(" ")
+        t_first = t_parts[0] if t_parts else ""
+        t_last = t_parts[-1] if t_parts else ""
+        for p in roster:
+            pid = p.get("id")
+            nm = f"{p.get('first_name','')} {p.get('last_name','')}".strip()
+            if not pid or not nm:
+                continue
+            n0 = strip_suffix(nm)
+            n_parts = n0.split(" ")
+            n_first = n_parts[0] if n_parts else ""
+            n_last = n_parts[-1] if n_parts else ""
+            if n_last == t_last and n_first[:1] == t_first[:1]:
+                return int(pid)
+    except Exception:
+        pass
+
+    return None
+
+def bdl_last_n_games_stats(player_ids: list[int], season: int, n: int) -> dict[int, list[tuple[str, float, float]]]:
+    """
+    Returns dict: pid -> list[(date, pts, minutes)] for last n games.
+    """
+    out = {pid: [] for pid in player_ids}
+    if not player_ids:
+        return out
+
     cursor = None
     pages = 0
-
-    # NOTE: /v1/stats supports player_ids[] and seasons[] per docs
     while pages < BDL_MAX_PAGES:
         params = {
             "per_page": min(BDL_PER_PAGE, 100),
-            "seasons[]": season_year,
+            "seasons[]": [season],
+            "player_ids[]": player_ids,
         }
-        # add player_ids[] list
-        for pid in player_ids:
-            params.setdefault("player_ids[]", [])
-            params["player_ids[]"].append(pid)
-
         if cursor is not None:
             params["cursor"] = cursor
 
         resp = _bdl_get("/v1/stats", params=params)
         rows = resp.get("data") or []
 
-        # Collect
         for row in rows:
-            player_obj = row.get("player") or {}
-            pid = player_obj.get("id")
-            if not pid:
+            p = row.get("player") or {}
+            pid = p.get("id")
+            if pid is None:
                 continue
             pid = int(pid)
-            if pid not in games_by_player:
+            if pid not in out:
                 continue
 
             game = row.get("game") or {}
-            date = game.get("date")  # "YYYY-MM-DD"
-            pts = row.get("pts", 0) or 0
-            mins = _parse_minutes_to_float(row.get("min"))
-
+            date = game.get("date")
+            pts = float(row.get("pts", 0) or 0)
+            mins = _parse_minutes(row.get("min"))
             if date:
-                games_by_player[pid].append((date, float(pts), float(mins)))
+                out[pid].append((date, pts, mins))
 
-        # Stop early if everyone has enough games
+        # stop early if everyone has n
         done = True
         for pid in player_ids:
-            if len(games_by_player[pid]) < AUTO_BENEFICIARIES_GAMES:
+            if len(out[pid]) < n:
                 done = False
                 break
         if done:
@@ -435,129 +352,243 @@ def _auto_boost_candidates(team_short_name: str, exclude_names_lower: set[str], 
         if not cursor:
             break
 
-    # Score each player by last N games
-    scored = []
-    for pid, full in roster:
-        games = games_by_player.get(pid, [])
-        if not games:
-            continue
-        games.sort(key=lambda x: x[0])  # sort by date
-        last = games[-AUTO_BENEFICIARIES_GAMES:]
-        if not last:
-            continue
+    # finalize: sort by date and keep last n
+    for pid in player_ids:
+        g = out[pid]
+        g.sort(key=lambda x: x[0])
+        out[pid] = g[-n:]
+    return out
 
-        pts_avg = sum(x[1] for x in last) / len(last)
-        min_avg = sum(x[2] for x in last) / len(last)
-        score = (BEN_PTS_W * pts_avg) + (BEN_MIN_W * min_avg)
-        scored.append((score, pts_avg, min_avg, full))
+def bdl_games_today_ids(now_et: datetime) -> list[int]:
+    today = now_et.strftime("%Y-%m-%d")
+    resp = _bdl_get("/v1/games", params={"dates[]": [today], "per_page": 100})
+    return [int(g["id"]) for g in (resp.get("data") or []) if g.get("id") is not None]
+
+def bdl_player_props_points(game_id: int) -> list[dict]:
+    """
+    Uses the odds namespace for NBA if available.
+    (Docs show /nba/v2/odds and player props usage + vendors like fanduel.)  [oai_citation:1‡Balldontlie](https://www.balldontlie.io/blog/nba-prediction-markets-comparison/?utm_source=chatgpt.com)
+    """
+    params = {"game_id": game_id, "prop_type": "points", "vendors[]": [BOOK_VENDOR]}
+    # Note: We call /v2 here and let _bdl_get try /nba + fallback
+    resp = _bdl_get("/v2/odds/player_props", params=params)
+    return resp.get("data") or []
+
+def points_line_for_player(game_id: int, player_id: int) -> float | None:
+    for pp in bdl_player_props_points(game_id):
+        if int(pp.get("player_id", -1)) != int(player_id):
+            continue
+        if (pp.get("prop_type") or "").lower() != "points":
+            continue
+        market = pp.get("market") or {}
+        if (market.get("type") or "").lower() != "over_under":
+            continue
+        try:
+            return float(pp.get("line_value"))
+        except Exception:
+            return None
+    return None
+
+# -------------------- BETTING LOGIC --------------------
+def avg_pts_min(games: list[tuple[str, float, float]]) -> tuple[float, float]:
+    if not games:
+        return 0.0, 0.0
+    pts = sum(x[1] for x in games) / len(games)
+    mins = sum(x[2] for x in games) / len(games)
+    return pts, mins
+
+def build_team_bet_ideas(team_short: str, injured_name: str, injured_status: str,
+                         exclude_names_lower: set[str], now_et: datetime) -> list[dict]:
+    """
+    Produces bet ideas for this team from a single injury trigger.
+    """
+    season = _season_year(now_et)
+
+    # 1) roster + stats for roster
+    roster = bdl_active_roster(team_short)
+    if not roster:
+        return []
+
+    roster_tuples = []
+    for p in roster:
+        pid = p.get("id")
+        nm = f"{p.get('first_name','')} {p.get('last_name','')}".strip()
+        if pid is None or not nm:
+            continue
+        if _clean_name(nm) in exclude_names_lower:
+            continue
+        roster_tuples.append((int(pid), nm))
+
+    if not roster_tuples:
+        return []
+
+    # 2) injured player's vacated pts/min from last N games (best-effort match)
+    injured_pid = bdl_find_player_id_on_team(team_short, injured_name)
+    vac_pts, vac_min = 12.0, 26.0  # fallback conservative
+    if injured_pid is not None:
+        inj_stats = bdl_last_n_games_stats([injured_pid], season, LOOKBACK_GAMES).get(injured_pid, [])
+        ip, im = avg_pts_min(inj_stats)
+        # only trust if we have a few games
+        if len(inj_stats) >= max(3, LOOKBACK_GAMES // 3):
+            vac_pts, vac_min = ip, im
+
+    # 3) teammate stats
+    pids = [pid for pid, _ in roster_tuples]
+    stats = bdl_last_n_games_stats(pids, season, LOOKBACK_GAMES)
+
+    # 4) rank candidates by "absorption ability" (ppm + minutes stability)
+    scored = []
+    for pid, nm in roster_tuples:
+        g = stats.get(pid, [])
+        pts_avg, min_avg = avg_pts_min(g)
+        if min_avg < 8:  # ignore deep bench
+            continue
+        ppm = pts_avg / max(min_avg, 1e-6)
+        score = (W_PPM * ppm) + (W_MIN * min_avg)
+        scored.append((score, pid, nm, pts_avg, min_avg, ppm))
 
     scored.sort(reverse=True, key=lambda x: x[0])
-    top = [x[3] for x in scored[:AUTO_BENEFICIARIES_TOPN]]
-    return top
+    candidates = scored[:max(TOPN_CANDIDATES, 6)]
+    if not candidates:
+        return []
 
+    # 5) locate today's game(s) for this team by checking which games have candidate props listed
+    game_ids = bdl_games_today_ids(now_et)
+    relevant = []
+    cand_ids = {c[1] for c in candidates}
+    for gid in game_ids:
+        props = bdl_player_props_points(gid)
+        if any(int(pp.get("player_id", -1)) in cand_ids for pp in props):
+            relevant.append(gid)
 
-# ---------- ALERT BUILD ----------
-def build_impact_alerts(old_players, new_players, now_et: datetime):
-    """
-    League-wide betting-signal alerts + auto beneficiaries.
-    """
-    lines = []
+    if not relevant:
+        return []
 
-    # Build exclusion list from current injury report (anyone in new_players)
-    exclude_names_lower = {v.get("name", "").strip().lower() for v in new_players.values() if v.get("name")}
+    # 6) projection model: baseline pts_avg + share of vacated pts (dampened)
+    total_score = sum(c[0] for c in candidates) or 1.0
+    ideas = []
 
-    def beneficiaries_text(team_short_name: str) -> str:
-        try:
-            picks = _auto_boost_candidates(team_short_name, exclude_names_lower, now_et)
-            if not picks:
-                return ""
-            # Keep it tight for WhatsApp
-            return " | Boost candidates: " + ", ".join(picks[:AUTO_BENEFICIARIES_TOPN])
-        except Exception:
-            # Never fail the whole run because BDL hiccuped
-            return ""
-
-    # NEW/CHANGED
-    for pid, cur in new_players.items():
-        if not status_in_scope(cur.get("status", "")):
+    for score, pid, nm, pts_avg, min_avg, ppm in candidates:
+        # pull FD line (over/under line value) for tonight
+        line = None
+        use_gid = None
+        for gid in relevant:
+            line = points_line_for_player(gid, pid)
+            if line is not None:
+                use_gid = gid
+                break
+        if line is None:
             continue
 
-        prev = old_players.get(pid)
+        share = score / total_score
+        boost_pts = vac_pts * share * 0.70  # dampening to avoid overconfidence
+        # small minutes effect: if they already play a lot, they absorb more
+        boost_min = vac_min * share * 0.35
+        proj = pts_avg + boost_pts + (boost_min * ppm * 0.20)
 
-        if IMPACT_ONLY_CHANGES:
-            is_new = prev is None
-            is_changed = (not is_new) and (
-                (prev.get("status"), prev.get("detail")) != (cur.get("status"), cur.get("detail"))
-            )
-            if not (is_new or is_changed):
-                continue
+        edge = proj - line
+        if edge < EDGE_THRESHOLD:
+            continue
 
-        tag = action_tag(prev.get("status") if prev else None, cur.get("status", ""), now_et)
-        tag_txt = f"[{tag}] " if tag else ""
-        ben_txt = beneficiaries_text(cur.get("team", ""))
+        why = (
+            f"{injured_name} {injured_status.upper()} → vacates ~{vac_pts:.1f} pts / {vac_min:.1f} min (L{LOOKBACK_GAMES}). "
+            f"{nm} L{LOOKBACK_GAMES}: {pts_avg:.1f} pts in {min_avg:.1f} min (ppm {ppm:.2f}). "
+            f"Proj {proj:.1f} vs FD line {line:.1f} (edge +{edge:.1f})."
+        )
 
-        if prev is None:
-            base = f"{tag_txt}{cur['name']} ({cur['team']}): {cur['status']}"
-            if cur.get("detail"):
-                base += f" — {cur['detail']}"
-            lines.append("➕ " + base + ben_txt)
-        else:
-            msg = f"🚨 {tag_txt}{cur['name']} ({cur['team']}): {prev.get('status')} → {cur.get('status')}"
-            if cur.get("detail"):
-                msg += f" — {cur.get('detail')}"
-            lines.append(msg + ben_txt)
+        ideas.append({
+            "player_name": nm,
+            "player_id": pid,
+            "line": line,
+            "proj": proj,
+            "edge": edge,
+            "why": why,
+            "game_id": use_gid,
+        })
 
-    # CLEARED
-    if IMPACT_ONLY_CHANGES:
-        for pid, prev in old_players.items():
-            if pid not in new_players and status_in_scope(prev.get("status", "")):
-                lines.append(f"✅ {prev.get('name')} ({prev.get('team')}): cleared (was {prev.get('status')})")
+    ideas.sort(key=lambda x: x["edge"], reverse=True)
+    return ideas[:MAX_BET_IDEAS]
 
-    if not lines:
-        return None
-
-    header = "🎯 Impact Alerts (player points)"
-    if AUTO_BENEFICIARIES and not BALLDONTLIE_API_KEY:
-        header += "\n(Boost candidates disabled: missing BALLDONTLIE_API_KEY)"
-    return header + "\n" + "\n".join(lines[:70])
-
-
+# -------------------- MAIN --------------------
 def run():
     now_et = _now_et()
     ts_et = now_et.strftime("%Y-%m-%d %I:%M %p ET")
 
     if TEST_MODE:
-        send_one(f"✅ NBA Injury Agent test: WhatsApp delivery is working. ({ts_et})")
+        send_one(f"✅ NBA betting agent test OK ({ts_et})")
         return
 
     state = load_state()
-    meta = state.get("__meta__", {})
     old_players = state.get("players", {})
 
-    data = fetch_sportradar_injuries()
-    team_order, injuries_by_team, new_players = parse_teams_and_injuries(data)
+    sr = fetch_sportradar_injuries()
+    new_players = parse_injuries(sr)
 
-    # 1) Impact alerts w/ auto beneficiaries
-    impact_msg = build_impact_alerts(old_players, new_players, now_et)
-    if impact_msg:
-        send_chunked(f"{impact_msg}\n({ts_et})")
+    # exclude anyone currently on injury list from being recommended
+    exclude_names_lower = {_clean_name(v.get("name", "")) for v in new_players.values() if v.get("name")}
 
-    # 2) Daily full summaries
-    if should_send_full_summary(meta, now_et):
-        full_report = f"NBA Full Injury Summary ({ts_et})\n\n" + format_team_summary(team_order, injuries_by_team)
-        send_chunked(full_report)
-        mark_full_summary_sent(meta, now_et)
+    triggers = []
+    bet_ideas = []
 
-    # 3) Burst window summaries
-    if should_send_burst_summary(meta, now_et):
-        burst_report = f"⏱ Pre-tip Summary ({ts_et})\n\n" + format_team_summary(team_order, injuries_by_team)
-        send_chunked(burst_report)
-        mark_burst_summary_sent(meta, now_et)
+    for pid, cur in new_players.items():
+        if not status_in_scope(cur.get("status", "")):
+            continue
 
-    state["__meta__"] = meta
+        prev = old_players.get(pid)
+        if IMPACT_ONLY_CHANGES:
+            is_new = prev is None
+            is_changed = (not is_new) and ((prev.get("status"), prev.get("detail")) != (cur.get("status"), cur.get("detail")))
+            if not (is_new or is_changed):
+                continue
+
+        team_short = cur.get("team", "")
+        injured_name = cur.get("name", "")
+        injured_status = (cur.get("status") or "").strip()
+
+        triggers.append(f"{injured_name} ({team_short}) {injured_status}")
+
+        ideas = build_team_bet_ideas(
+            team_short=team_short,
+            injured_name=injured_name,
+            injured_status=injured_status,
+            exclude_names_lower=exclude_names_lower | {_clean_name(injured_name)},
+            now_et=now_et
+        )
+        for i in ideas:
+            i["trigger"] = f"{injured_name} ({team_short}) {injured_status}"
+        bet_ideas.extend(ideas)
+
+    # dedupe by player name keep best edge
+    best = {}
+    for i in bet_ideas:
+        k = _clean_name(i["player_name"])
+        if (k not in best) or (i["edge"] > best[k]["edge"]):
+            best[k] = i
+    bet_ideas = sorted(best.values(), key=lambda x: x["edge"], reverse=True)[:MAX_BET_IDEAS]
+
+    if bet_ideas:
+        msg = [f"💰 FanDuel Points Bet Ideas ({ts_et})", ""]
+        if triggers:
+            msg.append("Triggers:")
+            for t in triggers[:8]:
+                msg.append(f"- {t}")
+            if len(triggers) > 8:
+                msg.append(f"- …and {len(triggers)-8} more")
+            msg.append("")
+
+        for i in bet_ideas:
+            msg.append(f"• {i['player_name']} OVER {i['line']:.1f}  (edge +{i['edge']:.1f})")
+            msg.append(f"  Trigger: {i['trigger']}")
+            msg.append(f"  Why: {i['why']}")
+            msg.append("")
+
+        send_chunked("\n".join(msg).strip())
+    else:
+        if SEND_NO_EDGE_PING and _in_burst_window(now_et):
+            send_one(f"🧠 No FanDuel points edges ≥ {EDGE_THRESHOLD:.1f} this run. ({ts_et})")
+
     state["players"] = new_players
     save_state(state)
-
 
 if __name__ == "__main__":
     run()
