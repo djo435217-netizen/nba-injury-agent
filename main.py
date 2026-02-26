@@ -1,59 +1,77 @@
 import os
 import json
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import requests
 from twilio.rest import Client
 
 STATE_FILE = "state.json"
+ET = ZoneInfo("America/New_York")
 
 # ---------- ENV / CONFIG ----------
 TWILIO_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 SPORTRADAR_KEY = os.environ["SPORTRADAR_API_KEY"]
 
-# Twilio WhatsApp sandbox sender (keep as-is for sandbox)
 FROM_WHATSAPP = os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
-
-# Your phone number (E.164) e.g. +13479029930
 TO_WHATSAPP = f"whatsapp:{os.environ['MY_WHATSAPP_NUMBER']}"
 
-# Set TEST_MODE=1 in Render env vars to force a WhatsApp test message on the next run
 TEST_MODE = os.environ.get("TEST_MODE", "0") == "1"
 
-# WhatsApp message safety limits
 MAX_BODY_CHARS = 1500
 MAX_PLAYERS_PER_TEAM = int(os.environ.get("MAX_PLAYERS_PER_TEAM", "50"))
+
+# ---- Impact Alerts (player props) ----
+IMPACT_STATUSES_RAW = os.environ.get("IMPACT_STATUSES", "out,doubtful,questionable")
+IMPACT_STATUSES = {x.strip().lower() for x in IMPACT_STATUSES_RAW.split(",") if x.strip()}
+IMPACT_ONLY_CHANGES = os.environ.get("IMPACT_ONLY_CHANGES", "1") == "1"
+
+# ---- Daily full summaries (spam control) ----
+SUMMARY_TIMES_ET_RAW = os.environ.get("SUMMARY_TIMES_ET", "10:00,17:00").strip()
+SUMMARY_TIMES_ET = [t.strip() for t in SUMMARY_TIMES_ET_RAW.split(",") if t.strip()]
+SUMMARY_WINDOW_START_ET = int(os.environ.get("SUMMARY_WINDOW_START_ET", "0"))
+SUMMARY_WINDOW_END_ET = int(os.environ.get("SUMMARY_WINDOW_END_ET", "24"))
+FORCE_FULL = os.environ.get("FORCE_FULL", "0") == "1"
+
+# ---- Pre-tip burst window ----
+BURST_START_ET = os.environ.get("BURST_START_ET", "17:00").strip()   # 5:00 PM
+BURST_END_ET = os.environ.get("BURST_END_ET", "22:30").strip()       # 10:30 PM
+BURST_FULL_SUMMARY_EVERY_MIN = int(os.environ.get("BURST_FULL_SUMMARY_EVERY_MIN", "60"))
+# If set to 0, burst won't send extra full summaries (only impact alerts)
 
 twilio = Client(TWILIO_SID, TWILIO_TOKEN)
 
 
+def _now_et():
+    return datetime.now(ET)
+
+
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {}
+        return {"__meta__": {}, "players": {}}
     try:
         with open(STATE_FILE, "r") as f:
-            return json.load(f)
+            raw = json.load(f)
+        if isinstance(raw, dict) and "players" in raw:
+            raw.setdefault("__meta__", {})
+            return raw
+        if isinstance(raw, dict):
+            return {"__meta__": {}, "players": raw}
+        return {"__meta__": {}, "players": {}}
     except Exception:
-        return {}
+        return {"__meta__": {}, "players": {}}
 
 
-def save_state(s):
+def save_state(state):
     with open(STATE_FILE, "w") as f:
-        json.dump(s, f, indent=2, sort_keys=True)
+        json.dump(state, f, indent=2, sort_keys=True)
 
 
 def send_one(body: str):
-    twilio.messages.create(
-        from_=FROM_WHATSAPP,
-        to=TO_WHATSAPP,
-        body=body[:MAX_BODY_CHARS],
-    )
+    twilio.messages.create(from_=FROM_WHATSAPP, to=TO_WHATSAPP, body=body[:MAX_BODY_CHARS])
 
 
 def send_chunked(full_text: str):
-    """
-    Splits long text into multiple WhatsApp messages safely.
-    """
     if len(full_text) <= MAX_BODY_CHARS:
         send_one(full_text)
         return
@@ -62,9 +80,8 @@ def send_chunked(full_text: str):
     remaining = full_text
 
     while len(remaining) > MAX_BODY_CHARS:
-        # Try to split on a newline near the limit for readability
         cut = remaining.rfind("\n", 0, MAX_BODY_CHARS)
-        if cut < 200:  # if no good newline, hard cut
+        if cut < 200:
             cut = MAX_BODY_CHARS
         parts.append(remaining[:cut].rstrip())
         remaining = remaining[cut:].lstrip()
@@ -75,7 +92,6 @@ def send_chunked(full_text: str):
     total = len(parts)
     for i, p in enumerate(parts, start=1):
         header = f"(Part {i}/{total})\n"
-        # Ensure header doesn't push us over limit
         if len(header) + len(p) > MAX_BODY_CHARS:
             p = p[: MAX_BODY_CHARS - len(header)]
         send_one(header + p)
@@ -96,12 +112,6 @@ def fetch():
 
 
 def parse_teams_and_injuries(data):
-    """
-    Returns:
-      team_order: [team_name, ...] sorted alphabetically
-      injuries_by_team: {team_name: [{"id": pid, "name":..., "status":..., "detail":...}, ...]}
-      flat_by_player: {pid: {"name":..., "team":..., "status":..., "detail":...}}
-    """
     injuries_by_team = {}
     flat_by_player = {}
 
@@ -119,24 +129,14 @@ def parse_teams_and_injuries(data):
             if not pid:
                 continue
 
-            player_obj = {
-                "id": pid,
-                "name": p.get("full_name")
-                or f"{p.get('first_name','')} {p.get('last_name','')}".strip(),
-                "team": team_name,
-                "status": (inj.get("status") or "Unknown").strip(),
-                "detail": (inj.get("comment") or inj.get("description") or "").strip(),
-            }
+            name = p.get("full_name") or f"{p.get('first_name','')} {p.get('last_name','')}".strip()
+            status = (inj.get("status") or "Unknown").strip()
+            detail = (inj.get("comment") or inj.get("description") or "").strip()
 
+            player_obj = {"id": pid, "name": name, "team": team_name, "status": status, "detail": detail}
             injuries_by_team[team_name].append(player_obj)
-            flat_by_player[pid] = {
-                "name": player_obj["name"],
-                "team": team_name,
-                "status": player_obj["status"],
-                "detail": player_obj["detail"],
-            }
+            flat_by_player[pid] = {"name": name, "team": team_name, "status": status, "detail": detail}
 
-    # Sort teams and players for stable output
     team_order = sorted(injuries_by_team.keys())
     for t in team_order:
         injuries_by_team[t].sort(key=lambda x: (x["name"] or ""))
@@ -144,49 +144,49 @@ def parse_teams_and_injuries(data):
     return team_order, injuries_by_team, flat_by_player
 
 
-def compute_changes(old, new):
-    changes = []
+def status_in_scope(status: str) -> bool:
+    return (status or "").strip().lower() in IMPACT_STATUSES
 
-    for pid, cur in new.items():
-        prev = old.get(pid)
-        if not prev:
-            changes.append((None, cur))
+
+def build_impact_alerts(old_players, new_players):
+    lines = []
+
+    for pid, cur in new_players.items():
+        if not status_in_scope(cur.get("status", "")):
+            continue
+
+        prev = old_players.get(pid)
+        if IMPACT_ONLY_CHANGES:
+            if prev is None:
+                lines.append(
+                    f"➕ {cur['name']} ({cur['team']}): {cur['status']}"
+                    + (f" — {cur['detail']}" if cur.get("detail") else "")
+                )
+            else:
+                if (prev.get("status"), prev.get("detail")) != (cur.get("status"), cur.get("detail")):
+                    lines.append(
+                        f"🚨 {cur['name']} ({cur['team']}): {prev.get('status')} → {cur.get('status')}"
+                        + (f" — {cur.get('detail')}" if cur.get("detail") else "")
+                    )
         else:
-            if (prev.get("status"), prev.get("detail")) != (cur.get("status"), cur.get("detail")):
-                changes.append((prev, cur))
-
-    for pid, prev in old.items():
-        if pid not in new:
-            changes.append((prev, None))
-
-    return changes
-
-
-def format_changes(changes):
-    lines = ["🚨 Changes since last check:"]
-    for prev, cur in changes[:30]:
-        if prev is None and cur is not None:
             lines.append(
-                f"➕ {cur['name']} ({cur['team']}): {cur['status']}"
+                f"• {cur['name']} ({cur['team']}): {cur['status']}"
                 + (f" — {cur['detail']}" if cur.get("detail") else "")
             )
-        elif prev is not None and cur is None:
-            lines.append(f"✅ {prev['name']} ({prev['team']}): cleared (was {prev.get('status','')})")
-        else:
-            lines.append(
-                f"🔄 {cur['name']} ({cur['team']}): {prev.get('status')} → {cur.get('status')}"
-                + (f" — {cur.get('detail')}" if cur.get("detail") else "")
-            )
-    if len(changes) > 30:
-        lines.append(f"…and {len(changes) - 30} more changes.")
-    return "\n".join(lines)
+
+    if IMPACT_ONLY_CHANGES:
+        for pid, prev in old_players.items():
+            if pid not in new_players and status_in_scope(prev.get("status", "")):
+                lines.append(f"✅ {prev.get('name')} ({prev.get('team')}): cleared (was {prev.get('status')})")
+
+    if not lines:
+        return None
+
+    return "🎯 Impact Alerts (player props)\n" + "\n".join(lines[:70])
 
 
 def format_team_summary(team_order, injuries_by_team):
-    """
-    Always prints every team. If a team has no injuries, prints 'No reported injuries'.
-    """
-    lines = ["🏥 League-wide injury report (by team):"]
+    lines = ["🏥 Full injury report (by team):"]
     for team in team_order:
         players = injuries_by_team.get(team, [])
         if not players:
@@ -206,36 +206,104 @@ def format_team_summary(team_order, injuries_by_team):
     return "\n".join(lines)
 
 
+def _time_to_minutes(hhmm: str) -> int:
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+
+def _in_burst_window(now_et: datetime) -> bool:
+    start = _time_to_minutes(BURST_START_ET)
+    end = _time_to_minutes(BURST_END_ET)
+    cur = now_et.hour * 60 + now_et.minute
+    return start <= cur <= end
+
+
+def should_send_full_summary(meta, now_et: datetime) -> bool:
+    if FORCE_FULL:
+        return True
+
+    hour = now_et.hour
+    if not (SUMMARY_WINDOW_START_ET <= hour < SUMMARY_WINDOW_END_ET):
+        return False
+
+    hhmm = now_et.strftime("%H:%M")
+    if hhmm not in SUMMARY_TIMES_ET:
+        return False
+
+    sent = meta.get("sent_summaries", {})
+    today = now_et.strftime("%Y-%m-%d")
+    already = set(sent.get(today, []))
+    return hhmm not in already
+
+
+def mark_full_summary_sent(meta, now_et: datetime):
+    hhmm = now_et.strftime("%H:%M")
+    today = now_et.strftime("%Y-%m-%d")
+    meta.setdefault("sent_summaries", {})
+    meta["sent_summaries"].setdefault(today, [])
+    if hhmm not in meta["sent_summaries"][today]:
+        meta["sent_summaries"][today].append(hhmm)
+
+    keys = sorted(meta["sent_summaries"].keys())
+    if len(keys) > 7:
+        for k in keys[:-7]:
+            meta["sent_summaries"].pop(k, None)
+
+
+def should_send_burst_summary(meta, now_et: datetime) -> bool:
+    if BURST_FULL_SUMMARY_EVERY_MIN <= 0:
+        return False
+    if not _in_burst_window(now_et):
+        return False
+
+    # Send at most once per BURST_FULL_SUMMARY_EVERY_MIN
+    key = "last_burst_summary_et"
+    last = meta.get(key)
+    cur_ts = int(now_et.timestamp())
+    if not last:
+        return True
+    return (cur_ts - int(last)) >= (BURST_FULL_SUMMARY_EVERY_MIN * 60)
+
+
+def mark_burst_summary_sent(meta, now_et: datetime):
+    meta["last_burst_summary_et"] = int(now_et.timestamp())
+
+
 def run():
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now_et = _now_et()
+    ts_et = now_et.strftime("%Y-%m-%d %I:%M %p ET")
 
     if TEST_MODE:
-        send_one(f"✅ NBA Injury Agent test: WhatsApp delivery is working. ({ts})")
+        send_one(f"✅ NBA Injury Agent test: WhatsApp delivery is working. ({ts_et})")
         return
 
-    old = load_state()
+    state = load_state()
+    meta = state.get("__meta__", {})
+    old_players = state.get("players", {})
+
     data = fetch()
-    team_order, injuries_by_team, flat_new = parse_teams_and_injuries(data)
+    team_order, injuries_by_team, new_players = parse_teams_and_injuries(data)
 
-    # IMPORTANT: Some APIs may omit teams with truly no injuries from the payload.
-    # We still print all teams that appear in the feed. (If you need all 30 always,
-    # we can hardcode the full team list.)
-    changes = compute_changes(old, flat_new)
+    # 1) Impact alerts (changes-only)
+    impact_msg = build_impact_alerts(old_players, new_players)
+    if impact_msg:
+        send_chunked(f"{impact_msg}\n({ts_et})")
 
-    header = f"NBA Injury Update ({ts})"
-    blocks = [header]
+    # 2) Daily summaries at scheduled times
+    if should_send_full_summary(meta, now_et):
+        full_report = f"NBA Full Injury Summary ({ts_et})\n\n" + format_team_summary(team_order, injuries_by_team)
+        send_chunked(full_report)
+        mark_full_summary_sent(meta, now_et)
 
-    if changes:
-        blocks.append(format_changes(changes))
-    else:
-        blocks.append("✅ No changes since last check.")
+    # 3) Burst window summaries (optional extra)
+    if should_send_burst_summary(meta, now_et):
+        burst_report = f"⏱ Pre-tip Summary ({ts_et})\n\n" + format_team_summary(team_order, injuries_by_team)
+        send_chunked(burst_report)
+        mark_burst_summary_sent(meta, now_et)
 
-    blocks.append(format_team_summary(team_order, injuries_by_team))
-
-    full_message = "\n\n".join(blocks)
-    send_chunked(full_message)
-
-    save_state(flat_new)
+    state["__meta__"] = meta
+    state["players"] = new_players
+    save_state(state)
 
 
 if __name__ == "__main__":
