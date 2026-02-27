@@ -1,416 +1,579 @@
 import os
+import json
 import re
 import time
-import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Dict, List, Optional, Tuple, Any
-
 import requests
 from twilio.rest import Client
 
+STATE_FILE = "state.json"
 ET = ZoneInfo("America/New_York")
 
-# ----------------------------
-# ENV
-# ----------------------------
+# -------------------- REQUIRED ENV --------------------
 TWILIO_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
+SPORTRADAR_KEY = os.environ["SPORTRADAR_API_KEY"]
+BALLDONTLIE_API_KEY = os.environ["BALLDONTLIE_API_KEY"].strip()
+
 FROM_WHATSAPP = os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
 TO_WHATSAPP = f"whatsapp:{os.environ['MY_WHATSAPP_NUMBER']}"
 
-BALLDONTLIE_API_KEY = os.environ.get("BALLDONTLIE_API_KEY", "").strip()
-SPORTRADAR_KEY = os.environ.get("SPORTRADAR_KEY", "").strip()  # optional for now
-
-TEST_MODE = os.environ.get("TEST_MODE", "0") == "1"
-SEND_NO_EDGE_PING = os.environ.get("SEND_NO_EDGE_PING", "1") in ("1", "true", "True")
-ODDS_ONLY_IN_BURST = os.environ.get("ODDS_ONLY_IN_BURST", "1") in ("1", "true", "True")
-HEARTBEAT_PING = os.environ.get("HEARTBEAT_PING", "0") in ("1", "true", "True")
-
-BURST_START_ET = os.environ.get("BURST_START_ET", "17:00").strip()
-BURST_END_ET = os.environ.get("BURST_END_ET", "23:45").strip()
-
-EDGE_THRESHOLD = float(os.environ.get("EDGE_THRESHOLD", "2.0"))
-MAX_BET_IDEAS = int(os.environ.get("MAX_BET_IDEAS", "4"))
-
-SPORTSBOOK = os.environ.get("SPORTSBOOK", "fanduel").strip().lower()
-MARKET = os.environ.get("MARKET", "player_points").strip().lower()
-
-# Example: 2025 means 2025-26 season
-SEASON = int(os.environ.get("SEASON", str(datetime.now(ET).year - 1)))
-
-# Debug: print sample odds rows structure
-DEBUG_SAMPLE = os.environ.get("DEBUG_SAMPLE", "1") in ("1", "true", "True")
-
 twilio = Client(TWILIO_SID, TWILIO_TOKEN)
-BDL_HEADERS = {"Authorization": BALLDONTLIE_API_KEY} if BALLDONTLIE_API_KEY else {}
 
-# ----------------------------
-# Helpers
-# ----------------------------
+# -------------------- CONFIG (ENV) --------------------
+TEST_MODE = os.environ.get("TEST_MODE", "0") == "1"
+MAX_BODY_CHARS = 1500
+
+IMPACT_STATUSES_RAW = os.environ.get("IMPACT_STATUSES", "out,doubtful").strip()
+IMPACT_STATUSES = {x.strip().lower() for x in IMPACT_STATUSES_RAW.split(",") if x.strip()}
+IMPACT_ONLY_CHANGES = os.environ.get("IMPACT_ONLY_CHANGES", "1") == "1"
+
+BOOK_VENDOR = os.environ.get("BOOK_VENDOR", "fanduel").strip().lower()
+PROP_TYPE = os.environ.get("PROP_TYPE", "points").strip().lower()
+EDGE_THRESHOLD = float(os.environ.get("EDGE_THRESHOLD", "1.0"))
+LOOKBACK_GAMES = int(os.environ.get("LOOKBACK_GAMES", "10"))
+TOPN_CANDIDATES = int(os.environ.get("TOPN_CANDIDATES", "4"))
+MAX_BET_IDEAS = int(os.environ.get("MAX_BET_IDEAS", "8"))
+
+W_PPM = float(os.environ.get("W_PPM", "1.0"))
+W_MIN = float(os.environ.get("W_MIN", "0.18"))
+
+SEND_NO_EDGE_PING = os.environ.get("SEND_NO_EDGE_PING", "0") == "1"
+BURST_START_ET = os.environ.get("BURST_START_ET", "17:00").strip()
+BURST_END_ET = os.environ.get("BURST_END_ET", "22:30").strip()
+
+# NEW: reduce rate-limit pain
+ODDS_ONLY_IN_BURST = os.environ.get("ODDS_ONLY_IN_BURST", "1") == "1"
+BDL_MAX_RETRIES = int(os.environ.get("BDL_MAX_RETRIES", "5"))
+BDL_RETRY_BASE_SEC = float(os.environ.get("BDL_RETRY_BASE_SEC", "1.5"))
+BDL_PER_PAGE = int(os.environ.get("BDL_PER_PAGE", "100"))
+BDL_MAX_PAGES = int(os.environ.get("BDL_MAX_PAGES", "10"))
+
+# -------------------- UTILS --------------------
 def _now_et() -> datetime:
     return datetime.now(ET)
 
-def _parse_hhmm(hhmm: str) -> Tuple[int, int]:
-    m = re.match(r"^(\d{1,2}):(\d{2})$", hhmm)
-    if not m:
-        raise ValueError(f"Bad time format (expected HH:MM): {hhmm}")
-    return int(m.group(1)), int(m.group(2))
+def _time_to_minutes(hhmm: str) -> int:
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
 
 def _in_burst_window(now_et: datetime) -> bool:
-    sh, sm = _parse_hhmm(BURST_START_ET)
-    eh, em = _parse_hhmm(BURST_END_ET)
-    start = now_et.replace(hour=sh, minute=sm, second=0, microsecond=0)
-    end = now_et.replace(hour=eh, minute=em, second=0, microsecond=0)
-    return start <= now_et <= end
+    start = _time_to_minutes(BURST_START_ET)
+    end = _time_to_minutes(BURST_END_ET)
+    cur = now_et.hour * 60 + now_et.minute
+    return start <= cur <= end
 
-def send_one(body: str) -> None:
-    msg = twilio.messages.create(from_=FROM_WHATSAPP, to=TO_WHATSAPP, body=body[:1500])
-    print(f"[TWILIO] sent sid={msg.sid} status={msg.status}")
+def _season_year(now_et: datetime) -> int:
+    return now_et.year if now_et.month >= 10 else now_et.year - 1
 
-def send_chunked(body: str, chunk_size: int = 1400) -> None:
-    if len(body) <= chunk_size:
-        send_one(body)
+def _parse_minutes(min_str) -> float:
+    if not min_str:
+        return 0.0
+    s = str(min_str)
+    if ":" in s:
+        try:
+            mm, ss = s.split(":", 1)
+            return float(mm) + float(ss) / 60.0
+        except Exception:
+            return 0.0
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+def _clean_name(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\.", "", s)
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace("’", "'")
+    return s.lower()
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {"players": {}}
+    try:
+        with open(STATE_FILE, "r") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict) and "players" in raw:
+            return raw
+        if isinstance(raw, dict):
+            return {"players": raw}
+        return {"players": {}}
+    except Exception:
+        return {"players": {}}
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+
+def send_one(body: str):
+    twilio.messages.create(from_=FROM_WHATSAPP, to=TO_WHATSAPP, body=body[:MAX_BODY_CHARS])
+
+def send_chunked(full_text: str):
+    if len(full_text) <= MAX_BODY_CHARS:
+        send_one(full_text)
         return
-    lines = body.splitlines()
-    parts: List[str] = []
-    cur = ""
-    for ln in lines:
-        if len(cur) + len(ln) + 1 > chunk_size:
-            parts.append(cur)
-            cur = ln
-        else:
-            cur = cur + ("\n" if cur else "") + ln
-    if cur:
-        parts.append(cur)
-
+    parts = []
+    remaining = full_text
+    while len(remaining) > MAX_BODY_CHARS:
+        cut = remaining.rfind("\n", 0, MAX_BODY_CHARS)
+        if cut < 200:
+            cut = MAX_BODY_CHARS
+        parts.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        parts.append(remaining)
     total = len(parts)
     for i, p in enumerate(parts, start=1):
-        send_one(f"(Part {i}/{total})\n{p}")
+        header = f"(Part {i}/{total})\n"
+        if len(header) + len(p) > MAX_BODY_CHARS:
+            p = p[: MAX_BODY_CHARS - len(header)]
+        send_one(header + p)
 
-def _pick(d: dict, keys: List[str]):
-    for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
-    return None
+# -------------------- SPORTRADAR --------------------
+def fetch_sportradar_injuries():
+    url = "https://api.sportradar.com/nba/trial/v8/en/league/injuries.json"
+    r = requests.get(url, params={"api_key": SPORTRADAR_KEY}, timeout=20)
+    if r.status_code != 200:
+        raise RuntimeError(f"Sportradar error {r.status_code}: {r.text[:300]}")
+    ct = (r.headers.get("Content-Type") or "").lower()
+    if "json" not in ct:
+        raise RuntimeError(f"Unexpected content-type: {ct}. Body: {r.text[:300]}")
+    return r.json()
 
-def _as_int(x) -> Optional[int]:
-    try:
-        if x is None:
-            return None
-        return int(x)
-    except Exception:
-        return None
+def parse_injuries(data):
+    flat_by_player = {}
+    for team in data.get("teams", []):
+        team_name = team.get("name") or team.get("market") or team.get("id", "TEAM")
+        for p in team.get("players", []):
+            injuries = p.get("injuries") or []
+            if not injuries:
+                continue
+            inj = injuries[-1]
+            pid = p.get("id")
+            if not pid:
+                continue
+            name = p.get("full_name") or f"{p.get('first_name','')} {p.get('last_name','')}".strip()
+            status = (inj.get("status") or "Unknown").strip()
+            detail = (inj.get("comment") or inj.get("description") or "").strip()
+            flat_by_player[pid] = {"name": name, "team": team_name, "status": status, "detail": detail}
+    return flat_by_player
 
-def _as_float(x) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        return float(x)
-    except Exception:
-        return None
+def status_in_scope(status: str) -> bool:
+    return (status or "").strip().lower() in IMPACT_STATUSES
 
-def _safe_sample(row: Any, max_chars: int = 1200) -> str:
+# -------------------- BALLDONTLIE (RETRY + FALLBACK) --------------------
+BDL_HEADERS = {"Authorization": BALLDONTLIE_API_KEY}
+BDL_PREFIXES = ["/nba", ""]  # try NBA namespace first, fallback to legacy
+
+_TEAM_CACHE = None
+_PROPS_CACHE = {}  # game_id -> props list for this run
+
+def _bdl_get(path: str, params: dict | None = None, timeout: int = 20) -> dict:
     """
-    Print a sanitized/minified JSON sample to logs.
+    Retries on rate limits & transient errors.
+    Tries /nba routes first, then legacy.
     """
-    try:
-        s = json.dumps(row, ensure_ascii=False)[:max_chars]
-        return s
-    except Exception:
-        return str(row)[:max_chars]
-
-# ----------------------------
-# BallDontLie client (retry/backoff)
-# ----------------------------
-def bdl_get(path: str, params: Optional[dict] = None, timeout: int = 25) -> dict:
-    bases = ["https://api.balldontlie.io/nba", "https://api.balldontlie.io"]
     last_err = None
 
-    for base in bases:
-        url = base + path
-        for attempt in range(1, 6):
+    for pref in BDL_PREFIXES:
+        url = f"https://api.balldontlie.io{pref}{path}"
+
+        for attempt in range(BDL_MAX_RETRIES):
             try:
                 r = requests.get(url, headers=BDL_HEADERS, params=params or {}, timeout=timeout)
 
+                # If route doesn't exist, try next prefix immediately
                 if r.status_code == 404:
                     last_err = f"404 {url}"
                     break
 
+                # Retryable statuses
                 if r.status_code in (429, 500, 502, 503, 504):
-                    wait = min(2 ** attempt, 20)
-                    print(f"[BDL] {r.status_code} on {path}; retry in {wait}s...")
-                    time.sleep(wait)
-                    last_err = f"{r.status_code}: {r.text[:160]}"
+                    retry_after = r.headers.get("Retry-After")
+                    if retry_after:
+                        sleep_s = float(retry_after)
+                    else:
+                        sleep_s = BDL_RETRY_BASE_SEC * (2 ** attempt)
+                    last_err = f"{r.status_code} {r.text[:120]}"
+                    time.sleep(min(sleep_s, 30.0))
                     continue
 
                 if r.status_code != 200:
-                    raise RuntimeError(f"{r.status_code}: {r.text[:300]}")
+                    raise RuntimeError(f"BallDontLie error {r.status_code}: {r.text[:300]}")
 
                 return r.json()
 
             except Exception as e:
                 last_err = str(e)
-                time.sleep(1.0)
+                time.sleep(min(BDL_RETRY_BASE_SEC * (2 ** attempt), 30.0))
+                continue
 
     raise RuntimeError(f"BallDontLie request failed for {path}. Last error: {last_err}")
 
-def bdl_games_today(now_et: datetime) -> List[dict]:
-    d = now_et.date().isoformat()
-    resp = bdl_get("/v1/games", params={"dates[]": [d], "per_page": 100})
-    return resp.get("data") or []
+def bdl_team_name_to_id():
+    global _TEAM_CACHE
+    if _TEAM_CACHE is not None:
+        return _TEAM_CACHE
+    data = _bdl_get("/v1/teams", params={"per_page": 100})
+    m = {}
+    for t in data.get("data", []):
+        nm = (t.get("name") or "").strip()
+        if nm and t.get("id") is not None:
+            m[nm] = int(t["id"])
+    _TEAM_CACHE = m
+    return _TEAM_CACHE
 
-def bdl_player_points_props_for_game(game_id: int) -> List[dict]:
-    params = {
-        "sportsbook": SPORTSBOOK,
-        "market": MARKET,
-        "game_id": int(game_id),
-        "per_page": 200
-    }
-    resp = bdl_get("/v2/odds/player_props", params=params)
-    return resp.get("data") or []
+def bdl_active_roster(team_short: str) -> list[dict]:
+    team_map = bdl_team_name_to_id()
+    team_id = team_map.get(team_short)
+    if not team_id:
+        return []
 
-def bdl_player_points_props_for_today(now_et: datetime) -> List[dict]:
-    games = bdl_games_today(now_et)
-    print(f"[INFO] BDL games today: {len(games)}")
-    all_rows: List[dict] = []
-    for g in games:
-        gid = g.get("id")
-        if gid is None:
+    players = []
+    cursor = None
+    pages = 0
+
+    while pages < 5:
+        params = {"per_page": 100, "team_ids[]": [team_id]}
+        if cursor is not None:
+            params["cursor"] = cursor
+        resp = _bdl_get("/v1/players/active", params=params)
+        chunk = resp.get("data") or []
+        players.extend(chunk)
+        meta = resp.get("meta") or {}
+        cursor = meta.get("next_cursor")
+        pages += 1
+        if not cursor:
+            break
+
+    out = []
+    for p in players:
+        team = p.get("team") or {}
+        if (team.get("name") or "").strip() != team_short:
             continue
-        try:
-            rows = bdl_player_points_props_for_game(int(gid))
-            all_rows.extend(rows)
-            time.sleep(0.35)
-        except Exception as e:
-            print(f"[WARN] props fetch failed for game_id={gid}: {e}")
-            continue
-    print(f"[INFO] BDL props rows total: {len(all_rows)}")
-    if DEBUG_SAMPLE and all_rows:
-        print("[DEBUG] Sample row 1:", _safe_sample(all_rows[0]))
-        if len(all_rows) > 1:
-            print("[DEBUG] Sample row 2:", _safe_sample(all_rows[1]))
-    return all_rows
+        out.append(p)
+    return out
 
-def bdl_season_averages(player_ids: List[int]) -> Dict[int, dict]:
-    out: Dict[int, dict] = {}
+def bdl_find_player_id_on_team(team_short: str, full_name: str) -> int | None:
+    roster = bdl_active_roster(team_short)
+    if not roster:
+        return None
+
+    def strip_suffix(n: str) -> str:
+        n = _clean_name(n)
+        n = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", "", n).strip()
+        n = re.sub(r"\s+", " ", n)
+        return n
+
+    t0 = strip_suffix(full_name)
+
+    for p in roster:
+        pid = p.get("id")
+        nm = f"{p.get('first_name','')} {p.get('last_name','')}".strip()
+        if pid and nm and strip_suffix(nm) == t0:
+            return int(pid)
+
+    # fallback: last name + first initial
+    try:
+        t_parts = t0.split(" ")
+        t_first = t_parts[0] if t_parts else ""
+        t_last = t_parts[-1] if t_parts else ""
+        for p in roster:
+            pid = p.get("id")
+            nm = f"{p.get('first_name','')} {p.get('last_name','')}".strip()
+            if not pid or not nm:
+                continue
+            n0 = strip_suffix(nm)
+            n_parts = n0.split(" ")
+            n_first = n_parts[0] if n_parts else ""
+            n_last = n_parts[-1] if n_parts else ""
+            if n_last == t_last and n_first[:1] == t_first[:1]:
+                return int(pid)
+    except Exception:
+        pass
+
+    return None
+
+def bdl_last_n_games_stats(player_ids: list[int], season: int, n: int) -> dict[int, list[tuple[str, float, float]]]:
+    out = {pid: [] for pid in player_ids}
     if not player_ids:
         return out
 
-    chunk_size = 40
-    for i in range(0, len(player_ids), chunk_size):
-        chunk = player_ids[i:i+chunk_size]
-        params = {"season": SEASON, "per_page": 100}
-        for pid in chunk:
-            params.setdefault("player_ids[]", []).append(pid)
+    cursor = None
+    pages = 0
+    while pages < BDL_MAX_PAGES:
+        params = {"per_page": min(BDL_PER_PAGE, 100), "seasons[]": [season], "player_ids[]": player_ids}
+        if cursor is not None:
+            params["cursor"] = cursor
 
-        resp = bdl_get("/v1/season_averages", params=params)
+        resp = _bdl_get("/v1/stats", params=params)
         rows = resp.get("data") or []
-        for row in rows:
-            pid = row.get("player_id")
-            if pid is not None:
-                out[int(pid)] = row
 
-        time.sleep(0.35)
+        for row in rows:
+            p = row.get("player") or {}
+            pid = p.get("id")
+            if pid is None:
+                continue
+            pid = int(pid)
+            if pid not in out:
+                continue
+            game = row.get("game") or {}
+            date = game.get("date")
+            pts = float(row.get("pts", 0) or 0)
+            mins = _parse_minutes(row.get("min"))
+            if date:
+                out[pid].append((date, pts, mins))
+
+        done = all(len(out[pid]) >= n for pid in player_ids)
+        if done:
+            break
+
+        meta = resp.get("meta") or {}
+        cursor = meta.get("next_cursor")
+        pages += 1
+        if not cursor:
+            break
+
+    for pid in player_ids:
+        g = out[pid]
+        g.sort(key=lambda x: x[0])
+        out[pid] = g[-n:]
     return out
 
-# ----------------------------
-# Odds row parsing (robust)
-# ----------------------------
-def extract_prop_fields(row: dict) -> Optional[dict]:
-    """
-    Try multiple possible BDL v2 prop row shapes.
-    We need: player_id, player_name, game_id, line.
-    """
-    # Common direct keys
-    line = _as_float(_pick(row, ["line", "value", "stat_value", "prop_line"]))
-    game_id = _as_int(_pick(row, ["game_id"]))
-    player_id = _as_int(_pick(row, ["player_id"]))
+def bdl_games_today_ids(now_et: datetime) -> list[int]:
+    today = now_et.strftime("%Y-%m-%d")
+    resp = _bdl_get("/v1/games", params={"dates[]": [today], "per_page": 100})
+    return [int(g["id"]) for g in (resp.get("data") or []) if g.get("id") is not None]
 
-    # Nested player
-    player = row.get("player") or row.get("athlete") or row.get("participant") or row.get("entity") or {}
-    if player_id is None:
-        player_id = _as_int(_pick(player, ["id", "player_id"]))
-    player_name = _pick(player, ["full_name", "name", "display_name"])
+def bdl_player_props_points(game_id: int) -> list[dict]:
+    # cache per run to reduce requests
+    if game_id in _PROPS_CACHE:
+        return _PROPS_CACHE[game_id]
 
-    # Nested game
-    game = row.get("game") or row.get("event") or {}
-    if game_id is None:
-        game_id = _as_int(_pick(game, ["id", "game_id", "event_id"]))
+    params = {"game_id": game_id, "prop_type": "points", "vendors[]": [BOOK_VENDOR]}
 
-    # Sometimes line is nested
-    if line is None:
-        odds = row.get("odds") or row.get("prices") or row.get("outcomes") or None
-        # If outcomes array exists, some providers place line there
-        if isinstance(odds, list) and odds:
-            line = _as_float(_pick(odds[0], ["line", "value", "stat_value"]))
-        elif isinstance(odds, dict):
-            line = _as_float(_pick(odds, ["line", "value", "stat_value"]))
+    # Soft-fail on odds problems (especially 429) so cron does NOT crash
+    try:
+        resp = _bdl_get("/v2/odds/player_props", params=params)
+        props = resp.get("data") or []
+    except Exception:
+        props = []
 
-    if player_id is None or game_id is None or line is None:
-        return None
+    _PROPS_CACHE[game_id] = props
+    return props
 
-    if not player_name:
-        # fallback: direct keys
-        player_name = _pick(row, ["player_name", "name"])
-
-    if not player_name:
-        player_name = f"player_id {player_id}"
-
-    return {
-        "player_id": int(player_id),
-        "player_name": str(player_name),
-        "game_id": int(game_id),
-        "line": float(line),
-    }
-
-def reduce_props_rows(props_rows: List[dict]) -> List[dict]:
-    """
-    Reduce to 1 row per (player_id, game_id) using extracted fields.
-    """
-    best: Dict[Tuple[int, int], dict] = {}
-    for row in props_rows:
-        ex = extract_prop_fields(row)
-        if not ex:
+def points_line_for_player(game_id: int, player_id: int) -> float | None:
+    for pp in bdl_player_props_points(game_id):
+        if int(pp.get("player_id", -1)) != int(player_id):
             continue
-        k = (ex["player_id"], ex["game_id"])
-        if k not in best:
-            best[k] = ex
-    return list(best.values())
-
-# ----------------------------
-# Edges (slow start): Season PPG vs line
-# ----------------------------
-def tier_and_reco(edge: float) -> Tuple[str, str]:
-    if edge >= 3.0:
-        return "A+", "45–50%"
-    if edge >= EDGE_THRESHOLD:
-        return "A", "30–40%"
-    return "", ""
-
-def build_edges(reduced_rows: List[dict]) -> Tuple[List[dict], int]:
-    player_ids = sorted(list({r["player_id"] for r in reduced_rows}))
-    print(f"[INFO] Unique players w/ lines: {len(player_ids)}")
-    avgs = bdl_season_averages(player_ids)
-
-    ideas: List[dict] = []
-    for r in reduced_rows:
-        pid = r["player_id"]
-        avg = avgs.get(pid) or {}
-        ppg = avg.get("pts")
+        market = pp.get("market") or {}
+        if (market.get("type") or "").lower() != "over_under":
+            continue
         try:
-            proj = float(ppg) if ppg is not None else 0.0
+            return float(pp.get("line_value"))
         except Exception:
-            proj = 0.0
+            return None
+    return None
 
-        edge = proj - r["line"]
+# -------------------- BETTING LOGIC --------------------
+def avg_pts_min(games: list[tuple[str, float, float]]) -> tuple[float, float]:
+    if not games:
+        return 0.0, 0.0
+    pts = sum(x[1] for x in games) / len(games)
+    mins = sum(x[2] for x in games) / len(games)
+    return pts, mins
+
+def build_team_bet_ideas(team_short: str, injured_name: str, injured_status: str,
+                         exclude_names_lower: set[str], now_et: datetime) -> list[dict]:
+    season = _season_year(now_et)
+
+    roster = bdl_active_roster(team_short)
+    if not roster:
+        return []
+
+    roster_tuples = []
+    for p in roster:
+        pid = p.get("id")
+        nm = f"{p.get('first_name','')} {p.get('last_name','')}".strip()
+        if pid is None or not nm:
+            continue
+        if _clean_name(nm) in exclude_names_lower:
+            continue
+        roster_tuples.append((int(pid), nm))
+
+    if not roster_tuples:
+        return []
+
+    injured_pid = bdl_find_player_id_on_team(team_short, injured_name)
+    vac_pts, vac_min = 12.0, 26.0
+    if injured_pid is not None:
+        inj_stats = bdl_last_n_games_stats([injured_pid], season, LOOKBACK_GAMES).get(injured_pid, [])
+        ip, im = avg_pts_min(inj_stats)
+        if len(inj_stats) >= max(3, LOOKBACK_GAMES // 3):
+            vac_pts, vac_min = ip, im
+
+    pids = [pid for pid, _ in roster_tuples]
+    stats = bdl_last_n_games_stats(pids, season, LOOKBACK_GAMES)
+
+    scored = []
+    for pid, nm in roster_tuples:
+        g = stats.get(pid, [])
+        pts_avg, min_avg = avg_pts_min(g)
+        if min_avg < 8:
+            continue
+        ppm = pts_avg / max(min_avg, 1e-6)
+        score = (W_PPM * ppm) + (W_MIN * min_avg)
+        scored.append((score, pid, nm, pts_avg, min_avg, ppm))
+
+    scored.sort(reverse=True, key=lambda x: x[0])
+    candidates = scored[:max(TOPN_CANDIDATES, 6)]
+    if not candidates:
+        return []
+
+    # Odds calls can be heavy; optionally only do them in burst window
+    if ODDS_ONLY_IN_BURST and (not _in_burst_window(now_et)):
+        return []  # skip bet ideas outside burst to avoid rate-limit
+
+    game_ids = bdl_games_today_ids(now_et)
+    if not game_ids:
+        return []
+
+    # Find relevant games by checking if any candidate has props in that game
+    cand_ids = {c[1] for c in candidates}
+    relevant = []
+    for gid in game_ids:
+        props = bdl_player_props_points(gid)  # cached + soft-fail
+        if not props:
+            continue
+        if any(int(pp.get("player_id", -1)) in cand_ids for pp in props):
+            relevant.append(gid)
+
+    if not relevant:
+        return []
+
+    total_score = sum(c[0] for c in candidates) or 1.0
+    ideas = []
+
+    for score, pid, nm, pts_avg, min_avg, ppm in candidates:
+        line = None
+        use_gid = None
+        for gid in relevant:
+            line = points_line_for_player(gid, pid)
+            if line is not None:
+                use_gid = gid
+                break
+        if line is None:
+            continue
+
+        share = score / total_score
+        boost_pts = vac_pts * share * 0.70
+        boost_min = vac_min * share * 0.35
+        proj = pts_avg + boost_pts + (boost_min * ppm * 0.20)
+
+        edge = proj - line
         if edge < EDGE_THRESHOLD:
             continue
 
-        tier, reco = tier_and_reco(edge)
-        if not tier:
-            continue
+        why = (
+            f"{injured_name} {injured_status.upper()} → vacates ~{vac_pts:.1f} pts / {vac_min:.1f} min (L{LOOKBACK_GAMES}). "
+            f"{nm} L{LOOKBACK_GAMES}: {pts_avg:.1f} pts in {min_avg:.1f} min (ppm {ppm:.2f}). "
+            f"Proj {proj:.1f} vs FD line {line:.1f} (edge +{edge:.1f})."
+        )
 
         ideas.append({
-            "tier": tier,
-            "reco": reco,
+            "player_name": nm,
             "player_id": pid,
-            "player_name": r["player_name"],
-            "game_id": r["game_id"],
-            "line": r["line"],
+            "line": line,
             "proj": proj,
             "edge": edge,
-            "why": f"Season PPG {proj:.1f} vs line {r['line']:.1f}",
+            "why": why,
+            "game_id": use_gid,
         })
 
-    # Best per player
-    best: Dict[int, dict] = {}
-    for x in ideas:
-        pid = x["player_id"]
-        if pid not in best or x["edge"] > best[pid]["edge"]:
-            best[pid] = x
+    ideas.sort(key=lambda x: x["edge"], reverse=True)
+    return ideas[:MAX_BET_IDEAS]
 
-    ideas = sorted(best.values(), key=lambda x: x["edge"], reverse=True)[:MAX_BET_IDEAS]
-    return ideas, len(reduced_rows)
-
-# ----------------------------
-# MAIN
-# ----------------------------
+# -------------------- MAIN --------------------
 def run():
     now_et = _now_et()
     ts_et = now_et.strftime("%Y-%m-%d %I:%M %p ET")
 
-    print(
-        f"[BOOT] ts={ts_et} "
-        f"TEST_MODE={os.environ.get('TEST_MODE')} "
-        f"SEND_NO_EDGE_PING={os.environ.get('SEND_NO_EDGE_PING')} "
-        f"ODDS_ONLY_IN_BURST={os.environ.get('ODDS_ONLY_IN_BURST')} "
-        f"BURST_START_ET={os.environ.get('BURST_START_ET')} "
-        f"BURST_END_ET={os.environ.get('BURST_END_ET')} "
-        f"EDGE_THRESHOLD={EDGE_THRESHOLD} "
-        f"SEASON={SEASON} "
-        f"SPORTSBOOK={SPORTSBOOK} MARKET={MARKET}"
-    )
-
     if TEST_MODE:
-        send_one(f"✅ TEST_MODE ping ({ts_et})")
+        send_one(f"✅ NBA betting agent test OK ({ts_et})")
         return
 
-    in_burst = _in_burst_window(now_et)
-    if ODDS_ONLY_IN_BURST and not in_burst:
-        print("[INFO] Outside burst window; skipping scan.")
-        return
+    state = load_state()
+    old_players = state.get("players", {})
 
-    if not BALLDONTLIE_API_KEY:
-        send_one(f"⚠️ Missing BALLDONTLIE_API_KEY. ({ts_et})")
-        return
+    sr = fetch_sportradar_injuries()
+    new_players = parse_injuries(sr)
 
-    # Fetch props
-    try:
-        props_rows = bdl_player_points_props_for_today(now_et)
-    except Exception as e:
-        print(f"[ERROR] props fetch failed: {e}")
-        if SEND_NO_EDGE_PING and in_burst:
-            send_one(f"⚠️ Agent ran ({ts_et}) but props fetch failed.\n{str(e)[:500]}")
-        return
+    exclude_names_lower = {_clean_name(v.get("name", "")) for v in new_players.values() if v.get("name")}
 
-    reduced = reduce_props_rows(props_rows)
-    print(f"[INFO] BDL props rows reduced: {len(reduced)}")
+    triggers = []
+    bet_ideas = []
 
-    # If still zero, we need the sample logs to adjust extraction
-    if not reduced:
-        if SEND_NO_EDGE_PING and in_burst:
-            send_one(f"⚠️ Agent ran ({ts_et}) but couldn't parse any props rows yet.\nCheck Render logs for [DEBUG] Sample row output.")
-        return
+    for pid, cur in new_players.items():
+        if not status_in_scope(cur.get("status", "")):
+            continue
 
-    bet_ideas, reduced_count = build_edges(reduced)
+        prev = old_players.get(pid)
+        if IMPACT_ONLY_CHANGES:
+            is_new = prev is None
+            is_changed = (not is_new) and ((prev.get("status"), prev.get("detail")) != (cur.get("status"), cur.get("detail")))
+            if not (is_new or is_changed):
+                continue
 
-    if HEARTBEAT_PING and in_burst:
-        send_one(f"🟣 Heartbeat ({ts_et})\nParsed props: {reduced_count}\nEdges: {len(bet_ideas)}")
+        team_short = cur.get("team", "")
+        injured_name = cur.get("name", "")
+        injured_status = (cur.get("status") or "").strip()
+
+        triggers.append(f"{injured_name} ({team_short}) {injured_status}")
+
+        ideas = build_team_bet_ideas(
+            team_short=team_short,
+            injured_name=injured_name,
+            injured_status=injured_status,
+            exclude_names_lower=exclude_names_lower | {_clean_name(injured_name)},
+            now_et=now_et
+        )
+        for i in ideas:
+            i["trigger"] = f"{injured_name} ({team_short}) {injured_status}"
+        bet_ideas.extend(ideas)
+
+    # dedupe by player, keep best edge
+    best = {}
+    for i in bet_ideas:
+        k = _clean_name(i["player_name"])
+        if (k not in best) or (i["edge"] > best[k]["edge"]):
+            best[k] = i
+    bet_ideas = sorted(best.values(), key=lambda x: x["edge"], reverse=True)[:MAX_BET_IDEAS]
 
     if bet_ideas:
-        lines: List[str] = []
-        lines.append(f"📈 FanDuel Points Edges — {ts_et}")
-        lines.append(f"A-only | threshold +{EDGE_THRESHOLD:.1f} | plays {len(bet_ideas)}")
-        lines.append("")
-        for b in bet_ideas:
-            lines.append(f"🔥 {b['tier']} TIER — {b['reco']} bankroll")
-            lines.append(f"{b['player_name']} OVER {b['line']:.1f} (edge +{b['edge']:.1f})")
-            lines.append(f"Why: {b['why']}")
-            lines.append(
-                f"#BET pid={b['player_id']} gid={b['game_id']} "
-                f"line={b['line']:.1f} proj={b['proj']:.1f} edge={b['edge']:.1f} tier={b['tier']}"
-            )
-            lines.append("")
-        send_chunked("\n".join(lines))
-        return
+        msg = [f"💰 FanDuel Points Bet Ideas ({ts_et})", ""]
+        if triggers:
+            msg.append("Triggers:")
+            for t in triggers[:8]:
+                msg.append(f"- {t}")
+            if len(triggers) > 8:
+                msg.append(f"- …and {len(triggers)-8} more")
+            msg.append("")
 
-    if SEND_NO_EDGE_PING and in_burst:
-        send_one(
-            f"✅ Agent scan complete ({ts_et})\n"
-            f"No A-tier edges ≥ {EDGE_THRESHOLD:.1f}.\n"
-            f"Parsed props: {reduced_count}"
-        )
+        for i in bet_ideas:
+            msg.append(f"• {i['player_name']} OVER {i['line']:.1f}  (edge +{i['edge']:.1f})")
+            msg.append(f"  Trigger: {i['trigger']}")
+            msg.append(f"  Why: {i['why']}")
+            msg.append("")
+
+        send_chunked("\n".join(msg).strip())
+    else:
+        if SEND_NO_EDGE_PING and _in_burst_window(now_et):
+            send_one(f"🧠 No FanDuel points edges ≥ {EDGE_THRESHOLD:.1f} this run. ({ts_et})")
+
+    state["players"] = new_players
+    save_state(state)
 
 if __name__ == "__main__":
     run()
