@@ -3,7 +3,7 @@ import re
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from twilio.rest import Client
@@ -19,11 +19,8 @@ FROM_WHATSAPP = os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
 TO_WHATSAPP = f"whatsapp:{os.environ['MY_WHATSAPP_NUMBER']}"
 
 BALLDONTLIE_API_KEY = os.environ.get("BALLDONTLIE_API_KEY", "").strip()
+SPORTRADAR_KEY = os.environ.get("SPORTRADAR_KEY", "").strip()  # optional for now
 
-# Optional (we’ll add later)
-SPORTRADAR_KEY = os.environ.get("SPORTRADAR_KEY", "").strip()
-
-# Behavior
 TEST_MODE = os.environ.get("TEST_MODE", "0") == "1"
 SEND_NO_EDGE_PING = os.environ.get("SEND_NO_EDGE_PING", "1") in ("1", "true", "True")
 ODDS_ONLY_IN_BURST = os.environ.get("ODDS_ONLY_IN_BURST", "1") in ("1", "true", "True")
@@ -35,12 +32,10 @@ BURST_END_ET = os.environ.get("BURST_END_ET", "23:45").strip()
 EDGE_THRESHOLD = float(os.environ.get("EDGE_THRESHOLD", "2.0"))
 MAX_BET_IDEAS = int(os.environ.get("MAX_BET_IDEAS", "4"))
 
-# Book / market
 SPORTSBOOK = os.environ.get("SPORTSBOOK", "fanduel").strip().lower()
 MARKET = os.environ.get("MARKET", "player_points").strip().lower()
 
-# Season for season averages (set to current season start year)
-# Example: 2025 means 2025-26 season.
+# Example: 2025 means 2025-26 season
 SEASON = int(os.environ.get("SEASON", str(datetime.now(ET).year - 1)))
 
 twilio = Client(TWILIO_SID, TWILIO_TOKEN)
@@ -64,13 +59,6 @@ def _in_burst_window(now_et: datetime) -> bool:
     start = now_et.replace(hour=sh, minute=sm, second=0, microsecond=0)
     end = now_et.replace(hour=eh, minute=em, second=0, microsecond=0)
     return start <= now_et <= end
-
-def _norm_name(s: str) -> str:
-    s = (s or "").lower()
-    s = s.replace("’", "'")
-    s = re.sub(r"[^a-z\s']", "", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
 
 def send_one(body: str) -> None:
     msg = twilio.messages.create(from_=FROM_WHATSAPP, to=TO_WHATSAPP, body=body[:1500])
@@ -100,10 +88,6 @@ def send_chunked(body: str, chunk_size: int = 1400) -> None:
 # BallDontLie client (retry/backoff)
 # ----------------------------
 def bdl_get(path: str, params: Optional[dict] = None, timeout: int = 25) -> dict:
-    """
-    Retries on 429 and transient errors.
-    Tries /nba namespace first then root.
-    """
     bases = ["https://api.balldontlie.io/nba", "https://api.balldontlie.io"]
     last_err = None
 
@@ -141,9 +125,6 @@ def bdl_games_today(now_et: datetime) -> List[dict]:
     return resp.get("data") or []
 
 def bdl_player_points_props_for_game(game_id: int) -> List[dict]:
-    """
-    This is the key fix: YOUR BDL endpoint requires game_id as an integer.
-    """
     params = {
         "sportsbook": SPORTSBOOK,
         "market": MARKET,
@@ -171,15 +152,35 @@ def bdl_player_points_props_for_today(now_et: datetime) -> List[dict]:
     print(f"[INFO] BDL props rows total: {len(all_rows)}")
     return all_rows
 
+def reduce_props_rows(props_rows: List[dict]) -> List[dict]:
+    """
+    BDL returns MANY duplicate/alternate offers. Reduce to 1 row per (player, game).
+    This makes the job fast + avoids season_averages 429s.
+    """
+    best: Dict[Tuple[int, int], dict] = {}
+    for row in props_rows:
+        player = row.get("player") or {}
+        game = row.get("game") or {}
+        pid = player.get("id")
+        gid = game.get("id") or row.get("game_id")
+        line = row.get("line")
+        if pid is None or gid is None or line is None:
+            continue
+        try:
+            k = (int(pid), int(gid))
+            _ = float(line)
+        except Exception:
+            continue
+        if k not in best:
+            best[k] = row
+    return list(best.values())
+
 def bdl_season_averages(player_ids: List[int]) -> Dict[int, dict]:
-    """
-    Pull season averages in chunks.
-    """
     out: Dict[int, dict] = {}
     if not player_ids:
         return out
 
-    chunk_size = 50
+    chunk_size = 40  # smaller chunks = fewer 429s
     for i in range(0, len(player_ids), chunk_size):
         chunk = player_ids[i:i+chunk_size]
         params = {"season": SEASON, "per_page": 100}
@@ -197,24 +198,21 @@ def bdl_season_averages(player_ids: List[int]) -> Dict[int, dict]:
     return out
 
 # ----------------------------
-# Optional Sportradar (we’ll use later)
+# Optional Sportradar (later)
 # ----------------------------
-def sportradar_injuries_optional() -> List[dict]:
+def sportradar_injuries_optional() -> None:
     if not SPORTRADAR_KEY:
         print("[WARN] SPORTRADAR_KEY not set; continuing WITHOUT injuries.")
-        return []
+        return
     url = "https://api.sportradar.com/nba/trial/v8/en/league/injuries.json"
     r = requests.get(url, params={"api_key": SPORTRADAR_KEY}, timeout=25)
     if r.status_code != 200:
         print(f"[WARN] Sportradar error {r.status_code}: {r.text[:200]}")
-        return []
-    try:
-        return r.json().get("teams", [])  # structure varies; we’ll wire it later
-    except Exception:
-        return []
+        return
+    print("[INFO] Sportradar key present (injury wiring comes next).")
 
 # ----------------------------
-# Edge logic (slow start): Season PPG vs Line
+# Edges (slow start): Season PPG vs line
 # ----------------------------
 def tier_and_reco(edge: float) -> Tuple[str, str]:
     if edge >= 3.0:
@@ -224,11 +222,6 @@ def tier_and_reco(edge: float) -> Tuple[str, str]:
     return "", ""
 
 def build_edges(props_rows: List[dict]) -> Tuple[List[dict], int]:
-    """
-    Build A/A+ edges using:
-    projection = season PPG
-    edge = proj - line
-    """
     clean: List[dict] = []
     player_ids: List[int] = []
 
@@ -238,21 +231,18 @@ def build_edges(props_rows: List[dict]) -> Tuple[List[dict], int]:
         pname = player.get("full_name") or player.get("name") or ""
         line = row.get("line")
 
-        if pid is None or not pname or line is None:
+        game = row.get("game") or {}
+        gid = game.get("id") or row.get("game_id")
+
+        if pid is None or not pname or line is None or gid is None:
             continue
 
         try:
             pid_i = int(pid)
+            gid_i = int(gid)
             line_f = float(line)
         except Exception:
             continue
-
-        game = row.get("game") or {}
-        gid = game.get("id") or row.get("game_id")
-        try:
-            gid_i = int(gid) if gid is not None else None
-        except Exception:
-            gid_i = None
 
         clean.append({
             "player_id": pid_i,
@@ -263,6 +253,8 @@ def build_edges(props_rows: List[dict]) -> Tuple[List[dict], int]:
         player_ids.append(pid_i)
 
     player_ids = sorted(list(set(player_ids)))
+    print(f"[INFO] Unique players w/ lines: {len(player_ids)}")
+
     avgs = bdl_season_averages(player_ids)
 
     ideas: List[dict] = []
@@ -270,6 +262,7 @@ def build_edges(props_rows: List[dict]) -> Tuple[List[dict], int]:
         pid = r["player_id"]
         avg = avgs.get(pid) or {}
         ppg = avg.get("pts")
+
         try:
             proj = float(ppg) if ppg is not None else 0.0
         except Exception:
@@ -333,14 +326,14 @@ def run():
         print("[INFO] Outside burst window; skipping scan.")
         return
 
-    # Optional injuries (not used in slow-start model yet)
-    sportradar_injuries_optional()
-
     if not BALLDONTLIE_API_KEY:
         send_one(f"⚠️ Missing BALLDONTLIE_API_KEY. ({ts_et})")
         return
 
-    # Fetch props via game_id loop (fixes your 400 error)
+    # Optional injuries (not used yet)
+    sportradar_injuries_optional()
+
+    # Fetch props via game_id loop
     try:
         props_rows = bdl_player_points_props_for_today(now_et)
     except Exception as e:
@@ -349,7 +342,11 @@ def run():
             send_one(f"⚠️ Agent ran ({ts_et}) but props fetch failed.\n{str(e)[:500]}")
         return
 
-    bet_ideas, props_clean_count = build_edges(props_rows)
+    # Reduce duplicates massively
+    reduced = reduce_props_rows(props_rows)
+    print(f"[INFO] BDL props rows reduced: {len(reduced)}")
+
+    bet_ideas, props_clean_count = build_edges(reduced)
 
     if HEARTBEAT_PING and in_burst:
         send_one(f"🟣 Heartbeat ({ts_et})\nProps cleaned: {props_clean_count}\nEdges: {len(bet_ideas)}")
@@ -363,7 +360,10 @@ def run():
             lines.append(f"🔥 {b['tier']} TIER — {b['reco']} bankroll")
             lines.append(f"{b['player_name']} OVER {b['line']:.1f} (edge +{b['edge']:.1f})")
             lines.append(f"Why: {b['why']}")
-            lines.append(f"#BET pid={b['player_id']} gid={b['game_id'] or 0} line={b['line']:.1f} proj={b['proj']:.1f} edge={b['edge']:.1f} tier={b['tier']}")
+            lines.append(
+                f"#BET pid={b['player_id']} gid={b['game_id']} "
+                f"line={b['line']:.1f} proj={b['proj']:.1f} edge={b['edge']:.1f} tier={b['tier']}"
+            )
             lines.append("")
         send_chunked("\n".join(lines))
         return
