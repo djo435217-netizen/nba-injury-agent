@@ -1,9 +1,10 @@
 import os
 import re
 import time
+import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import requests
 from twilio.rest import Client
@@ -37,6 +38,9 @@ MARKET = os.environ.get("MARKET", "player_points").strip().lower()
 
 # Example: 2025 means 2025-26 season
 SEASON = int(os.environ.get("SEASON", str(datetime.now(ET).year - 1)))
+
+# Debug: print sample odds rows structure
+DEBUG_SAMPLE = os.environ.get("DEBUG_SAMPLE", "1") in ("1", "true", "True")
 
 twilio = Client(TWILIO_SID, TWILIO_TOKEN)
 BDL_HEADERS = {"Authorization": BALLDONTLIE_API_KEY} if BALLDONTLIE_API_KEY else {}
@@ -83,6 +87,38 @@ def send_chunked(body: str, chunk_size: int = 1400) -> None:
     total = len(parts)
     for i, p in enumerate(parts, start=1):
         send_one(f"(Part {i}/{total})\n{p}")
+
+def _pick(d: dict, keys: List[str]):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
+
+def _as_int(x) -> Optional[int]:
+    try:
+        if x is None:
+            return None
+        return int(x)
+    except Exception:
+        return None
+
+def _as_float(x) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+def _safe_sample(row: Any, max_chars: int = 1200) -> str:
+    """
+    Print a sanitized/minified JSON sample to logs.
+    """
+    try:
+        s = json.dumps(row, ensure_ascii=False)[:max_chars]
+        return s
+    except Exception:
+        return str(row)[:max_chars]
 
 # ----------------------------
 # BallDontLie client (retry/backoff)
@@ -145,42 +181,23 @@ def bdl_player_points_props_for_today(now_et: datetime) -> List[dict]:
         try:
             rows = bdl_player_points_props_for_game(int(gid))
             all_rows.extend(rows)
-            time.sleep(0.35)  # reduce 429 risk
+            time.sleep(0.35)
         except Exception as e:
             print(f"[WARN] props fetch failed for game_id={gid}: {e}")
             continue
     print(f"[INFO] BDL props rows total: {len(all_rows)}")
+    if DEBUG_SAMPLE and all_rows:
+        print("[DEBUG] Sample row 1:", _safe_sample(all_rows[0]))
+        if len(all_rows) > 1:
+            print("[DEBUG] Sample row 2:", _safe_sample(all_rows[1]))
     return all_rows
-
-def reduce_props_rows(props_rows: List[dict]) -> List[dict]:
-    """
-    BDL returns MANY duplicate/alternate offers. Reduce to 1 row per (player, game).
-    This makes the job fast + avoids season_averages 429s.
-    """
-    best: Dict[Tuple[int, int], dict] = {}
-    for row in props_rows:
-        player = row.get("player") or {}
-        game = row.get("game") or {}
-        pid = player.get("id")
-        gid = game.get("id") or row.get("game_id")
-        line = row.get("line")
-        if pid is None or gid is None or line is None:
-            continue
-        try:
-            k = (int(pid), int(gid))
-            _ = float(line)
-        except Exception:
-            continue
-        if k not in best:
-            best[k] = row
-    return list(best.values())
 
 def bdl_season_averages(player_ids: List[int]) -> Dict[int, dict]:
     out: Dict[int, dict] = {}
     if not player_ids:
         return out
 
-    chunk_size = 40  # smaller chunks = fewer 429s
+    chunk_size = 40
     for i in range(0, len(player_ids), chunk_size):
         chunk = player_ids[i:i+chunk_size]
         params = {"season": SEASON, "per_page": 100}
@@ -198,18 +215,68 @@ def bdl_season_averages(player_ids: List[int]) -> Dict[int, dict]:
     return out
 
 # ----------------------------
-# Optional Sportradar (later)
+# Odds row parsing (robust)
 # ----------------------------
-def sportradar_injuries_optional() -> None:
-    if not SPORTRADAR_KEY:
-        print("[WARN] SPORTRADAR_KEY not set; continuing WITHOUT injuries.")
-        return
-    url = "https://api.sportradar.com/nba/trial/v8/en/league/injuries.json"
-    r = requests.get(url, params={"api_key": SPORTRADAR_KEY}, timeout=25)
-    if r.status_code != 200:
-        print(f"[WARN] Sportradar error {r.status_code}: {r.text[:200]}")
-        return
-    print("[INFO] Sportradar key present (injury wiring comes next).")
+def extract_prop_fields(row: dict) -> Optional[dict]:
+    """
+    Try multiple possible BDL v2 prop row shapes.
+    We need: player_id, player_name, game_id, line.
+    """
+    # Common direct keys
+    line = _as_float(_pick(row, ["line", "value", "stat_value", "prop_line"]))
+    game_id = _as_int(_pick(row, ["game_id"]))
+    player_id = _as_int(_pick(row, ["player_id"]))
+
+    # Nested player
+    player = row.get("player") or row.get("athlete") or row.get("participant") or row.get("entity") or {}
+    if player_id is None:
+        player_id = _as_int(_pick(player, ["id", "player_id"]))
+    player_name = _pick(player, ["full_name", "name", "display_name"])
+
+    # Nested game
+    game = row.get("game") or row.get("event") or {}
+    if game_id is None:
+        game_id = _as_int(_pick(game, ["id", "game_id", "event_id"]))
+
+    # Sometimes line is nested
+    if line is None:
+        odds = row.get("odds") or row.get("prices") or row.get("outcomes") or None
+        # If outcomes array exists, some providers place line there
+        if isinstance(odds, list) and odds:
+            line = _as_float(_pick(odds[0], ["line", "value", "stat_value"]))
+        elif isinstance(odds, dict):
+            line = _as_float(_pick(odds, ["line", "value", "stat_value"]))
+
+    if player_id is None or game_id is None or line is None:
+        return None
+
+    if not player_name:
+        # fallback: direct keys
+        player_name = _pick(row, ["player_name", "name"])
+
+    if not player_name:
+        player_name = f"player_id {player_id}"
+
+    return {
+        "player_id": int(player_id),
+        "player_name": str(player_name),
+        "game_id": int(game_id),
+        "line": float(line),
+    }
+
+def reduce_props_rows(props_rows: List[dict]) -> List[dict]:
+    """
+    Reduce to 1 row per (player_id, game_id) using extracted fields.
+    """
+    best: Dict[Tuple[int, int], dict] = {}
+    for row in props_rows:
+        ex = extract_prop_fields(row)
+        if not ex:
+            continue
+        k = (ex["player_id"], ex["game_id"])
+        if k not in best:
+            best[k] = ex
+    return list(best.values())
 
 # ----------------------------
 # Edges (slow start): Season PPG vs line
@@ -221,48 +288,16 @@ def tier_and_reco(edge: float) -> Tuple[str, str]:
         return "A", "30–40%"
     return "", ""
 
-def build_edges(props_rows: List[dict]) -> Tuple[List[dict], int]:
-    clean: List[dict] = []
-    player_ids: List[int] = []
-
-    for row in props_rows:
-        player = row.get("player") or {}
-        pid = player.get("id")
-        pname = player.get("full_name") or player.get("name") or ""
-        line = row.get("line")
-
-        game = row.get("game") or {}
-        gid = game.get("id") or row.get("game_id")
-
-        if pid is None or not pname or line is None or gid is None:
-            continue
-
-        try:
-            pid_i = int(pid)
-            gid_i = int(gid)
-            line_f = float(line)
-        except Exception:
-            continue
-
-        clean.append({
-            "player_id": pid_i,
-            "player_name": pname,
-            "game_id": gid_i,
-            "line": line_f,
-        })
-        player_ids.append(pid_i)
-
-    player_ids = sorted(list(set(player_ids)))
+def build_edges(reduced_rows: List[dict]) -> Tuple[List[dict], int]:
+    player_ids = sorted(list({r["player_id"] for r in reduced_rows}))
     print(f"[INFO] Unique players w/ lines: {len(player_ids)}")
-
     avgs = bdl_season_averages(player_ids)
 
     ideas: List[dict] = []
-    for r in clean:
+    for r in reduced_rows:
         pid = r["player_id"]
         avg = avgs.get(pid) or {}
         ppg = avg.get("pts")
-
         try:
             proj = float(ppg) if ppg is not None else 0.0
         except Exception:
@@ -288,7 +323,7 @@ def build_edges(props_rows: List[dict]) -> Tuple[List[dict], int]:
             "why": f"Season PPG {proj:.1f} vs line {r['line']:.1f}",
         })
 
-    # Dedup best edge per player
+    # Best per player
     best: Dict[int, dict] = {}
     for x in ideas:
         pid = x["player_id"]
@@ -296,7 +331,7 @@ def build_edges(props_rows: List[dict]) -> Tuple[List[dict], int]:
             best[pid] = x
 
     ideas = sorted(best.values(), key=lambda x: x["edge"], reverse=True)[:MAX_BET_IDEAS]
-    return ideas, len(clean)
+    return ideas, len(reduced_rows)
 
 # ----------------------------
 # MAIN
@@ -330,10 +365,7 @@ def run():
         send_one(f"⚠️ Missing BALLDONTLIE_API_KEY. ({ts_et})")
         return
 
-    # Optional injuries (not used yet)
-    sportradar_injuries_optional()
-
-    # Fetch props via game_id loop
+    # Fetch props
     try:
         props_rows = bdl_player_points_props_for_today(now_et)
     except Exception as e:
@@ -342,14 +374,19 @@ def run():
             send_one(f"⚠️ Agent ran ({ts_et}) but props fetch failed.\n{str(e)[:500]}")
         return
 
-    # Reduce duplicates massively
     reduced = reduce_props_rows(props_rows)
     print(f"[INFO] BDL props rows reduced: {len(reduced)}")
 
-    bet_ideas, props_clean_count = build_edges(reduced)
+    # If still zero, we need the sample logs to adjust extraction
+    if not reduced:
+        if SEND_NO_EDGE_PING and in_burst:
+            send_one(f"⚠️ Agent ran ({ts_et}) but couldn't parse any props rows yet.\nCheck Render logs for [DEBUG] Sample row output.")
+        return
+
+    bet_ideas, reduced_count = build_edges(reduced)
 
     if HEARTBEAT_PING and in_burst:
-        send_one(f"🟣 Heartbeat ({ts_et})\nProps cleaned: {props_clean_count}\nEdges: {len(bet_ideas)}")
+        send_one(f"🟣 Heartbeat ({ts_et})\nParsed props: {reduced_count}\nEdges: {len(bet_ideas)}")
 
     if bet_ideas:
         lines: List[str] = []
@@ -372,7 +409,7 @@ def run():
         send_one(
             f"✅ Agent scan complete ({ts_et})\n"
             f"No A-tier edges ≥ {EDGE_THRESHOLD:.1f}.\n"
-            f"Props cleaned: {props_clean_count}"
+            f"Parsed props: {reduced_count}"
         )
 
 if __name__ == "__main__":
