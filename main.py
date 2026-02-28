@@ -30,7 +30,7 @@ IMPACT_STATUSES_RAW = os.environ.get("IMPACT_STATUSES", "out,doubtful").strip()
 IMPACT_STATUSES = {x.strip().lower() for x in IMPACT_STATUSES_RAW.split(",") if x.strip()}
 IMPACT_ONLY_CHANGES = os.environ.get("IMPACT_ONLY_CHANGES", "1") == "1"
 
-# BallDontLie vendor(s): allow comma-separated fallback (e.g. "fanduel,fanatics")
+# Allow comma-separated vendors. Keep your default fanduel but allow fallback.
 BOOK_VENDOR_RAW = os.environ.get("BOOK_VENDOR", "fanduel").strip().lower()
 BOOK_VENDORS = [v.strip() for v in BOOK_VENDOR_RAW.split(",") if v.strip()]
 
@@ -53,18 +53,23 @@ MIN_PROB = float(os.environ.get("MIN_PROB", "0.60"))
 MIN_EDGE = float(os.environ.get("MIN_EDGE", str(EDGE_THRESHOLD)))
 STD_FLOOR = float(os.environ.get("STD_FLOOR", "5.0"))
 
-# Role trend (to avoid “same guys every day”)
-ROLE_LOOKBACK_SHORT = int(os.environ.get("ROLE_LOOKBACK_SHORT", "3"))   # L3
-ROLE_LOOKBACK_LONG = int(os.environ.get("ROLE_LOOKBACK_LONG", "10"))    # L10 (usually LOOKBACK_GAMES)
-ROLE_BOOST_MAX = float(os.environ.get("ROLE_BOOST_MAX", "0.18"))        # cap +18%
-ROLE_MIN_DELTA = float(os.environ.get("ROLE_MIN_DELTA", "2.0"))         # minutes increase threshold
+# Role trend
+ROLE_LOOKBACK_SHORT = int(os.environ.get("ROLE_LOOKBACK_SHORT", "3"))
+ROLE_LOOKBACK_LONG = int(os.environ.get("ROLE_LOOKBACK_LONG", "10"))
+ROLE_BOOST_MAX = float(os.environ.get("ROLE_BOOST_MAX", "0.18"))
+ROLE_MIN_DELTA = float(os.environ.get("ROLE_MIN_DELTA", "2.0"))
 
-# Injury boost caps (prevents wild projections)
+# Injury boost caps
 BOOST_CAP_PTS = float(os.environ.get("BOOST_CAP_PTS", "5.5"))
 BOOST_CAP_MIN = float(os.environ.get("BOOST_CAP_MIN", "6.0"))
 
-# Debug: print ONE sample points prop row to logs (set to 1 temporarily)
-DEBUG_POINTS_SAMPLE = os.environ.get("DEBUG_POINTS_SAMPLE", "0") == "1"
+# NEW: require real trigger signal (kills 0.0/0.0 vacated triggers)
+MIN_VAC_MIN = float(os.environ.get("MIN_VAC_MIN", "10.0"))   # must vacate at least 10 mins
+MIN_VAC_PTS = float(os.environ.get("MIN_VAC_PTS", "6.0"))    # or at least 6 points
+
+# NEW: sanity guard on points lines (main NBA points props are rarely < 6 for a listed player prop)
+MIN_POINTS_LINE = float(os.environ.get("MIN_POINTS_LINE", "6.0"))
+MAX_POINTS_LINE = float(os.environ.get("MAX_POINTS_LINE", "45.0"))
 
 # -------------------- UTILS --------------------
 def _now_et() -> datetime:
@@ -109,9 +114,6 @@ def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 def avg_pts_min_std(games):
-    """
-    Returns (avg_pts, avg_min, std_pts). games is list of (date, pts, min)
-    """
     if not games:
         return 0.0, 0.0, 0.0
     pts = [x[1] for x in games]
@@ -197,13 +199,12 @@ def parse_injuries(data):
 def status_in_scope(status: str) -> bool:
     return (status or "").strip().lower() in IMPACT_STATUSES
 
-# -------------------- BALLDONTLIE (RETRY + FALLBACK) --------------------
+# -------------------- BALLDONTLIE --------------------
 BDL_HEADERS = {"Authorization": BALLDONTLIE_API_KEY}
-BDL_PREFIXES = ["/nba", ""]  # try NBA namespace first, fallback legacy
+BDL_PREFIXES = ["/nba", ""]
 
 TEAM_CACHE = None
 PROPS_CACHE = {}  # (game_id, vendor_key) -> list
-DEBUG_PRINTED_ONCE = False
 
 BDL_MAX_RETRIES = int(os.environ.get("BDL_MAX_RETRIES", "5"))
 BDL_RETRY_BASE_SEC = float(os.environ.get("BDL_RETRY_BASE_SEC", "1.5"))
@@ -301,25 +302,6 @@ def bdl_find_player_id_on_team(team_short: str, full_name: str):
         if pid and nm and strip_suffix(nm) == t0:
             return int(pid)
 
-    # fallback: last name + first initial
-    try:
-        t_parts = t0.split(" ")
-        t_first = t_parts[0] if t_parts else ""
-        t_last = t_parts[-1] if t_parts else ""
-        for p in roster:
-            pid = p.get("id")
-            nm = f"{p.get('first_name','')} {p.get('last_name','')}".strip()
-            if not pid or not nm:
-                continue
-            n0 = strip_suffix(nm)
-            n_parts = n0.split(" ")
-            n_first = n_parts[0] if n_parts else ""
-            n_last = n_parts[-1] if n_parts else ""
-            if n_last == t_last and n_first[:1] == t_first[:1]:
-                return int(pid)
-    except Exception:
-        pass
-
     return None
 
 def bdl_last_n_games_stats(player_ids, season: int, n: int):
@@ -374,13 +356,6 @@ def bdl_games_today_ids(now_et: datetime):
     return [int(g["id"]) for g in (resp.get("data") or []) if g.get("id") is not None]
 
 def bdl_player_props_points(game_id: int, vendor: str | None):
-    """
-    Fetch points props for a single game_id.
-    We try vendor filtering (if supplied), but also allow a fallback with no vendor filter if empty.
-    Cached per run.
-    """
-    global DEBUG_PRINTED_ONCE
-
     vendor_key = vendor or ""
     cache_key = (int(game_id), vendor_key)
     if cache_key in PROPS_CACHE:
@@ -396,51 +371,85 @@ def bdl_player_props_points(game_id: int, vendor: str | None):
     except Exception:
         props = []
 
-    # Optional: print ONE sample points row to logs
-    if DEBUG_POINTS_SAMPLE and (not DEBUG_PRINTED_ONCE) and props:
-        print("[DEBUG] SAMPLE POINT PROP ROW:", json.dumps(props[0])[:2000])
-        DEBUG_PRINTED_ONCE = True
-
     PROPS_CACHE[cache_key] = props
     return props
 
+def _pick_main_points_line(rows_for_player):
+    """
+    Choose the MAIN line:
+    - If over/under odds exist -> choose line closest to -110/-110
+    - Else -> choose median line_value
+    """
+    if not rows_for_player:
+        return None
+
+    candidates = []
+    for pp in rows_for_player:
+        market = pp.get("market") or {}
+        if (market.get("type") or "").lower() != "over_under":
+            continue
+        try:
+            line = float(pp.get("line_value"))
+        except Exception:
+            continue
+
+        if line < MIN_POINTS_LINE or line > MAX_POINTS_LINE:
+            continue
+
+        over = market.get("over_odds")
+        under = market.get("under_odds")
+
+        if isinstance(over, (int, float)) and isinstance(under, (int, float)):
+            dist = abs(abs(float(over)) - 110.0) + abs(abs(float(under)) - 110.0)
+        else:
+            dist = None
+
+        candidates.append((dist, line))
+
+    if not candidates:
+        return None
+
+    # Prefer those with odds-distance (dist not None)
+    with_dist = [c for c in candidates if c[0] is not None]
+    if with_dist:
+        with_dist.sort(key=lambda x: x[0])
+        return with_dist[0][1]
+
+    # fallback: median line
+    lines = sorted([c[1] for c in candidates])
+    mid = len(lines) // 2
+    if len(lines) % 2 == 1:
+        return lines[mid]
+    return 0.5 * (lines[mid - 1] + lines[mid])
+
 def points_line_for_player(game_id: int, player_id: int):
-    """
-    Find the primary over/under line for points.
-    Uses schema field: line_value.
-    """
-    # Try each vendor in order, then fallback without vendor
+    # Try each vendor, then fallback without vendor
     for v in BOOK_VENDORS + [None]:
         props = bdl_player_props_points(game_id, v)
         if not props:
             continue
+
+        rows_for_player = []
         for pp in props:
             try:
                 if int(pp.get("player_id", -1)) != int(player_id):
                     continue
             except Exception:
                 continue
+            rows_for_player.append(pp)
 
-            # market type "over_under" expected
-            market = pp.get("market") or {}
-            if (market.get("type") or "").lower() != "over_under":
-                continue
+        line = _pick_main_points_line(rows_for_player)
+        if line is not None:
+            return float(line)
 
-            try:
-                return float(pp.get("line_value"))
-            except Exception:
-                continue
     return None
 
-# -------------------- BETTING LOGIC (SMARTER) --------------------
+# -------------------- SMARTER BETTING LOGIC --------------------
 def _role_trend(games):
-    """
-    Returns (mins_short, mins_long, ppm_short, ppm_long)
-    games expected sorted by date ascending.
-    """
     if not games:
         return 0.0, 0.0, 0.0, 0.0
     g = list(games)
+
     long_n = min(len(g), ROLE_LOOKBACK_LONG)
     short_n = min(len(g), ROLE_LOOKBACK_SHORT)
 
@@ -472,20 +481,26 @@ def build_team_bet_ideas(team_short, injured_name, injured_status,
     if not roster_tuples:
         return []
 
-    # Estimate vacated production
     injured_pid = bdl_find_player_id_on_team(team_short, injured_name)
-    vac_pts, vac_min = 12.0, 26.0
-    if injured_pid:
-        inj_stats = bdl_last_n_games_stats([injured_pid], season, LOOKBACK_GAMES).get(injured_pid, [])
-        ip, im, _ = avg_pts_min_std(inj_stats)
-        if len(inj_stats) >= 3:
-            vac_pts, vac_min = ip, im
+    if not injured_pid:
+        return []  # must be matchable to use as a real trigger
+
+    inj_stats = bdl_last_n_games_stats([injured_pid], season, LOOKBACK_GAMES).get(injured_pid, [])
+    ip, im, _ = avg_pts_min_std(inj_stats)
+    if len(inj_stats) < 3:
+        return []  # not enough data to treat this as a strong trigger
+
+    vac_pts, vac_min = ip, im
 
     # Injury certainty weighting
     status = (injured_status or "").lower()
     STATUS_MULT = {"out": 1.0, "doubtful": 0.8, "questionable": 0.55}.get(status, 0.65)
     vac_pts *= STATUS_MULT
     vac_min *= STATUS_MULT
+
+    # Require meaningful vacancy
+    if not ((vac_min >= MIN_VAC_MIN) or (vac_pts >= MIN_VAC_PTS)):
+        return []
 
     pids = [pid for pid, _ in roster_tuples]
     stats = bdl_last_n_games_stats(pids, season, LOOKBACK_GAMES)
@@ -497,22 +512,20 @@ def build_team_bet_ideas(team_short, injured_name, injured_status,
         if min_avg < 10:
             continue
 
-        # Role trend: minutes + ppm change (L3 vs L10)
         min_s, min_l, ppm_s, ppm_l = _role_trend(g)
         min_delta = min_s - min_l
         ppm_delta = ppm_s - ppm_l
 
         ppm = pts_avg / max(min_avg, 1e-6)
 
-        # Absorption score: base + rewards for upward role trend
+        # Reward only “role rising” players
         role_bonus = 0.0
         if min_delta >= ROLE_MIN_DELTA:
-            role_bonus += min(ROLE_BOOST_MAX, (min_delta / 10.0) * 0.10)  # up to ~+10%
+            role_bonus += min(ROLE_BOOST_MAX, (min_delta / 10.0) * 0.10)
         if ppm_delta > 0.05:
-            role_bonus += min(ROLE_BOOST_MAX, (ppm_delta / 0.25) * 0.08)  # up to ~+8%
+            role_bonus += min(ROLE_BOOST_MAX, (ppm_delta / 0.25) * 0.08)
 
-        score = (W_PPM * ppm) + (W_MIN * min_avg) + (role_bonus * 10.0)  # scaled
-
+        score = (W_PPM * ppm) + (W_MIN * min_avg) + (role_bonus * 10.0)
         scored.append((score, pid, nm, pts_avg, min_avg, ppm, std_pts, role_bonus, min_delta, ppm_delta))
 
     scored.sort(reverse=True)
@@ -528,7 +541,6 @@ def build_team_bet_ideas(team_short, injured_name, injured_status,
     ideas = []
 
     for score, pid, nm, pts_avg, min_avg, ppm, std_pts, role_bonus, min_delta, ppm_delta in candidates:
-        # find today’s line
         line = None
         use_gid = None
         for gid in game_ids:
@@ -539,19 +551,15 @@ def build_team_bet_ideas(team_short, injured_name, injured_status,
         if line is None:
             continue
 
-        # Baseline regression (prevents constant “same guys” from dominating)
+        # Regression baseline: anchor toward the market line
         seasonish = (0.70 * pts_avg) + (0.30 * line)
         base_proj = 0.55 * seasonish + 0.45 * pts_avg
 
-        # Injury boost allocation prefers “role rising” guys
         share = score / total_score
-
         boost_pts = min(BOOST_CAP_PTS, vac_pts * share * 0.75)
         boost_min = min(BOOST_CAP_MIN, vac_min * share * 0.35)
 
         proj = base_proj + boost_pts + (boost_min * ppm * 0.20)
-
-        # Apply role bonus multiplicatively (changes rankings day-to-day)
         proj *= (1.0 + min(ROLE_BOOST_MAX, role_bonus))
 
         edge = proj - line
@@ -568,7 +576,7 @@ def build_team_bet_ideas(team_short, injured_name, injured_status,
             f"{injured_name} {injured_status.upper()} → vacates ~{vac_pts:.1f} pts / {vac_min:.1f} min. "
             f"{nm} L{LOOKBACK_GAMES}: {pts_avg:.1f} pts in {min_avg:.1f} min (ppm {ppm:.2f}). "
             f"Role: Δmin(L{ROLE_LOOKBACK_SHORT}−L{ROLE_LOOKBACK_LONG})={min_delta:+.1f}, Δppm={ppm_delta:+.2f}. "
-            f"Proj {proj:.1f} vs line {line:.1f} | edge +{edge:.1f} | P(over)≈{prob_over*100:.0f}%."
+            f"Proj {proj:.1f} vs MAIN line {line:.1f} | edge +{edge:.1f} | P(over)≈{prob_over*100:.0f}%."
         )
 
         ideas.append({
@@ -620,8 +628,6 @@ def run():
         injured_name = cur.get("name", "")
         injured_status = (cur.get("status") or "").strip()
 
-        triggers.append(f"{injured_name} ({team_short}) {injured_status}")
-
         ideas = build_team_bet_ideas(
             team_short=team_short,
             injured_name=injured_name,
@@ -629,11 +635,15 @@ def run():
             exclude_names_lower=exclude_names_lower | {_clean_name(injured_name)},
             now_et=now_et
         )
+
+        if ideas:
+            triggers.append(f"{injured_name} ({team_short}) {injured_status}")
+
         for i in ideas:
             i["trigger"] = f"{injured_name} ({team_short}) {injured_status}"
         bet_ideas.extend(ideas)
 
-    # dedupe by player, keep best edge
+    # dedupe by player, keep best
     best = {}
     for i in bet_ideas:
         k = _clean_name(i["player_name"])
@@ -660,7 +670,7 @@ def run():
         send_chunked("\n".join(msg).strip())
     else:
         if SEND_NO_EDGE_PING and _in_burst_window(now_et):
-            send_one(f"🧠 No points edges ≥ {MIN_EDGE:.1f} and P(over) ≥ {MIN_PROB:.2f} this run. ({ts_et})")
+            send_one(f"🧠 No MAIN-line points edges ≥ {MIN_EDGE:.1f} and P(over) ≥ {MIN_PROB:.2f}. ({ts_et})")
 
     state["players"] = new_players
     save_state(state)
