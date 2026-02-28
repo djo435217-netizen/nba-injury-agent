@@ -33,12 +33,10 @@ IMPACT_ONLY_CHANGES = os.environ.get("IMPACT_ONLY_CHANGES", "1") == "1"
 BOOK_VENDOR_RAW = os.environ.get("BOOK_VENDOR", "fanduel").strip().lower()
 BOOK_VENDORS = [v.strip() for v in BOOK_VENDOR_RAW.split(",") if v.strip()]
 
-PROP_TYPE = os.environ.get("PROP_TYPE", "points").strip().lower()
-
 # Multi-horizon windows
-BASELINE_GAMES = int(os.environ.get("BASELINE_GAMES", "30"))  # "season-ish" baseline
-LOOKBACK_GAMES = int(os.environ.get("LOOKBACK_GAMES", "10"))   # recent
-SHORT_GAMES = int(os.environ.get("SHORT_GAMES", "3"))          # trend
+BASELINE_GAMES = int(os.environ.get("BASELINE_GAMES", "30"))
+LOOKBACK_GAMES = int(os.environ.get("LOOKBACK_GAMES", "10"))
+SHORT_GAMES = int(os.environ.get("SHORT_GAMES", "3"))
 
 # Projection blend weights
 W_BASE = float(os.environ.get("W_BASE", "0.45"))
@@ -203,18 +201,6 @@ def send_chunked(full_text: str):
 def status_in_scope(status: str) -> bool:
     return (status or "").strip().lower() in IMPACT_STATUSES
 
-def _name_from_prop_row(pp: dict) -> str | None:
-    p = pp.get("player") or {}
-    fn = (p.get("first_name") or "").strip()
-    ln = (p.get("last_name") or "").strip()
-    if fn or ln:
-        return f"{fn} {ln}".strip()
-    for k in ("player_name", "name", "full_name"):
-        v = (pp.get(k) or "").strip()
-        if v:
-            return v
-    return None
-
 
 # -------------------- SPORTRADAR --------------------
 def fetch_sportradar_injuries():
@@ -258,6 +244,9 @@ BDL_MAX_PAGES = int(os.environ.get("BDL_MAX_PAGES", "10"))
 TEAM_CACHE = None
 PROPS_CACHE = {}
 DEBUG_PRINTED_ONCE = False
+
+# ✅ NEW: Name cache from stats endpoint
+PLAYER_NAME_CACHE = {}  # pid -> "First Last"
 
 def _bdl_get(path: str, params=None, timeout: int = 20) -> dict:
     last_err = None
@@ -348,14 +337,17 @@ def bdl_last_n_games_stats(player_ids, season: int, n: int):
     out = {int(pid): [] for pid in player_ids}
     if not player_ids:
         return out
+
     cursor = None
     pages = 0
     while pages < BDL_MAX_PAGES:
         params = {"per_page": min(BDL_PER_PAGE, 100), "seasons[]": [season], "player_ids[]": player_ids}
         if cursor is not None:
             params["cursor"] = cursor
+
         resp = _bdl_get("/v1/stats", params=params)
         rows = resp.get("data") or []
+
         for row in rows:
             p = row.get("player") or {}
             pid = p.get("id")
@@ -364,18 +356,28 @@ def bdl_last_n_games_stats(player_ids, season: int, n: int):
             pid = int(pid)
             if pid not in out:
                 continue
+
+            # ✅ NEW: capture name from stats rows
+            fn = (p.get("first_name") or "").strip()
+            ln = (p.get("last_name") or "").strip()
+            if (fn or ln) and pid not in PLAYER_NAME_CACHE:
+                PLAYER_NAME_CACHE[pid] = f"{fn} {ln}".strip()
+
             game = row.get("game") or {}
             date = game.get("date")
             pts = float(row.get("pts", 0) or 0)
             mins = _parse_minutes(row.get("min"))
             if date:
                 out[pid].append((date, pts, mins))
+
         if all(len(out[int(pid)]) >= n for pid in player_ids):
             break
+
         cursor = (resp.get("meta") or {}).get("next_cursor")
         pages += 1
         if not cursor:
             break
+
     for pid in list(out.keys()):
         g = out[pid]
         g.sort(key=lambda x: x[0])
@@ -387,17 +389,21 @@ def bdl_player_props_points(game_id: int, vendor: str | None):
     key = (int(game_id), vendor or "")
     if key in PROPS_CACHE:
         return PROPS_CACHE[key]
+
     params = {"game_id": int(game_id), "prop_type": "points"}
     if vendor:
         params["vendors[]"] = [vendor]
+
     try:
         resp = _bdl_get("/v2/odds/player_props", params=params)
         props = resp.get("data") or []
     except Exception:
         props = []
+
     if DEBUG_POINTS_SAMPLE and (not DEBUG_PRINTED_ONCE) and props:
         print("[DEBUG] SAMPLE POINT PROP ROW:", json.dumps(props[0])[:2000])
         DEBUG_PRINTED_ONCE = True
+
     PROPS_CACHE[key] = props
     return props
 
@@ -457,12 +463,11 @@ def compute_projection_and_prob(games_all, line, injury_boost_pts=0.0, injury_bo
     l10_slice = _slice_last(games_all, LOOKBACK_GAMES)
     l3_slice = _slice_last(games_all, SHORT_GAMES)
 
-    base_avg, base_min, base_std = avg_pts_min_std(base_slice)
+    base_avg, _, base_std = avg_pts_min_std(base_slice)
     l10_avg, l10_min, l10_std = avg_pts_min_std(l10_slice)
-    l3_avg, l3_min, l3_std = avg_pts_min_std(l3_slice)
+    l3_avg, _, _ = avg_pts_min_std(l3_slice)
 
     sigma = max(STD_FLOOR, (l10_std if l10_std > 0 else base_std if base_std > 0 else STD_FLOOR))
-
     proj = (W_BASE * base_avg) + (W_L10 * l10_avg) + (W_L3 * l3_avg) + (W_LINE * line)
 
     ppm = l10_avg / max(l10_min, 1e-6)
@@ -566,7 +571,7 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
             injury_boost_pts=injury_boost_pts,
             injury_boost_min=injury_boost_min
         )
-        base_avg, l10_avg2, l3_avg, l10_min2, sigma, ppm = aux
+        base_avg, l10_avg2, l3_avg, l10_min2, _, _ = aux
 
         if edge < MIN_EDGE or prob_over < MIN_PROB:
             continue
@@ -612,7 +617,6 @@ def slate_scan_edges(now_et):
         return []
 
     player_to_best_line = {}  # pid -> (line, gid)
-    pid_to_name = {}          # NEW: capture names from props
     pulled = 0
 
     for gid in game_ids:
@@ -633,12 +637,7 @@ def slate_scan_edges(now_et):
                 pid = int(pid)
             except Exception:
                 continue
-
             by_pid.setdefault(pid, []).append(pp)
-
-            nm = _name_from_prop_row(pp)
-            if nm and pid not in pid_to_name:
-                pid_to_name[pid] = nm
 
         for pid, rows in by_pid.items():
             if pid in player_to_best_line:
@@ -657,7 +656,7 @@ def slate_scan_edges(now_et):
         return []
 
     pids = list(player_to_best_line.keys())
-    stats = bdl_last_n_games_stats(pids, season, BASELINE_GAMES)
+    stats = bdl_last_n_games_stats(pids, season, BASELINE_GAMES)  # fills PLAYER_NAME_CACHE
 
     ideas = []
     for pid in pids:
@@ -678,12 +677,14 @@ def slate_scan_edges(now_et):
         ppm_delta = ppm_s - ppm_l
 
         proj, edge, prob_over, aux = compute_projection_and_prob(games_all=games, line=line)
-        base_avg, l10_avg2, l3_avg, l10_min2, sigma, ppm = aux
+        base_avg, l10_avg2, l3_avg, l10_min2, _, _ = aux
 
         if edge < MIN_EDGE or prob_over < MIN_PROB:
             continue
         if min_delta < MIN_DELTA_FLOOR and edge < (MIN_EDGE + 2.0):
             continue
+
+        name = PLAYER_NAME_CACHE.get(int(pid), f"Player {pid}")
 
         why = (
             f"SlateScan. base(L{BASELINE_GAMES}) {base_avg:.1f}, L10 {l10_avg2:.1f}, L3 {l3_avg:.1f} "
@@ -693,7 +694,7 @@ def slate_scan_edges(now_et):
 
         ideas.append({
             "section": "slate",
-            "player_name": pid_to_name.get(pid, f"Player {pid}"),
+            "player_name": name,
             "player_id": pid,
             "line": float(line),
             "proj": float(proj),
