@@ -71,6 +71,12 @@ MIN_VAC_PTS = float(os.environ.get("MIN_VAC_PTS", "6.0"))
 MIN_POINTS_LINE = float(os.environ.get("MIN_POINTS_LINE", "6.0"))
 MAX_POINTS_LINE = float(os.environ.get("MAX_POINTS_LINE", "45.0"))
 
+# NEW: line sanity vs baseline (kills “sticky” repeats when line is too far below avg)
+LINE_MIN_GAP = float(os.environ.get("LINE_MIN_GAP", "8.0"))
+
+# NEW: minutes-collapse guardrail
+MIN_DELTA_FLOOR = float(os.environ.get("MIN_DELTA_FLOOR", "-3.0"))
+
 # Debug: print one sample points prop row (set to 1 temporarily)
 DEBUG_POINTS_SAMPLE = os.environ.get("DEBUG_POINTS_SAMPLE", "0") == "1"
 
@@ -540,7 +546,6 @@ def build_team_bet_ideas(team_short, injured_name, injured_status,
         return []
 
     # Trigger Strength (0–100-ish)
-    # Weighted by both minutes + points; scaled modestly.
     trigger_strength = min(100.0, (vac_min * 1.2 + vac_pts * 1.5))
 
     # Pull stats for roster
@@ -573,8 +578,8 @@ def build_team_bet_ideas(team_short, injured_name, injured_status,
             absorption += 0.10
         absorption = min(0.65, absorption)
 
-        # Score (keeps your style but adds trigger strength)
-        score = (W_PPM * ppm) + (W_MIN * min_avg) + (absorption * 6.0) + (trigger_strength / 35.0)
+        # ✅ UPDATED: Trigger strength weighted harder to drive slate variation
+        score = (W_PPM * ppm) + (W_MIN * min_avg) + (absorption * 6.0) + (trigger_strength / 22.0)
 
         scored.append((score, pid, nm, pts_avg, min_avg, ppm, std_pts, absorption, min_delta, ppm_delta))
 
@@ -588,7 +593,6 @@ def build_team_bet_ideas(team_short, injured_name, injured_status,
     if not game_ids:
         return []
 
-    total_score = sum(c[0] for c in candidates) or 1.0
     ideas = []
 
     for score, pid, nm, pts_avg, min_avg, ppm, std_pts, absorption, min_delta, ppm_delta in candidates:
@@ -602,8 +606,11 @@ def build_team_bet_ideas(team_short, injured_name, injured_status,
         if line is None:
             continue
 
-        # Projection:
-        # anchor toward line to reduce “same guy always”
+        # ✅ NEW: Line sanity check vs baseline (kills sticky repeats / stale lines)
+        if (pts_avg - line) > LINE_MIN_GAP:
+            continue
+
+        # Projection: anchor toward line to reduce “same guy always”
         base_proj = 0.60 * pts_avg + 0.40 * line
 
         # Injury-driven boost (allocated by absorption)
@@ -612,7 +619,7 @@ def build_team_bet_ideas(team_short, injured_name, injured_status,
 
         proj = base_proj + injury_boost_pts + (injury_boost_min * ppm * 0.20)
 
-        # Role bonus multiplicative (changes slate-to-slate)
+        # Role bonus multiplicative
         role_bonus = 0.0
         if min_delta >= ROLE_MIN_DELTA:
             role_bonus += min(ROLE_BOOST_MAX, (min_delta / 10.0) * 0.10)
@@ -622,6 +629,10 @@ def build_team_bet_ideas(team_short, injured_name, injured_status,
 
         edge = proj - line
         if edge < MIN_EDGE:
+            continue
+
+        # ✅ NEW: Minutes collapse guardrail (only allow if edge is significantly better)
+        if min_delta < MIN_DELTA_FLOOR and edge < (MIN_EDGE + 1.5):
             continue
 
         sigma = max(STD_FLOOR, std_pts if std_pts > 0 else STD_FLOOR)
@@ -660,10 +671,10 @@ def run():
     now_et = _now_et()
     ts_et = now_et.strftime("%Y-%m-%d %I:%M %p ET")
 
-    # quick boot print (helps logs)
     print(
         f"[BOOT] ts={ts_et} TEST_MODE={int(TEST_MODE)} "
         f"MIN_EDGE={MIN_EDGE} MIN_PROB={MIN_PROB} "
+        f"LINE_MIN_GAP={LINE_MIN_GAP} MIN_DELTA_FLOOR={MIN_DELTA_FLOOR} "
         f"BOOK_VENDORS={','.join(BOOK_VENDORS)}"
     )
 
@@ -710,14 +721,18 @@ def run():
 
         bet_ideas.extend(ideas)
 
-    # Dedupe by player name: keep best trigger_strength then edge
+    # Dedupe by player name: keep best by trigger_strength then edge
     best = {}
     for i in bet_ideas:
         k = _clean_name(i["player_name"])
         if (k not in best) or ((i["trigger_strength"], i["edge"]) > (best[k]["trigger_strength"], best[k]["edge"])):
             best[k] = i
 
-    bet_ideas = sorted(best.values(), key=lambda x: (x["trigger_strength"], x["edge"], x["prob_over"]), reverse=True)[:MAX_BET_IDEAS]
+    bet_ideas = sorted(
+        best.values(),
+        key=lambda x: (x["trigger_strength"], x["edge"], x["prob_over"]),
+        reverse=True
+    )[:MAX_BET_IDEAS]
 
     if bet_ideas:
         msg = [f"💰 FanDuel Points Bet Ideas ({ts_et})", ""]
