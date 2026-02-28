@@ -40,7 +40,7 @@ BASELINE_GAMES = int(os.environ.get("BASELINE_GAMES", "30"))  # "season-ish" bas
 LOOKBACK_GAMES = int(os.environ.get("LOOKBACK_GAMES", "10"))   # recent
 SHORT_GAMES = int(os.environ.get("SHORT_GAMES", "3"))          # trend
 
-# Projection blend weights (must sum ~1, doesn't have to be exact)
+# Projection blend weights
 W_BASE = float(os.environ.get("W_BASE", "0.45"))
 W_L10 = float(os.environ.get("W_L10", "0.35"))
 W_L3 = float(os.environ.get("W_L3", "0.10"))
@@ -59,8 +59,8 @@ STD_FLOOR = float(os.environ.get("STD_FLOOR", "5.0"))
 # Guardrails
 MIN_POINTS_LINE = float(os.environ.get("MIN_POINTS_LINE", "6.0"))
 MAX_POINTS_LINE = float(os.environ.get("MAX_POINTS_LINE", "45.0"))
-LINE_MIN_GAP = float(os.environ.get("LINE_MIN_GAP", "8.0"))        # if avg10 - line too large => probably stale/weird
-MIN_DELTA_FLOOR = float(os.environ.get("MIN_DELTA_FLOOR", "-3.0"))  # minutes collapse floor
+LINE_MIN_GAP = float(os.environ.get("LINE_MIN_GAP", "8.0"))
+MIN_DELTA_FLOOR = float(os.environ.get("MIN_DELTA_FLOOR", "-3.0"))
 
 # Injury vacancy requirements
 MIN_VAC_MIN = float(os.environ.get("MIN_VAC_MIN", "10.0"))
@@ -78,11 +78,11 @@ BURST_END_ET = os.environ.get("BURST_END_ET", "23:45").strip()
 # Slate Scan toggles
 ENABLE_SLATE_SCAN = os.environ.get("ENABLE_SLATE_SCAN", "1") == "1"
 SLATE_ONLY_IN_BURST = os.environ.get("SLATE_ONLY_IN_BURST", "1") == "1"
-SLATE_SCAN_MAX_PLAYERS = int(os.environ.get("SLATE_SCAN_MAX_PLAYERS", "260"))  # cap API load
+SLATE_SCAN_MAX_PLAYERS = int(os.environ.get("SLATE_SCAN_MAX_PLAYERS", "260"))
 
-# Cooldown (prevents repeats)
-BET_COOLDOWN_MIN = int(os.environ.get("BET_COOLDOWN_MIN", "180"))  # 3 hours
-EDGE_JUMP_TO_RESEND = float(os.environ.get("EDGE_JUMP_TO_RESEND", "1.5"))  # resend early if edge improves
+# Cooldown
+BET_COOLDOWN_MIN = int(os.environ.get("BET_COOLDOWN_MIN", "180"))
+EDGE_JUMP_TO_RESEND = float(os.environ.get("EDGE_JUMP_TO_RESEND", "1.5"))
 
 # Debug
 DEBUG_POINTS_SAMPLE = os.environ.get("DEBUG_POINTS_SAMPLE", "0") == "1"
@@ -147,9 +147,6 @@ def _slice_last(games, n):
     return games[-min(len(games), n):]
 
 def _role_trend(games):
-    """
-    Return: min_short, min_long, ppm_short, ppm_long
-    """
     if not games:
         return 0.0, 0.0, 0.0, 0.0
     long_slice = _slice_last(games, LOOKBACK_GAMES)
@@ -206,6 +203,18 @@ def send_chunked(full_text: str):
 def status_in_scope(status: str) -> bool:
     return (status or "").strip().lower() in IMPACT_STATUSES
 
+def _name_from_prop_row(pp: dict) -> str | None:
+    p = pp.get("player") or {}
+    fn = (p.get("first_name") or "").strip()
+    ln = (p.get("last_name") or "").strip()
+    if fn or ln:
+        return f"{fn} {ln}".strip()
+    for k in ("player_name", "name", "full_name"):
+        v = (pp.get(k) or "").strip()
+        if v:
+            return v
+    return None
+
 
 # -------------------- SPORTRADAR --------------------
 def fetch_sportradar_injuries():
@@ -237,7 +246,7 @@ def parse_injuries(data):
     return flat_by_player
 
 
-# -------------------- BALLDONTLIE (retry + caching) --------------------
+# -------------------- BALLDONTLIE --------------------
 BDL_HEADERS = {"Authorization": BALLDONTLIE_API_KEY}
 BDL_PREFIXES = ["/nba", ""]
 
@@ -247,7 +256,7 @@ BDL_PER_PAGE = int(os.environ.get("BDL_PER_PAGE", "100"))
 BDL_MAX_PAGES = int(os.environ.get("BDL_MAX_PAGES", "10"))
 
 TEAM_CACHE = None
-PROPS_CACHE = {}   # (game_id, vendor) -> list
+PROPS_CACHE = {}
 DEBUG_PRINTED_ONCE = False
 
 def _bdl_get(path: str, params=None, timeout: int = 20) -> dict:
@@ -298,7 +307,6 @@ def bdl_active_roster(team_short: str):
     team_id = team_map.get(team_short)
     if not team_id:
         return []
-
     players = []
     cursor = None
     pages = 0
@@ -312,7 +320,6 @@ def bdl_active_roster(team_short: str):
         pages += 1
         if not cursor:
             break
-
     out = []
     for p in players:
         team = p.get("team") or {}
@@ -324,15 +331,12 @@ def bdl_find_player_id_on_team(team_short: str, full_name: str):
     roster = bdl_active_roster(team_short)
     if not roster:
         return None
-
     def strip_suffix(n: str) -> str:
         n = _clean_name(n)
         n = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", "", n).strip()
         n = re.sub(r"\s+", " ", n)
         return n
-
     t0 = strip_suffix(full_name)
-
     for p in roster:
         pid = p.get("id")
         nm = f"{p.get('first_name','')} {p.get('last_name','')}".strip()
@@ -341,23 +345,17 @@ def bdl_find_player_id_on_team(team_short: str, full_name: str):
     return None
 
 def bdl_last_n_games_stats(player_ids, season: int, n: int):
-    """
-    Returns dict[player_id] -> list[(date, pts, min)] length<=n
-    """
     out = {int(pid): [] for pid in player_ids}
     if not player_ids:
         return out
-
     cursor = None
     pages = 0
     while pages < BDL_MAX_PAGES:
         params = {"per_page": min(BDL_PER_PAGE, 100), "seasons[]": [season], "player_ids[]": player_ids}
         if cursor is not None:
             params["cursor"] = cursor
-
         resp = _bdl_get("/v1/stats", params=params)
         rows = resp.get("data") or []
-
         for row in rows:
             p = row.get("player") or {}
             pid = p.get("id")
@@ -366,23 +364,18 @@ def bdl_last_n_games_stats(player_ids, season: int, n: int):
             pid = int(pid)
             if pid not in out:
                 continue
-
             game = row.get("game") or {}
             date = game.get("date")
             pts = float(row.get("pts", 0) or 0)
             mins = _parse_minutes(row.get("min"))
             if date:
                 out[pid].append((date, pts, mins))
-
-        # stop early if everyone has enough
         if all(len(out[int(pid)]) >= n for pid in player_ids):
             break
-
         cursor = (resp.get("meta") or {}).get("next_cursor")
         pages += 1
         if not cursor:
             break
-
     for pid in list(out.keys()):
         g = out[pid]
         g.sort(key=lambda x: x[0])
@@ -390,36 +383,25 @@ def bdl_last_n_games_stats(player_ids, season: int, n: int):
     return out
 
 def bdl_player_props_points(game_id: int, vendor: str | None):
-    """
-    Cached: returns list of prop rows for this game/vendor.
-    """
     global DEBUG_PRINTED_ONCE
     key = (int(game_id), vendor or "")
     if key in PROPS_CACHE:
         return PROPS_CACHE[key]
-
     params = {"game_id": int(game_id), "prop_type": "points"}
     if vendor:
         params["vendors[]"] = [vendor]
-
     try:
         resp = _bdl_get("/v2/odds/player_props", params=params)
         props = resp.get("data") or []
     except Exception:
         props = []
-
     if DEBUG_POINTS_SAMPLE and (not DEBUG_PRINTED_ONCE) and props:
         print("[DEBUG] SAMPLE POINT PROP ROW:", json.dumps(props[0])[:2000])
         DEBUG_PRINTED_ONCE = True
-
     PROPS_CACHE[key] = props
     return props
 
 def _pick_main_points_line(rows_for_player):
-    """
-    Prefer closest to -110/-110. Else median.
-    Enforces MIN_POINTS_LINE..MAX_POINTS_LINE.
-    """
     if not rows_for_player:
         return None
     candidates = []
@@ -451,9 +433,6 @@ def _pick_main_points_line(rows_for_player):
     return lines[mid] if len(lines) % 2 == 1 else 0.5 * (lines[mid - 1] + lines[mid])
 
 def points_line_for_player(game_id: int, player_id: int):
-    """
-    Find player's MAIN points line for this game using vendor preference fallback.
-    """
     for v in BOOK_VENDORS + [None]:
         props = bdl_player_props_points(game_id, v)
         if not props:
@@ -474,14 +453,6 @@ def points_line_for_player(game_id: int, player_id: int):
 
 # -------------------- PROJECTION CORE --------------------
 def compute_projection_and_prob(games_all, line, injury_boost_pts=0.0, injury_boost_min=0.0):
-    """
-    Multi-horizon projection:
-      - baseline window (L30 default)
-      - L10
-      - L3
-      - line anchor
-    """
-    # Need enough data
     base_slice = _slice_last(games_all, BASELINE_GAMES)
     l10_slice = _slice_last(games_all, LOOKBACK_GAMES)
     l3_slice = _slice_last(games_all, SHORT_GAMES)
@@ -490,15 +461,11 @@ def compute_projection_and_prob(games_all, line, injury_boost_pts=0.0, injury_bo
     l10_avg, l10_min, l10_std = avg_pts_min_std(l10_slice)
     l3_avg, l3_min, l3_std = avg_pts_min_std(l3_slice)
 
-    # use L10 std primarily, fall back to baseline
     sigma = max(STD_FLOOR, (l10_std if l10_std > 0 else base_std if base_std > 0 else STD_FLOOR))
 
-    # blended base
     proj = (W_BASE * base_avg) + (W_L10 * l10_avg) + (W_L3 * l3_avg) + (W_LINE * line)
 
-    # ppm for minutes-based injury boost conversion
     ppm = l10_avg / max(l10_min, 1e-6)
-
     proj += injury_boost_pts
     proj += (injury_boost_min * ppm * 0.20)
 
@@ -511,11 +478,9 @@ def compute_projection_and_prob(games_all, line, injury_boost_pts=0.0, injury_bo
 # -------------------- INJURY ENGINE --------------------
 def build_injury_edges(team_short, injured_name, injured_status, exclude_names_lower, now_et):
     season = _season_year(now_et)
-
     roster = bdl_active_roster(team_short)
     if not roster:
         return []
-
     roster_tuples = []
     for p in roster:
         pid = p.get("id")
@@ -547,11 +512,9 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
 
     trigger_strength = min(100.0, (vac_min * 1.2 + vac_pts * 1.5))
 
-    # Gather candidate ids
     cand_ids = [pid for pid, _ in roster_tuples]
     stats = bdl_last_n_games_stats(cand_ids, season, BASELINE_GAMES)
 
-    # Find today's games once
     game_ids = bdl_games_today_ids(now_et)
     if not game_ids:
         return []
@@ -562,17 +525,14 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
         if len(games) < 6:
             continue
 
-        # role trend
         min_s, min_l, ppm_s, ppm_l = _role_trend(games)
         min_delta = min_s - min_l
         ppm_delta = ppm_s - ppm_l
 
-        # minutes floor
-        _, l10_min, _ = avg_pts_min_std(_slice_last(games, LOOKBACK_GAMES))
+        l10_avg, l10_min, _ = avg_pts_min_std(_slice_last(games, LOOKBACK_GAMES))
         if l10_min < 10:
             continue
 
-        # absorption (0..0.65)
         absorption = 0.0
         if l10_min >= 28:
             absorption += 0.30
@@ -584,7 +544,6 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
             absorption += 0.10
         absorption = min(0.65, absorption)
 
-        # Find line for today's game
         line = None
         use_gid = None
         for gid in game_ids:
@@ -595,12 +554,9 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
         if line is None:
             continue
 
-        # Baseline sanity vs L10
-        l10_avg, _, _ = avg_pts_min_std(_slice_last(games, LOOKBACK_GAMES))
         if (l10_avg - line) > LINE_MIN_GAP:
             continue
 
-        # Build injury boost
         injury_boost_pts = min(BOOST_CAP_PTS, vac_pts * absorption * 0.65)
         injury_boost_min = min(BOOST_CAP_MIN, vac_min * absorption * 0.25)
 
@@ -614,8 +570,6 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
 
         if edge < MIN_EDGE or prob_over < MIN_PROB:
             continue
-
-        # minutes collapse guardrail
         if min_delta < MIN_DELTA_FLOOR and edge < (MIN_EDGE + 1.5):
             continue
 
@@ -647,13 +601,8 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
 
 # -------------------- SLATE SCAN ENGINE --------------------
 def slate_scan_edges(now_et):
-    """
-    League-wide scan of today's games (no injury required).
-    Finds edges from multi-horizon projection + role trend + main-line.
-    """
     if not ENABLE_SLATE_SCAN:
         return []
-
     if SLATE_ONLY_IN_BURST and (not _in_burst_window(now_et)):
         return []
 
@@ -662,13 +611,11 @@ def slate_scan_edges(now_et):
     if not game_ids:
         return []
 
-    # Pull props and collect player_ids up to cap
-    player_to_any_game = {}
     player_to_best_line = {}  # pid -> (line, gid)
+    pid_to_name = {}          # NEW: capture names from props
     pulled = 0
 
     for gid in game_ids:
-        # prefer vendor order; pick first vendor that returns data
         props = []
         for v in BOOK_VENDORS + [None]:
             props = bdl_player_props_points(gid, v)
@@ -677,14 +624,21 @@ def slate_scan_edges(now_et):
         if not props:
             continue
 
-        # group by player
         by_pid = {}
         for pp in props:
             pid = pp.get("player_id")
             if pid is None:
                 continue
-            pid = int(pid)
+            try:
+                pid = int(pid)
+            except Exception:
+                continue
+
             by_pid.setdefault(pid, []).append(pp)
+
+            nm = _name_from_prop_row(pp)
+            if nm and pid not in pid_to_name:
+                pid_to_name[pid] = nm
 
         for pid, rows in by_pid.items():
             if pid in player_to_best_line:
@@ -692,7 +646,6 @@ def slate_scan_edges(now_et):
             line = _pick_main_points_line(rows)
             if line is None:
                 continue
-            player_to_any_game[pid] = int(gid)
             player_to_best_line[pid] = (float(line), int(gid))
             pulled += 1
             if pulled >= SLATE_SCAN_MAX_PLAYERS:
@@ -714,14 +667,12 @@ def slate_scan_edges(now_et):
 
         line, gid = player_to_best_line[pid]
 
-        # sanity: line too far below L10 avg (stale-ish)
         l10_avg, l10_min, _ = avg_pts_min_std(_slice_last(games, LOOKBACK_GAMES))
         if l10_min < 10:
             continue
         if (l10_avg - line) > LINE_MIN_GAP:
             continue
 
-        # role trend
         min_s, min_l, ppm_s, ppm_l = _role_trend(games)
         min_delta = min_s - min_l
         ppm_delta = ppm_s - ppm_l
@@ -731,8 +682,6 @@ def slate_scan_edges(now_et):
 
         if edge < MIN_EDGE or prob_over < MIN_PROB:
             continue
-
-        # minutes collapse guardrail (lighter for slate, but still helps)
         if min_delta < MIN_DELTA_FLOOR and edge < (MIN_EDGE + 2.0):
             continue
 
@@ -744,7 +693,7 @@ def slate_scan_edges(now_et):
 
         ideas.append({
             "section": "slate",
-            "player_name": f"Player {pid}",
+            "player_name": pid_to_name.get(pid, f"Player {pid}"),
             "player_id": pid,
             "line": float(line),
             "proj": float(proj),
@@ -762,10 +711,6 @@ def slate_scan_edges(now_et):
 
 # -------------------- COOLDOWN FILTER --------------------
 def apply_cooldown(state, ideas, now_ts: int):
-    """
-    Skip plays sent recently, unless the line changed or edge improved enough.
-    Keyed by (player_id, line, section).
-    """
     sent = state.get("sent_bets", {}) or {}
     cooldown_sec = BET_COOLDOWN_MIN * 60
 
@@ -782,17 +727,14 @@ def apply_cooldown(state, ideas, now_ts: int):
         last_edge = float(prev.get("edge", 0.0) or 0.0)
         last_line = float(prev.get("line", i["line"]) or i["line"])
 
-        # If line changed, resend
         if abs(last_line - float(i["line"])) >= 0.5:
             kept.append(i)
             continue
 
-        # If edge improved materially, resend
         if (float(i["edge"]) - last_edge) >= EDGE_JUMP_TO_RESEND:
             kept.append(i)
             continue
 
-        # else enforce cooldown time
         if (now_ts - last_ts) >= cooldown_sec:
             kept.append(i)
 
@@ -826,7 +768,6 @@ def run():
     state = load_state()
     old_players = state.get("players", {})
 
-    # ---------- Injury engine triggers ----------
     sr = fetch_sportradar_injuries()
     new_players = parse_injuries(sr)
 
@@ -861,12 +802,10 @@ def run():
             triggers.append(f"{injured_name} ({team_short}) {injured_status}")
             injury_ideas.extend(ideas)
 
-    # ---------- Slate scan (no injuries required) ----------
     slate_ideas = slate_scan_edges(now_et)
 
-    # Combine, then dedupe by player within each section preference:
-    # Keep highest edge for same player_id across ideas.
     combined = injury_ideas + slate_ideas
+
     best = {}
     for i in combined:
         k = (i["section"], int(i["player_id"]))
@@ -874,16 +813,13 @@ def run():
             best[k] = i
     combined = list(best.values())
 
-    # Apply cooldown
     combined = apply_cooldown(state, combined, now_ts)
 
-    # Re-split for pretty output, and cap total
     injury_out = sorted([i for i in combined if i["section"] == "injury"],
                         key=lambda x: (x["trigger_strength"], x["edge"], x["prob_over"]), reverse=True)[:INJURY_TOPN]
     slate_out = sorted([i for i in combined if i["section"] == "slate"],
                        key=lambda x: (x["edge"], x["prob_over"]), reverse=True)[:SLATE_TOPN]
 
-    # Final cap
     final_out = (injury_out + slate_out)[:MAX_BET_IDEAS]
 
     if final_out:
@@ -913,15 +849,12 @@ def run():
                 msg.append("")
 
         send_chunked("\n".join(msg).strip())
-
-        # record sent plays (only what we actually sent)
         record_sent(state, final_out, now_ts)
 
     else:
         if SEND_NO_EDGE_PING and _in_burst_window(now_et):
             send_one(f"🧠 No edges ≥ {MIN_EDGE:.1f} and P ≥ {MIN_PROB:.2f} this run. ({ts_et})")
 
-    # persist injury state always
     state["players"] = new_players
     save_state(state)
 
