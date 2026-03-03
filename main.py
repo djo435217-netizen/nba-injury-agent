@@ -5,18 +5,8 @@ import time
 import math
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
 import requests
 from twilio.rest import Client
-
-# =============================================================================
-# NBA Props Agent (Points + 3PT Made)  — Injury-triggered + League-wide scan
-# - Uses Sportradar injuries as "triggers"
-# - Uses BallDontLie odds (/v2/odds/player_props) for prop lines
-# - Uses BallDontLie stats (/v1/stats) for recent production + minutes
-# - Supports multiple prop types (points, three_pointers_made) with alias fallback
-# - Cooldown / resend guardrails to reduce repeats
-# =============================================================================
 
 STATE_FILE = "state.json"
 ET = ZoneInfo("America/New_York")
@@ -24,7 +14,6 @@ ET = ZoneInfo("America/New_York")
 # -------------------- REQUIRED ENV --------------------
 TWILIO_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
-
 SPORTRADAR_KEY = os.environ["SPORTRADAR_API_KEY"]
 BALLDONTLIE_API_KEY = os.environ["BALLDONTLIE_API_KEY"].strip()
 
@@ -41,23 +30,12 @@ IMPACT_STATUSES_RAW = os.environ.get("IMPACT_STATUSES", "out,doubtful,questionab
 IMPACT_STATUSES = {x.strip().lower() for x in IMPACT_STATUSES_RAW.split(",") if x.strip()}
 IMPACT_ONLY_CHANGES = os.environ.get("IMPACT_ONLY_CHANGES", "1") == "1"
 
-# Vendors: allow comma-separated (we try each and also fallback to None)
 BOOK_VENDOR_RAW = os.environ.get("BOOK_VENDORS", os.environ.get("BOOK_VENDOR", "fanduel")).strip().lower()
 BOOK_VENDORS = [v.strip() for v in BOOK_VENDOR_RAW.split(",") if v.strip()]
-if not BOOK_VENDORS:
-    BOOK_VENDORS = ["fanduel"]
 
-# Markets (prop types) we will compute / send
-PROP_TYPES_RAW = os.environ.get("PROP_TYPES", "points,three_pointers_made").strip().lower()
+# Which prop types to run (e.g., "points,threes")
+PROP_TYPES_RAW = os.environ.get("PROP_TYPES", "points").strip().lower()
 PROP_TYPES = [p.strip() for p in PROP_TYPES_RAW.split(",") if p.strip()]
-
-# For threes, BallDontLie sometimes uses different prop_type strings.
-# We'll try these in order until we see rows.
-THREES_PROP_ALIASES_RAW = os.environ.get(
-    "THREES_PROP_ALIASES",
-    "three_pointers_made,threes,fg3m,3pt_made,three_points_made,three_point_field_goals_made",
-).strip().lower()
-THREES_PROP_ALIASES = [x.strip() for x in THREES_PROP_ALIASES_RAW.split(",") if x.strip()]
 
 # Multi-horizon windows
 BASELINE_GAMES = int(os.environ.get("BASELINE_GAMES", "30"))
@@ -70,28 +48,27 @@ W_L10 = float(os.environ.get("W_L10", "0.35"))
 W_L3 = float(os.environ.get("W_L3", "0.10"))
 W_LINE = float(os.environ.get("W_LINE", "0.10"))
 
-# Output sizing (global + per-market)
-MIN_PER_MARKET = int(os.environ.get("MIN_PER_MARKET", "2"))
+# Output sizing
+MIN_PER_MARKET = int(os.environ.get("MIN_PER_MARKET", "0"))
 MAX_PER_MARKET = int(os.environ.get("MAX_PER_MARKET", "6"))
 MAX_BET_IDEAS = int(os.environ.get("MAX_BET_IDEAS", "10"))
 
-# Default thresholds (points)
+# Thresholds (global)
 MIN_EDGE = float(os.environ.get("MIN_EDGE", "2.5"))
 MIN_PROB = float(os.environ.get("MIN_PROB", "0.62"))
-
-# Optional separate thresholds for threes (recommended lower)
-MIN_EDGE_THREES = float(os.environ.get("MIN_EDGE_THREES", "0.7"))
-MIN_PROB_THREES = float(os.environ.get("MIN_PROB_THREES", "0.56"))
-
 STD_FLOOR = float(os.environ.get("STD_FLOOR", "5.0"))
 
-# Guardrails
-MIN_POINTS_LINE = float(os.environ.get("MIN_POINTS_LINE", "6.0"))
-MAX_POINTS_LINE = float(os.environ.get("MAX_POINTS_LINE", "45.0"))
+# Optional separate thresholds for threes (if unset, uses global)
+MIN_EDGE_THREES = float(os.environ.get("MIN_EDGE_THREES", str(MIN_EDGE)))
+MIN_PROB_THREES = float(os.environ.get("MIN_PROB_THREES", str(MIN_PROB)))
+
+# Guardrails (points + generally safe for most markets)
+MIN_POINTS_LINE = float(os.environ.get("MIN_POINTS_LINE", "0.5"))
+MAX_POINTS_LINE = float(os.environ.get("MAX_POINTS_LINE", "60.0"))
 LINE_MIN_GAP = float(os.environ.get("LINE_MIN_GAP", "8.0"))
 MIN_DELTA_FLOOR = float(os.environ.get("MIN_DELTA_FLOOR", "-3.0"))
 
-# Injury vacancy requirements (for "trigger strength" / quality)
+# Injury vacancy requirements
 MIN_VAC_MIN = float(os.environ.get("MIN_VAC_MIN", "10.0"))
 MIN_VAC_PTS = float(os.environ.get("MIN_VAC_PTS", "6.0"))
 
@@ -109,17 +86,17 @@ ENABLE_SLATE_SCAN = os.environ.get("ENABLE_SLATE_SCAN", "1") == "1"
 SLATE_ONLY_IN_BURST = os.environ.get("SLATE_ONLY_IN_BURST", "0") == "1"
 SLATE_SCAN_MAX_PLAYERS = int(os.environ.get("SLATE_SCAN_MAX_PLAYERS", "260"))
 
-# Injury strict game matching (if 1, only generate injury edges for players that have a line in a "relevant" game)
-STRICT_INJURY_GAME_MATCH = os.environ.get("STRICT_INJURY_GAME_MATCH", "1") == "1"
-
-# Cooldown / resend rules
+# Cooldown
 BET_COOLDOWN_MIN = int(os.environ.get("BET_COOLDOWN_MIN", "180"))
 EDGE_JUMP_TO_RESEND = float(os.environ.get("EDGE_JUMP_TO_RESEND", "1.5"))
 
-# Debug: print one sample prop row per type (comma-separated)
-DEBUG_PROP_SAMPLE_TYPES_RAW = os.environ.get("DEBUG_PROP_SAMPLE_TYPES", "")
-DEBUG_PROP_SAMPLE_TYPES = {x.strip().lower() for x in DEBUG_PROP_SAMPLE_TYPES_RAW.split(",") if x.strip()}
-DEBUG_PRINTED_FOR = set()
+# Strict injury/game matching toggle (your script prints this already)
+STRICT_INJURY_GAME_MATCH = os.environ.get("STRICT_INJURY_GAME_MATCH", "1") == "1"
+
+# Debug: print sample prop rows for specific prop types (comma list)
+DEBUG_PROP_SAMPLE_TYPES_RAW = os.environ.get("DEBUG_PROP_SAMPLE_TYPES", "").strip().lower()
+DEBUG_PROP_SAMPLE_TYPES = {x.strip() for x in DEBUG_PROP_SAMPLE_TYPES_RAW.split(",") if x.strip()}
+
 
 # -------------------- UTILS --------------------
 def _now_et() -> datetime:
@@ -163,6 +140,17 @@ def _clean_name(s: str) -> str:
 def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
+def avg_pts_min_std(games):
+    if not games:
+        return 0.0, 0.0, 0.0
+    pts = [x[1] for x in games]
+    mins = [x[2] for x in games]
+    n = len(pts)
+    pts_avg = sum(pts) / n
+    min_avg = sum(mins) / n
+    var = sum((p - pts_avg) ** 2 for p in pts) / max(n, 1)
+    return pts_avg, min_avg, math.sqrt(var)
+
 def _slice_last(games, n):
     if not games:
         return []
@@ -174,10 +162,10 @@ def _role_trend(games):
     long_slice = _slice_last(games, LOOKBACK_GAMES)
     short_slice = _slice_last(games, SHORT_GAMES)
 
-    stat_l, min_l, _ = avg_stat_min_std(long_slice)
-    stat_s, min_s, _ = avg_stat_min_std(short_slice)
-    rate_l = stat_l / max(min_l, 1e-6)
-    rate_s = stat_s / max(min_s, 1e-6)
+    pts_l, min_l, _ = avg_pts_min_std(long_slice)
+    pts_s, min_s, _ = avg_pts_min_std(short_slice)
+    rate_l = pts_l / max(min_l, 1e-6)
+    rate_s = pts_s / max(min_s, 1e-6)
     return min_s, min_l, rate_s, rate_l
 
 def load_state():
@@ -225,41 +213,6 @@ def send_chunked(full_text: str):
 def status_in_scope(status: str) -> bool:
     return (status or "").strip().lower() in IMPACT_STATUSES
 
-# -------------------- MARKET CONFIG --------------------
-def market_label(prop_type: str) -> str:
-    if prop_type == "points":
-        return "Points"
-    if prop_type in ("three_pointers_made", "threes", "fg3m", "3pt_made"):
-        return "3PT Made"
-    return prop_type
-
-def thresholds_for_market(prop_type: str) -> tuple[float, float]:
-    # return (min_edge, min_prob)
-    if prop_type == "three_pointers_made":
-        return (MIN_EDGE_THREES, MIN_PROB_THREES)
-    return (MIN_EDGE, MIN_PROB)
-
-def line_range_for_market(prop_type: str) -> tuple[float, float]:
-    if prop_type == "points":
-        return (MIN_POINTS_LINE, MAX_POINTS_LINE)
-    if prop_type == "three_pointers_made":
-        # keep sane bounds
-        return (0.5, 8.5)
-    return (MIN_POINTS_LINE, MAX_POINTS_LINE)
-
-def stat_key_candidates_for_market(prop_type: str) -> list[str]:
-    # BallDontLie stats fields: points uses "pts".
-    # 3PT made is usually "fg3m" (and sometimes "fg3m" only).
-    if prop_type == "points":
-        return ["pts"]
-    if prop_type == "three_pointers_made":
-        return ["fg3m", "fg3m"]  # keep duplicates harmless; just in case
-    return ["pts"]
-
-def prop_type_aliases(prop_type: str) -> list[str]:
-    if prop_type == "three_pointers_made":
-        return THREES_PROP_ALIASES or ["three_pointers_made"]
-    return [prop_type]
 
 # -------------------- SPORTRADAR --------------------
 def fetch_sportradar_injuries():
@@ -290,6 +243,7 @@ def parse_injuries(data):
             flat_by_player[pid] = {"name": name, "team": team_name, "status": status, "detail": detail}
     return flat_by_player
 
+
 # -------------------- BALLDONTLIE --------------------
 BDL_HEADERS = {"Authorization": BALLDONTLIE_API_KEY}
 BDL_PREFIXES = ["/nba", ""]
@@ -300,8 +254,9 @@ BDL_PER_PAGE = int(os.environ.get("BDL_PER_PAGE", "100"))
 BDL_MAX_PAGES = int(os.environ.get("BDL_MAX_PAGES", "10"))
 
 TEAM_CACHE = None
-PROPS_CACHE = {}  # (gid, vendor, prop_type_alias) -> rows
-PLAYER_NAME_CACHE = {}  # pid -> "First Last"
+PROPS_CACHE = {}
+PLAYER_NAME_CACHE = {}  # pid -> name
+_DEBUG_PRINTED = set()  # (prop_type, vendor) printed already
 
 def _bdl_get(path: str, params=None, timeout: int = 20) -> dict:
     last_err = None
@@ -316,7 +271,7 @@ def _bdl_get(path: str, params=None, timeout: int = 20) -> dict:
                 if r.status_code in (429, 500, 502, 503, 504):
                     retry_after = r.headers.get("Retry-After")
                     sleep_s = float(retry_after) if retry_after else BDL_RETRY_BASE_SEC * (2 ** attempt)
-                    last_err = f"{r.status_code} {r.text[:160]}"
+                    last_err = f"{r.status_code} {r.text[:120]}"
                     time.sleep(min(sleep_s, 30.0))
                     continue
                 if r.status_code != 200:
@@ -390,21 +345,73 @@ def bdl_find_player_id_on_team(team_short: str, full_name: str):
             return int(pid)
     return None
 
-def _stat_from_row(row: dict, prop_type: str) -> float:
-    # read stat field based on market
-    keys = stat_key_candidates_for_market(prop_type)
-    for k in keys:
-        if k in row and row.get(k) is not None:
-            try:
-                return float(row.get(k) or 0)
-            except Exception:
-                pass
-    return 0.0
+def bdl_last_n_games_stats(player_ids, season: int, n: int):
+    out = {int(pid): [] for pid in player_ids}
+    if not player_ids:
+        return out
 
-def bdl_last_n_games_stats(player_ids, season: int, n: int, prop_type: str):
+    cursor = None
+    pages = 0
+    while pages < BDL_MAX_PAGES:
+        params = {"per_page": min(BDL_PER_PAGE, 100), "seasons[]": [season], "player_ids[]": player_ids}
+        if cursor is not None:
+            params["cursor"] = cursor
+
+        resp = _bdl_get("/v1/stats", params=params)
+        rows = resp.get("data") or []
+
+        for row in rows:
+            p = row.get("player") or {}
+            pid = p.get("id")
+            if pid is None:
+                continue
+            pid = int(pid)
+            if pid not in out:
+                continue
+
+            fn = (p.get("first_name") or "").strip()
+            ln = (p.get("last_name") or "").strip()
+            if (fn or ln) and pid not in PLAYER_NAME_CACHE:
+                PLAYER_NAME_CACHE[pid] = f"{fn} {ln}".strip()
+
+            game = row.get("game") or {}
+            date = game.get("date")
+            stat_val = float(row.get("pts", 0) or 0)  # default points
+            mins = _parse_minutes(row.get("min"))
+            if date:
+                out[pid].append((date, stat_val, mins))
+
+        if all(len(out[int(pid)]) >= n for pid in player_ids):
+            break
+
+        cursor = (resp.get("meta") or {}).get("next_cursor")
+        pages += 1
+        if not cursor:
+            break
+
+    for pid in list(out.keys()):
+        g = out[pid]
+        g.sort(key=lambda x: x[0])
+        out[pid] = g[-n:]
+    return out
+
+def _stat_from_row(row: dict, prop_type: str) -> float:
     """
-    Returns: pid -> list[(date, stat_value, minutes)]
-    Fills PLAYER_NAME_CACHE from stats endpoint.
+    Return the historical stat value for a given prop_type from a BDL stats row.
+    Supports: points, threes.
+    """
+    prop_type = (prop_type or "").lower()
+    if prop_type in ("points", "pts"):
+        return float(row.get("pts", 0) or 0)
+    if prop_type in ("threes", "3pt", "3pm", "fg3m", "three_pointers_made"):
+        # BDL stat key is usually "fg3m" for 3PT made
+        return float(row.get("fg3m", 0) or 0)
+    # fallback to points
+    return float(row.get("pts", 0) or 0)
+
+def bdl_last_n_games_stats_for_prop(player_ids, season: int, n: int, prop_type: str):
+    """
+    Same as bdl_last_n_games_stats but uses prop_type-specific stat extraction (points/threes).
     """
     out = {int(pid): [] for pid in player_ids}
     if not player_ids:
@@ -455,39 +462,39 @@ def bdl_last_n_games_stats(player_ids, season: int, n: int, prop_type: str):
         out[pid] = g[-n:]
     return out
 
-def bdl_player_props(game_id: int, vendor: str | None, prop_type_alias: str):
+def bdl_player_props(game_id: int, vendor: str | None, prop_type: str):
     """
-    Fetch odds rows for a given gid + vendor + prop_type alias.
-    Cached.
+    Pull props for a game/vendor/prop_type. Cached.
     """
-    key = (int(game_id), (vendor or ""), prop_type_alias)
+    key = (int(game_id), vendor or "", prop_type)
     if key in PROPS_CACHE:
         return PROPS_CACHE[key]
 
-    params = {"game_id": int(game_id), "prop_type": prop_type_alias}
+    params = {"game_id": int(game_id), "prop_type": prop_type}
     if vendor:
         params["vendors[]"] = [vendor]
 
     try:
         resp = _bdl_get("/v2/odds/player_props", params=params)
-        rows = resp.get("data") or []
+        props = resp.get("data") or []
     except Exception:
-        rows = []
+        props = []
 
-    # Debug one sample row per requested market
-    if prop_type_alias in DEBUG_PROP_SAMPLE_TYPES and rows and prop_type_alias not in DEBUG_PRINTED_FOR:
-        print(f"[DEBUG] SAMPLE PROP ROW ({prop_type_alias}): {json.dumps(rows[0])[:2000]}")
-        DEBUG_PRINTED_FOR.add(prop_type_alias)
+    # debug sample row (one per prop_type+vendor)
+    if prop_type in DEBUG_PROP_SAMPLE_TYPES and props and (prop_type, vendor or "NO_VENDOR") not in _DEBUG_PRINTED:
+        print(f"[DEBUG] SAMPLE PROP ROW ({prop_type}, vendor={vendor or 'NO_VENDOR'}): {json.dumps(props[0])[:2000]}")
+        _DEBUG_PRINTED.add((prop_type, vendor or "NO_VENDOR"))
 
-    PROPS_CACHE[key] = rows
-    return rows
+    PROPS_CACHE[key] = props
+    return props
 
-def _pick_main_line(rows_for_player, prop_type: str):
+def _pick_main_line(rows_for_player):
+    """
+    Choose 'main' line (closest to -110/-110 if present), otherwise median.
+    Works for both points and threes.
+    """
     if not rows_for_player:
         return None
-
-    lo, hi = line_range_for_market(prop_type)
-
     candidates = []
     for pp in rows_for_player:
         market = pp.get("market") or {}
@@ -497,9 +504,8 @@ def _pick_main_line(rows_for_player, prop_type: str):
             line = float(pp.get("line_value"))
         except Exception:
             continue
-        if line < lo or line > hi:
+        if line < MIN_POINTS_LINE or line > MAX_POINTS_LINE:
             continue
-
         over = market.get("over_odds")
         under = market.get("under_odds")
         if isinstance(over, (int, float)) and isinstance(under, (int, float)):
@@ -507,91 +513,87 @@ def _pick_main_line(rows_for_player, prop_type: str):
         else:
             dist = None
         candidates.append((dist, line))
-
     if not candidates:
         return None
-
     with_dist = [c for c in candidates if c[0] is not None]
     if with_dist:
         with_dist.sort(key=lambda x: x[0])
         return with_dist[0][1]
-
     lines = sorted([c[1] for c in candidates])
     mid = len(lines) // 2
     return lines[mid] if len(lines) % 2 == 1 else 0.5 * (lines[mid - 1] + lines[mid])
 
-def main_line_for_player(game_id: int, player_id: int, prop_type: str):
+def line_for_player(game_id: int, player_id: int, prop_type: str):
     """
-    Find a "main" over/under line by:
-      - trying all vendors + None
-      - trying all prop_type aliases (for threes)
+    Return a best/main line for player. Tries:
+      - vendor-filtered for each vendor
+      - then NO vendor filter fallback
+    NOTE: This vendorless fallback is especially important for threes.
     """
-    aliases = prop_type_aliases(prop_type)
-
-    for alias in aliases:
-        for v in BOOK_VENDORS + [None]:
-            rows = bdl_player_props(game_id, v, alias)
-            if not rows:
-                continue
-            rows_for_player = []
-            for pp in rows:
-                try:
-                    if int(pp.get("player_id", -1)) != int(player_id):
-                        continue
-                except Exception:
+    # 1) vendor-filtered tries
+    for v in BOOK_VENDORS:
+        props = bdl_player_props(game_id, v, prop_type)
+        if not props:
+            continue
+        rows = []
+        for pp in props:
+            try:
+                if int(pp.get("player_id", -1)) != int(player_id):
                     continue
-                rows_for_player.append(pp)
+            except Exception:
+                continue
+            rows.append(pp)
+        line = _pick_main_line(rows)
+        if line is not None:
+            return float(line), v
 
-            line = _pick_main_line(rows_for_player, prop_type)
-            if line is not None:
-                return float(line), alias, (v or "MAIN")
+    # 2) vendorless fallback
+    props = bdl_player_props(game_id, None, prop_type)
+    if props:
+        rows = []
+        for pp in props:
+            try:
+                if int(pp.get("player_id", -1)) != int(player_id):
+                    continue
+            except Exception:
+                continue
+            rows.append(pp)
+        line = _pick_main_line(rows)
+        if line is not None:
+            return float(line), "MAIN"
 
-    return None, None, None
+    return None, None
 
-# -------------------- STATS MATH --------------------
-def avg_stat_min_std(games):
-    # games: list[(date, stat, min)]
-    if not games:
-        return 0.0, 0.0, 0.0
-    vals = [x[1] for x in games]
-    mins = [x[2] for x in games]
-    n = len(vals)
-    avg_v = sum(vals) / n
-    avg_m = sum(mins) / n
-    var = sum((v - avg_v) ** 2 for v in vals) / max(n, 1)
-    return avg_v, avg_m, math.sqrt(var)
 
+# -------------------- PROJECTION CORE --------------------
 def compute_projection_and_prob(games_all, line, prop_type: str, injury_boost_stat=0.0, injury_boost_min=0.0):
+    """
+    games_all = list of (date, stat_value, minutes)
+    For threes, stat_value = fg3m.
+    """
     base_slice = _slice_last(games_all, BASELINE_GAMES)
     l10_slice = _slice_last(games_all, LOOKBACK_GAMES)
     l3_slice = _slice_last(games_all, SHORT_GAMES)
 
-    base_avg, _, base_std = avg_stat_min_std(base_slice)
-    l10_avg, l10_min, l10_std = avg_stat_min_std(l10_slice)
-    l3_avg, _, _ = avg_stat_min_std(l3_slice)
+    base_avg, _, base_std = avg_pts_min_std(base_slice)
+    l10_avg, l10_min, l10_std = avg_pts_min_std(l10_slice)
+    l3_avg, _, _ = avg_pts_min_std(l3_slice)
 
     sigma = max(STD_FLOOR, (l10_std if l10_std > 0 else base_std if base_std > 0 else STD_FLOOR))
-
     proj = (W_BASE * base_avg) + (W_L10 * l10_avg) + (W_L3 * l3_avg) + (W_LINE * line)
 
-    # rate per minute for this stat
     rate = l10_avg / max(l10_min, 1e-6)
-
-    # injury boosts
-    proj += float(injury_boost_stat)
-    proj += float(injury_boost_min) * rate * 0.20
+    proj += injury_boost_stat
+    proj += (injury_boost_min * rate * 0.20)
 
     edge = proj - line
     z = (proj - line) / sigma
     prob_over = _norm_cdf(z)
-
     return proj, edge, prob_over, (base_avg, l10_avg, l3_avg, l10_min, sigma, rate)
 
-# -------------------- INJURY ENGINE (GENERIC MARKET) --------------------
+
+# -------------------- INJURY ENGINE --------------------
 def build_injury_edges(team_short, injured_name, injured_status, exclude_names_lower, now_et, prop_type: str):
-    """
-    Returns list of ideas for one market (points or three_pointers_made)
-    """
     season = _season_year(now_et)
     roster = bdl_active_roster(team_short)
     if not roster:
@@ -606,7 +608,6 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
         if _clean_name(nm) in exclude_names_lower:
             continue
         roster_tuples.append((int(pid), nm))
-
     if not roster_tuples:
         return []
 
@@ -614,38 +615,37 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
     if not injured_pid:
         return []
 
-    # injured player's recent production for this market + minutes
-    inj_games = bdl_last_n_games_stats([injured_pid], season, BASELINE_GAMES, prop_type).get(injured_pid, [])
-    inj_l10 = _slice_last(inj_games, LOOKBACK_GAMES)
-
-    vac_stat_l10, vac_min_l10, _ = avg_stat_min_std(inj_l10)
+    inj_games = bdl_last_n_games_stats_for_prop([injured_pid], season, BASELINE_GAMES, prop_type).get(injured_pid, [])
+    ip10, im10, _ = avg_pts_min_std(_slice_last(inj_games, LOOKBACK_GAMES))
     if len(inj_games) < 3:
         return []
 
     status = (injured_status or "").lower()
     STATUS_MULT = {"out": 1.0, "doubtful": 0.8, "questionable": 0.55}.get(status, 0.65)
 
-    vac_stat = vac_stat_l10 * STATUS_MULT
-    vac_min = vac_min_l10 * STATUS_MULT
+    vac_stat = ip10 * STATUS_MULT
+    vac_min = im10 * STATUS_MULT
+    if not ((vac_min >= MIN_VAC_MIN) or (vac_stat >= MIN_VAC_PTS)):
+        return []
 
-    # keep original "quality filter" tied to points/minutes vacated
-    # for threes, vac_stat is smaller — so don't kill it unfairly:
-    if prop_type == "points":
-        if not ((vac_min >= MIN_VAC_MIN) or (vac_stat >= MIN_VAC_PTS)):
-            return []
-        trigger_strength = min(100.0, (vac_min * 1.2 + vac_stat * 1.5))
-    else:
-        # threes: scale strength so it still ranks reasonably
-        trigger_strength = min(100.0, (vac_min * 0.9 + vac_stat * 18.0))
+    trigger_strength = min(100.0, (vac_min * 1.2 + vac_stat * 1.5))
 
     cand_ids = [pid for pid, _ in roster_tuples]
-    stats = bdl_last_n_games_stats(cand_ids, season, BASELINE_GAMES, prop_type)
+    stats = bdl_last_n_games_stats_for_prop(cand_ids, season, BASELINE_GAMES, prop_type)
 
     game_ids = bdl_games_today_ids(now_et)
     if not game_ids:
         return []
 
-    min_edge, min_prob = thresholds_for_market(prop_type)
+    # thresholds per market
+    if prop_type == "threes":
+        min_edge_use = MIN_EDGE_THREES
+        min_prob_use = MIN_PROB_THREES
+        stat_label = "3PT Made"
+    else:
+        min_edge_use = MIN_EDGE
+        min_prob_use = MIN_PROB
+        stat_label = "Points"
 
     ideas = []
     for pid, nm in roster_tuples:
@@ -653,16 +653,14 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
         if len(games) < 6:
             continue
 
-        # role trend based on stat/min and minutes trend
         min_s, min_l, rate_s, rate_l = _role_trend(games)
         min_delta = min_s - min_l
         rate_delta = rate_s - rate_l
 
-        l10_avg, l10_min, _ = avg_stat_min_std(_slice_last(games, LOOKBACK_GAMES))
+        l10_avg, l10_min, _ = avg_pts_min_std(_slice_last(games, LOOKBACK_GAMES))
         if l10_min < 10:
             continue
 
-        # absorption score (how likely they soak up usage/role)
         absorption = 0.0
         if l10_min >= 28:
             absorption += 0.30
@@ -670,69 +668,54 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
             absorption += 0.10
         if min_delta >= 2.0:
             absorption += 0.15
-        if rate_delta > (0.05 if prop_type == "points" else 0.01):
+        if rate_delta > 0.05:
             absorption += 0.10
         absorption = min(0.65, absorption)
 
-        # find a line (optionally enforce "has a line in a relevant game")
         line = None
         use_gid = None
-        used_alias = None
         used_vendor = None
-
         for gid in game_ids:
-            line, used_alias, used_vendor = main_line_for_player(gid, pid, prop_type)
+            line, used_vendor = line_for_player(gid, pid, prop_type)
             if line is not None:
                 use_gid = gid
                 break
-
         if line is None:
-            if STRICT_INJURY_GAME_MATCH:
-                continue
-            else:
-                continue
+            continue
 
-        # points-only guardrail (avoid obvious misreads)
-        if prop_type == "points":
-            if (l10_avg - line) > LINE_MIN_GAP:
-                continue
+        # Guardrail: avoid cases where L10 average dwarfs line by a huge gap (often mis-mapped markets/lines)
+        if (l10_avg - line) > LINE_MIN_GAP:
+            continue
 
-        # injury boost caps + scale
-        # threes needs smaller cap scale
-        if prop_type == "points":
-            injury_boost_stat = min(BOOST_CAP_PTS, vac_stat * absorption * 0.65)
-            injury_boost_min = min(BOOST_CAP_MIN, vac_min * absorption * 0.25)
-        else:
-            injury_boost_stat = min(1.0, vac_stat * absorption * 0.55)
-            injury_boost_min = min(5.0, vac_min * absorption * 0.18)
+        injury_boost_stat = min(BOOST_CAP_PTS, vac_stat * absorption * 0.65)
+        injury_boost_min = min(BOOST_CAP_MIN, vac_min * absorption * 0.25)
 
         proj, edge, prob_over, aux = compute_projection_and_prob(
             games_all=games,
             line=line,
             prop_type=prop_type,
             injury_boost_stat=injury_boost_stat,
-            injury_boost_min=injury_boost_min,
+            injury_boost_min=injury_boost_min
         )
         base_avg, l10_avg2, l3_avg, l10_min2, _, _ = aux
 
-        if edge < min_edge or prob_over < min_prob:
+        if edge < min_edge_use or prob_over < min_prob_use:
             continue
-
-        if min_delta < MIN_DELTA_FLOOR and edge < (min_edge + (1.5 if prop_type == "points" else 0.8)):
+        if min_delta < MIN_DELTA_FLOOR and edge < (min_edge_use + 1.5):
             continue
 
         why = (
             f"TriggerStrength {trigger_strength:.0f} | Absorb {absorption:.2f}. "
-            f"{injured_name} {injured_status.upper()} vacates ~{vac_stat:.1f} {market_label(prop_type)} / {vac_min:.1f} min. "
+            f"{injured_name} {injured_status.upper()} vacates ~{vac_stat:.1f} {stat_label} / {vac_min:.1f} min. "
             f"{nm} base(L{BASELINE_GAMES}) {base_avg:.1f}, L10 {l10_avg2:.1f}, L3 {l3_avg:.1f} "
             f"(mins L10 {l10_min2:.1f}). Role Δmin={min_delta:+.1f}, Δrate={rate_delta:+.2f}. "
             f"Proj {proj:.1f} vs {used_vendor} line {line:.1f} | edge +{edge:.1f} | P≈{prob_over*100:.0f}%. "
-            f"[prop_type={used_alias}]"
+            f"[prop_type={prop_type}]"
         )
 
         ideas.append({
-            "market": prop_type,
             "section": "injury",
+            "prop_type": prop_type,
             "player_name": nm,
             "player_id": pid,
             "line": float(line),
@@ -743,12 +726,14 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
             "trigger": f"{injured_name} ({team_short}) {injured_status}",
             "why": why,
             "game_id": use_gid,
+            "vendor": used_vendor,
         })
 
     ideas.sort(key=lambda x: (x["trigger_strength"], x["edge"], x["prob_over"]), reverse=True)
     return ideas[:MAX_PER_MARKET]
 
-# -------------------- SLATE SCAN ENGINE (GENERIC MARKET) --------------------
+
+# -------------------- SLATE SCAN ENGINE --------------------
 def slate_scan_edges(now_et, prop_type: str):
     if not ENABLE_SLATE_SCAN:
         return []
@@ -760,34 +745,30 @@ def slate_scan_edges(now_et, prop_type: str):
     if not game_ids:
         return []
 
-    # Pull a set of players with "main" lines for this market
-    player_to_best_line = {}  # pid -> (line, gid, used_alias, used_vendor)
+    player_to_best_line = {}  # pid -> (line, gid, vendor)
     pulled = 0
 
-    aliases = prop_type_aliases(prop_type)
-
     for gid in game_ids:
-        # Try to pull one props blob from vendors/aliases; then group by pid.
-        props_blob = None
-        used_alias = None
+        # Try vendor-filtered first, but also allow vendorless fallback.
+        props = []
         used_vendor = None
 
-        for alias in aliases:
-            for v in BOOK_VENDORS + [None]:
-                rows = bdl_player_props(gid, v, alias)
-                if rows:
-                    props_blob = rows
-                    used_alias = alias
-                    used_vendor = (v or "MAIN")
-                    break
-            if props_blob:
+        for v in BOOK_VENDORS:
+            props = bdl_player_props(gid, v, prop_type)
+            if props:
+                used_vendor = v
                 break
 
-        if not props_blob:
+        if not props:
+            props = bdl_player_props(gid, None, prop_type)
+            if props:
+                used_vendor = "MAIN"
+
+        if not props:
             continue
 
         by_pid = {}
-        for pp in props_blob:
+        for pp in props:
             pid = pp.get("player_id")
             if pid is None:
                 continue
@@ -800,14 +781,13 @@ def slate_scan_edges(now_et, prop_type: str):
         for pid, rows in by_pid.items():
             if pid in player_to_best_line:
                 continue
-            line = _pick_main_line(rows, prop_type)
+            line = _pick_main_line(rows)
             if line is None:
                 continue
-            player_to_best_line[pid] = (float(line), int(gid), used_alias, used_vendor)
+            player_to_best_line[pid] = (float(line), int(gid), used_vendor)
             pulled += 1
             if pulled >= SLATE_SCAN_MAX_PLAYERS:
                 break
-
         if pulled >= SLATE_SCAN_MAX_PLAYERS:
             break
 
@@ -815,9 +795,16 @@ def slate_scan_edges(now_et, prop_type: str):
         return []
 
     pids = list(player_to_best_line.keys())
-    stats = bdl_last_n_games_stats(pids, season, BASELINE_GAMES, prop_type)  # fills PLAYER_NAME_CACHE
+    stats = bdl_last_n_games_stats_for_prop(pids, season, BASELINE_GAMES, prop_type)  # fills PLAYER_NAME_CACHE
 
-    min_edge, min_prob = thresholds_for_market(prop_type)
+    if prop_type == "threes":
+        min_edge_use = MIN_EDGE_THREES
+        min_prob_use = MIN_PROB_THREES
+        stat_label = "3PT Made"
+    else:
+        min_edge_use = MIN_EDGE
+        min_prob_use = MIN_PROB
+        stat_label = "Points"
 
     ideas = []
     for pid in pids:
@@ -825,15 +812,13 @@ def slate_scan_edges(now_et, prop_type: str):
         if len(games) < 8:
             continue
 
-        line, gid, used_alias, used_vendor = player_to_best_line[pid]
+        line, gid, used_vendor = player_to_best_line[pid]
 
-        l10_avg, l10_min, _ = avg_stat_min_std(_slice_last(games, LOOKBACK_GAMES))
+        l10_avg, l10_min, _ = avg_pts_min_std(_slice_last(games, LOOKBACK_GAMES))
         if l10_min < 10:
             continue
-
-        if prop_type == "points":
-            if (l10_avg - line) > LINE_MIN_GAP:
-                continue
+        if (l10_avg - line) > LINE_MIN_GAP:
+            continue
 
         min_s, min_l, rate_s, rate_l = _role_trend(games)
         min_delta = min_s - min_l
@@ -842,10 +827,9 @@ def slate_scan_edges(now_et, prop_type: str):
         proj, edge, prob_over, aux = compute_projection_and_prob(games_all=games, line=line, prop_type=prop_type)
         base_avg, l10_avg2, l3_avg, l10_min2, _, _ = aux
 
-        if edge < min_edge or prob_over < min_prob:
+        if edge < min_edge_use or prob_over < min_prob_use:
             continue
-
-        if min_delta < MIN_DELTA_FLOOR and edge < (min_edge + (2.0 if prop_type == "points" else 0.8)):
+        if min_delta < MIN_DELTA_FLOOR and edge < (min_edge_use + 2.0):
             continue
 
         name = PLAYER_NAME_CACHE.get(int(pid), f"Player {pid}")
@@ -854,12 +838,12 @@ def slate_scan_edges(now_et, prop_type: str):
             f"SlateScan. base(L{BASELINE_GAMES}) {base_avg:.1f}, L10 {l10_avg2:.1f}, L3 {l3_avg:.1f} "
             f"(mins L10 {l10_min2:.1f}). Role Δmin={min_delta:+.1f}, Δrate={rate_delta:+.2f}. "
             f"Proj {proj:.1f} vs {used_vendor} line {line:.1f} | edge +{edge:.1f} | P≈{prob_over*100:.0f}%. "
-            f"[prop_type={used_alias}]"
+            f"[prop_type={prop_type}]"
         )
 
         ideas.append({
-            "market": prop_type,
             "section": "slate",
+            "prop_type": prop_type,
             "player_name": name,
             "player_id": pid,
             "line": float(line),
@@ -870,10 +854,12 @@ def slate_scan_edges(now_et, prop_type: str):
             "trigger": "No injury trigger (league-wide scan)",
             "why": why,
             "game_id": gid,
+            "vendor": used_vendor,
         })
 
     ideas.sort(key=lambda x: (x["edge"], x["prob_over"]), reverse=True)
     return ideas[:MAX_PER_MARKET]
+
 
 # -------------------- COOLDOWN FILTER --------------------
 def apply_cooldown(state, ideas, now_ts: int):
@@ -882,7 +868,7 @@ def apply_cooldown(state, ideas, now_ts: int):
 
     kept = []
     for i in ideas:
-        key = f"{i['market']}|{i['section']}|{int(i['player_id'])}|{i['line']:.1f}"
+        key = f"{i['section']}|{i['prop_type']}|{int(i['player_id'])}|{i['line']:.1f}"
         prev = sent.get(key)
 
         if not prev:
@@ -893,17 +879,14 @@ def apply_cooldown(state, ideas, now_ts: int):
         last_edge = float(prev.get("edge", 0.0) or 0.0)
         last_line = float(prev.get("line", i["line"]) or i["line"])
 
-        # resend if line moved meaningfully
         if abs(last_line - float(i["line"])) >= 0.5:
             kept.append(i)
             continue
 
-        # resend if edge improved enough
         if (float(i["edge"]) - last_edge) >= EDGE_JUMP_TO_RESEND:
             kept.append(i)
             continue
 
-        # resend if cooldown elapsed
         if (now_ts - last_ts) >= cooldown_sec:
             kept.append(i)
 
@@ -912,9 +895,10 @@ def apply_cooldown(state, ideas, now_ts: int):
 def record_sent(state, ideas, now_ts: int):
     sent = state.get("sent_bets", {}) or {}
     for i in ideas:
-        key = f"{i['market']}|{i['section']}|{int(i['player_id'])}|{i['line']:.1f}"
+        key = f"{i['section']}|{i['prop_type']}|{int(i['player_id'])}|{i['line']:.1f}"
         sent[key] = {"ts": now_ts, "edge": float(i["edge"]), "line": float(i["line"])}
     state["sent_bets"] = sent
+
 
 # -------------------- MAIN --------------------
 def run():
@@ -924,29 +908,26 @@ def run():
 
     print(
         f"[BOOT] ts={ts_et} TEST_MODE={int(TEST_MODE)} "
-        f"PROP_TYPES={','.join(PROP_TYPES)} "
-        f"MIN_PER_MARKET={MIN_PER_MARKET} MAX_PER_MARKET={MAX_PER_MARKET} MAX_BET_IDEAS={MAX_BET_IDEAS} "
-        f"BOOK_VENDORS={','.join(BOOK_VENDORS)} ENABLE_SLATE_SCAN={int(ENABLE_SLATE_SCAN)} "
-        f"STRICT_INJURY_GAME_MATCH={int(STRICT_INJURY_GAME_MATCH)}"
+        f"PROP_TYPES={','.join(PROP_TYPES)} MIN_PER_MARKET={MIN_PER_MARKET} MAX_PER_MARKET={MAX_PER_MARKET} "
+        f"MAX_BET_IDEAS={MAX_BET_IDEAS} BOOK_VENDORS={','.join(BOOK_VENDORS)} "
+        f"ENABLE_SLATE_SCAN={int(ENABLE_SLATE_SCAN)} STRICT_INJURY_GAME_MATCH={int(STRICT_INJURY_GAME_MATCH)}"
     )
 
     if TEST_MODE:
-        send_one(f"✅ NBA props agent test OK ({ts_et})")
+        send_one(f"✅ NBA betting agent test OK ({ts_et})")
         return
 
     state = load_state()
     old_players = state.get("players", {})
 
-    # Injuries
     sr = fetch_sportradar_injuries()
     new_players = parse_injuries(sr)
 
     exclude_names_lower = {_clean_name(v.get("name", "")) for v in new_players.values() if v.get("name")}
 
-    # Build triggers (only those that pass change filter)
-    active_triggers = []  # strings
-    trigger_rows = []     # dicts w/ team/name/status
-
+    # Build triggers once (injury changes only)
+    triggers = []
+    injury_triggers = []
     for pid, cur in new_players.items():
         if not status_in_scope(cur.get("status", "")):
             continue
@@ -962,166 +943,119 @@ def run():
         injured_name = cur.get("name", "")
         injured_status = (cur.get("status") or "").strip()
 
-        active_triggers.append(f"{injured_name} ({team_short}) {injured_status}")
-        trigger_rows.append({
-            "team": team_short,
-            "name": injured_name,
-            "status": injured_status,
-        })
+        triggers.append(f"{injured_name} ({team_short}) {injured_status}")
+        injury_triggers.append((team_short, injured_name, injured_status))
 
-    # Build ideas per market
     all_ideas = []
 
-    for market in PROP_TYPES:
-        # normalize market name internally
-        prop_type = "three_pointers_made" if market in ("three_pointers_made", "threes", "fg3m", "3pt_made") else market
-
-        # Injury-triggered
-        injury_ideas_market = []
-        for tr in trigger_rows:
+    for prop_type in PROP_TYPES:
+        # Injury ideas
+        injury_ideas = []
+        for (team_short, injured_name, injured_status) in injury_triggers:
             ideas = build_injury_edges(
-                team_short=tr["team"],
-                injured_name=tr["name"],
-                injured_status=tr["status"],
-                exclude_names_lower=exclude_names_lower | {_clean_name(tr["name"])},
+                team_short=team_short,
+                injured_name=injured_name,
+                injured_status=injured_status,
+                exclude_names_lower=exclude_names_lower | {_clean_name(injured_name)},
                 now_et=now_et,
-                prop_type=prop_type,
+                prop_type=prop_type
             )
-            if ideas:
-                injury_ideas_market.extend(ideas)
+            injury_ideas.extend(ideas)
 
-        # Slate scan
-        slate_ideas_market = slate_scan_edges(now_et, prop_type=prop_type)
+        # Slate ideas
+        slate_ideas = slate_scan_edges(now_et, prop_type=prop_type)
 
-        # combine + dedupe within market by (section, pid) keep best edge/prob
-        combined_market = injury_ideas_market + slate_ideas_market
+        # Dedup per player within this prop_type (keep best edge/prob)
         best = {}
-        for i in combined_market:
-            k = (i["market"], i["section"], int(i["player_id"]))
+        for i in (injury_ideas + slate_ideas):
+            k = (i["section"], i["prop_type"], int(i["player_id"]))
             if (k not in best) or ((i["edge"], i["prob_over"]) > (best[k]["edge"], best[k]["prob_over"])):
                 best[k] = i
-        combined_market = list(best.values())
 
-        all_ideas.extend(combined_market)
+        merged = list(best.values())
+        all_ideas.extend(merged)
 
     # Apply cooldown across everything
     all_ideas = apply_cooldown(state, all_ideas, now_ts)
 
-    # Re-split per market, per section, then select with caps
-    output_chunks = []
-    sent_final = []
+    # Organize output by market
+    out_by_market = {p: {"injury": [], "slate": []} for p in PROP_TYPES}
+    for i in all_ideas:
+        pt = i["prop_type"]
+        if pt not in out_by_market:
+            continue
+        out_by_market[pt][i["section"]].append(i)
 
-    header = f"💰 FanDuel Props ({ts_et})"
-    output_chunks.append(header)
-    output_chunks.append("")
+    # Sort and cap per market
+    for pt in list(out_by_market.keys()):
+        out_by_market[pt]["injury"].sort(key=lambda x: (x["trigger_strength"], x["edge"], x["prob_over"]), reverse=True)
+        out_by_market[pt]["slate"].sort(key=lambda x: (x["edge"], x["prob_over"]), reverse=True)
 
-    # Show triggers once (if any)
-    if active_triggers:
-        # keep it short
-        output_chunks.append("🚑 Injury-Triggered Plays:")
-        output_chunks.append("Triggers:")
-        for t in active_triggers[:8]:
-            output_chunks.append(f"- {t}")
-        if len(active_triggers) > 8:
-            output_chunks.append(f"- …and {len(active_triggers)-8} more")
-        output_chunks.append("")
+        out_by_market[pt]["injury"] = out_by_market[pt]["injury"][:MAX_PER_MARKET]
+        out_by_market[pt]["slate"] = out_by_market[pt]["slate"][:MAX_PER_MARKET]
 
-    total_left = MAX_BET_IDEAS
+        # Apply MIN_PER_MARKET gating (but never suppress other markets)
+        if MIN_PER_MARKET > 0:
+            total_here = len(out_by_market[pt]["injury"]) + len(out_by_market[pt]["slate"])
+            if total_here < MIN_PER_MARKET:
+                out_by_market[pt]["injury"] = []
+                out_by_market[pt]["slate"] = []
 
-    for market in PROP_TYPES:
-        prop_type = "three_pointers_made" if market in ("three_pointers_made", "threes", "fg3m", "3pt_made") else market
-        label = market_label(prop_type)
+    # Build final message with overall cap
+    msg = [f"💰 FanDuel Props ({ts_et})", ""]
 
-        market_ideas = [i for i in all_ideas if i["market"] == prop_type]
-        if not market_ideas:
+    any_output = False
+    sent_list = []
+
+    for pt in PROP_TYPES:
+        inj = out_by_market[pt]["injury"]
+        slt = out_by_market[pt]["slate"]
+        if not inj and not slt:
             continue
 
-        injury = sorted(
-            [i for i in market_ideas if i["section"] == "injury"],
-            key=lambda x: (x["trigger_strength"], x["edge"], x["prob_over"]),
-            reverse=True,
-        )
-        slate = sorted(
-            [i for i in market_ideas if i["section"] == "slate"],
-            key=lambda x: (x["edge"], x["prob_over"]),
-            reverse=True,
-        )
+        any_output = True
+        header = "Points" if pt == "points" else ("3PT Made" if pt == "threes" else pt)
+        msg.append(f"🏷️ {header}")
+        msg.append("")
 
-        # take up to MAX_PER_MARKET combined but ensure at least MIN_PER_MARKET if possible
-        picked = []
-        # prefer injury first, then slate
-        for lst in (injury, slate):
-            for it in lst:
-                if len(picked) >= MAX_PER_MARKET:
-                    break
-                picked.append(it)
-            if len(picked) >= MAX_PER_MARKET:
-                break
+        if inj:
+            msg.append("🚑 Injury-Triggered Plays:")
+            if triggers:
+                msg.append("Triggers:")
+                for t in triggers[:8]:
+                    msg.append(f"- {t}")
+                if len(triggers) > 8:
+                    msg.append(f"- …and {len(triggers)-8} more")
+            msg.append("")
+            for i in inj:
+                msg.append(f"• {i['player_name']} OVER {i['line']:.1f}  (edge +{i['edge']:.1f}, P≈{i['prob_over']*100:.0f}%)")
+                msg.append(f"  Trigger: {i['trigger']}")
+                msg.append(f"  Why: {i['why']}")
+                msg.append("")
+                sent_list.append(i)
 
-        # if we still have less than MIN_PER_MARKET and there are remaining slate items, top up
-        if len(picked) < MIN_PER_MARKET:
-            rest = [x for x in slate if x not in picked]
-            for it in rest:
-                if len(picked) >= MIN_PER_MARKET:
-                    break
-                picked.append(it)
+        if slt:
+            msg.append("🌎 League-Wide Slate Scan (no injury required):")
+            msg.append("")
+            for i in slt:
+                msg.append(f"• {i['player_name']} OVER {i['line']:.1f}  (edge +{i['edge']:.1f}, P≈{i['prob_over']*100:.0f}%)")
+                msg.append(f"  Why: {i['why']}")
+                msg.append("")
+                sent_list.append(i)
 
-        if not picked:
-            continue
-
-        # global cap
-        if total_left <= 0:
+        # Overall cap enforcement at message level (stop adding if exceeded)
+        if len(sent_list) >= MAX_BET_IDEAS:
             break
-        picked = picked[:total_left]
-        total_left -= len(picked)
 
-        output_chunks.append(f"🏷️ {label}")
-        output_chunks.append("")
+    # Trim sent_list to max ideas and record cooldown
+    sent_list = sent_list[:MAX_BET_IDEAS]
 
-        # Group prints: injury then slate
-        inj_picked = [x for x in picked if x["section"] == "injury"]
-        slate_picked = [x for x in picked if x["section"] == "slate"]
-
-        if inj_picked:
-            for i in inj_picked:
-                output_chunks.append(
-                    f"• {i['player_name']} OVER {i['line']:.1f}  (edge +{i['edge']:.1f}, P≈{i['prob_over']*100:.0f}%)"
-                )
-                output_chunks.append(f"  Trigger: {i['trigger']}")
-                output_chunks.append(f"  Why: {i['why']}")
-                output_chunks.append("")
-                sent_final.append(i)
-
-        if slate_picked:
-            output_chunks.append("🌎 League-Wide Slate Scan (no injury required):")
-            output_chunks.append("")
-            for i in slate_picked:
-                output_chunks.append(
-                    f"• {i['player_name']} OVER {i['line']:.1f}  (edge +{i['edge']:.1f}, P≈{i['prob_over']*100:.0f}%)"
-                )
-                output_chunks.append(f"  Why: {i['why']}")
-                output_chunks.append("")
-                sent_final.append(i)
-
-    # If you asked for threes but none were found, tell you why (so it doesn't feel broken)
-    if "three_pointers_made" in [("three_pointers_made" if m in ("three_pointers_made","threes","fg3m","3pt_made") else m) for m in PROP_TYPES]:
-        has_threes = any(i["market"] == "three_pointers_made" for i in sent_final)
-        if not has_threes:
-            output_chunks.append("🧩 Note on 3PT Made:")
-            output_chunks.append(
-                "No 3PT lines matched your vendor(s) for this run. If you *know* FanDuel has 3PT props up, "
-                "set DEBUG_PROP_SAMPLE_TYPES=three_pointers_made to print a sample row in logs so we can confirm the correct prop_type."
-            )
-            output_chunks.append("")
-
-    text = "\n".join(output_chunks).strip()
-
-    if sent_final:
-        send_chunked(text)
-        record_sent(state, sent_final, now_ts)
+    if any_output and sent_list:
+        send_chunked("\n".join(msg).strip())
+        record_sent(state, sent_list, now_ts)
     else:
         if SEND_NO_EDGE_PING and _in_burst_window(now_et):
-            send_one(f"🧠 No edges hit thresholds this run. ({ts_et})")
+            send_one(f"🧠 No edges met thresholds this run. ({ts_et})")
 
     state["players"] = new_players
     save_state(state)
