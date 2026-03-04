@@ -545,7 +545,16 @@ def build_today_props(now_et: datetime):
                             "line": float(line),
                             "odds": float(odds),
                             "updated_at": pp.get("updated_at"),
-                        })
+                        })ladders_points.setdefault(pid, []).append({
+    "pid": pid,
+    "gid": int(pp.get("game_id")) if pp.get("game_id") is not None else int(gid),
+    "vendor": (pp.get("vendor") or (v or "no_vendor")),
+    "line": float(line),
+    "odds": float(odds),
+    "updated_at": pp.get("updated_at"),
+})
+
+print(f"[DEBUG] LADDER ROW: {pp}")
 
             # Reduce each vendor to its "main" line for each player; then compute consensus across vendors
             if not per_vendor_rows:
