@@ -153,7 +153,7 @@ BDL_HEADERS = {"Authorization": BALLDONTLIE_API_KEY} if BALLDONTLIE_API_KEY else
 BDL_PREFIXES = ["/nba", ""]  # try nba namespace then fallback
 
 BDL_MAX_RETRIES = int(float(os.environ.get("BDL_MAX_RETRIES", "5")))
-BDL_RETRY_BASE_SEC = float(os.environ.get("BDL_RETRY_BASE_SEC", "1.5")))
+BDL_RETRY_BASE_SEC = float(os.environ.get("BDL_RETRY_BASE_SEC", "1.5"))
 BDL_PER_PAGE = int(float(os.environ.get("BDL_PER_PAGE", "100")))
 BDL_MAX_PAGES = int(float(os.environ.get("BDL_MAX_PAGES", "8")))
 
