@@ -40,12 +40,10 @@ ENABLE_SLATE_SCAN = os.environ.get("ENABLE_SLATE_SCAN", "1") == "1"
 MAX_PLAYS_PER_TEAM = int(os.environ.get("MAX_PLAYS_PER_TEAM", "2"))
 MAX_PLAYS_PER_GAME = int(os.environ.get("MAX_PLAYS_PER_GAME", "2"))
 
-# Consensus + Steam + EV + Plus odds + "market respect"
+# Consensus + "market respect"
 MIN_VENDORS_FOR_CONSENSUS = int(os.environ.get("MIN_VENDORS_FOR_CONSENSUS", "2"))
 MIN_SHARP_VENDORS = int(os.environ.get("MIN_SHARP_VENDORS", "1"))
-SHARP_VENDORS_RAW = os.environ.get(
-    "SHARP_VENDORS", "draftkings,caesars,betmgm,bet365,pointsbet,hardrock"
-).strip().lower()
+SHARP_VENDORS_RAW = os.environ.get("SHARP_VENDORS", "draftkings,caesars,betmgm,bet365,pointsbet,hardrock").strip().lower()
 SHARP_VENDORS = {x.strip() for x in SHARP_VENDORS_RAW.split(",") if x.strip()}
 
 ENABLE_STEAM = os.environ.get("ENABLE_STEAM", "0") == "1"
@@ -108,13 +106,8 @@ THREES_MIN_ATT_GAMES = int(os.environ.get("THREES_MIN_ATT_GAMES", "8"))
 LINEUPEXPERTS = os.environ.get("LINEUPEXPERTS", "0") == "1"
 LINEUPEXPERTS_KEY = os.environ.get("LINEUPEXPERTS_KEY", os.environ.get("LINEUPEXPERTS_API_KEY", "")).strip()
 
-# ✅ FIX: force the correct API base, and ignore bad env values like https://www.lineupexperts.com/api
-# If you *do* set LINEUPEXPERTS_BASE_URL, it must be https://api.lineupexperts.com/v1
-_env_le_base = os.environ.get("LINEUPEXPERTS_BASE_URL", "").strip().rstrip("/")
-if _env_le_base and "api.lineupexperts.com" in _env_le_base:
-    LINEUPEXPERTS_BASE_URL = _env_le_base
-else:
-    LINEUPEXPERTS_BASE_URL = "https://api.lineupexperts.com/v1"
+# ✅ FIX #1: default base url should be api.lineupexperts.com/v1 (NOT www.lineupexperts.com/api)
+LINEUPEXPERTS_BASE_URL = os.environ.get("LINEUPEXPERTS_BASE_URL", "https://api.lineupexperts.com/v1").strip().rstrip("/")
 
 LINEUPEXPERTS_TIMEOUT = int(os.environ.get("LINEUPEXPERTS_TIMEOUT", "12"))
 LINEUPEXPERTS_MAX_ITEMS = int(os.environ.get("LINEUPEXPERTS_MAX_ITEMS", "200"))
@@ -123,6 +116,7 @@ NEWS_BOOST_OUT = float(os.environ.get("NEWS_BOOST_OUT", "0.18"))
 NEWS_BOOST_QUESTIONABLE = float(os.environ.get("NEWS_BOOST_QUESTIONABLE", "0.08"))
 NEWS_BOOST_MINUTES = float(os.environ.get("NEWS_BOOST_MINUTES", "0.05"))
 NEWS_MIN_CONFIDENCE = float(os.environ.get("NEWS_MIN_CONFIDENCE", "0.25"))
+LINEUPEXPERTS_DEBUG = os.environ.get("LINEUPEXPERTS_DEBUG", "0") == "1"
 
 # -------------------- RUNTIME DEADLINE --------------------
 RUN_START = time.time()
@@ -211,7 +205,7 @@ def avg_stat_min_std(games):
 def _slice_last(games, n):
     if not games:
         return []
-    return games[-min(len(games), n) :]
+    return games[-min(len(games), n):]
 
 
 def _role_trend(games, long_n=LOOKBACK_GAMES, short_n=SHORT_GAMES):
@@ -285,7 +279,7 @@ def status_in_scope(status: str) -> bool:
 
 def _chunk(lst, n):
     for i in range(0, len(lst), n):
-        yield lst[i : i + n]
+        yield lst[i:i + n]
 
 
 # -------------------- SPORTRADAR (injuries) --------------------
@@ -312,7 +306,7 @@ def parse_injuries(data):
             pid = p.get("id")
             if not pid:
                 continue
-            name = p.get("full_name") or f"{p.get('first_name','')} {p.get('last_name','')}".strip()
+            name = p.get("full_name") or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
             status = (inj.get("status") or "Unknown").strip()
             detail = (inj.get("comment") or inj.get("description") or "").strip()
             flat_by_player[pid] = {"name": name, "team": team_name, "status": status, "detail": detail}
@@ -346,7 +340,7 @@ def _bdl_get(path: str, params=None, timeout: int = 20) -> dict:
                     break
                 if r.status_code in (429, 500, 502, 503, 504):
                     retry_after = r.headers.get("Retry-After")
-                    sleep_s = float(retry_after) if retry_after else (BDL_RETRY_BASE_SEC * (2**attempt))
+                    sleep_s = float(retry_after) if retry_after else (BDL_RETRY_BASE_SEC * (2 ** attempt))
                     last_err = f"{r.status_code} {r.text[:120]}"
                     time.sleep(min(sleep_s, 20.0))
                     continue
@@ -355,7 +349,7 @@ def _bdl_get(path: str, params=None, timeout: int = 20) -> dict:
                 return r.json()
             except Exception as e:
                 last_err = str(e)
-                time.sleep(min(BDL_RETRY_BASE_SEC * (2**attempt), 20.0))
+                time.sleep(min(BDL_RETRY_BASE_SEC * (2 ** attempt), 20.0))
                 continue
     raise RuntimeError(f"BallDontLie request failed for {path}. Last error: {last_err}")
 
@@ -430,7 +424,7 @@ def bdl_find_player_id_on_team(team_short: str, full_name: str):
     t0 = strip_suffix(full_name)
     for p in roster:
         pid = p.get("id")
-        nm = f"{p.get('first_name','')} {p.get('last_name','')}".strip()
+        nm = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
         if pid and nm and strip_suffix(nm) == t0:
             return int(pid)
     return None
@@ -557,7 +551,7 @@ def bdl_last_n_games_threes(player_ids, season: int, n: int):
     return out
 
 
-def bdl_fetch_props_for_game(game_id: int, vendor: str | None, prop_type: str):
+def bdl_fetch_props_for_game(game_id: int, vendor, prop_type: str):
     key = (int(game_id), (vendor or "NO_VENDOR"), prop_type)
     if key in PROPS_CACHE:
         return PROPS_CACHE[key]
@@ -734,39 +728,56 @@ def compute_projection_and_prob_points(games_all, line, w_base=0.45, w_l10=0.35,
     return proj, edge, prob_over, (base_avg, l10_avg, l3_avg, l10_min, sigma)
 
 
-# -------------------- THREES (BETA-BINOMIAL) ✅ FIXED / HARDENED --------------------
+# -------------------- THREES (BETA-BINOMIAL) --------------------
 def _betaln(a: float, b: float) -> float:
     return math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
 
 
-def _log_choose(n: int, k: int) -> float:
-    n = int(n)
-    k = int(k)
+def _log_choose(n, k) -> float:
+    # ✅ FIX #2: harden against floats and invalid k>n cases
+    try:
+        n = int(n)
+        k = int(k)
+    except Exception:
+        return float("-inf")
     if n < 0 or k < 0 or k > n:
         return float("-inf")
-    return math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)
+    return math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma((n - k) + 1)
 
 
-def beta_binom_pmf(k: int, n: int, a: float, b: float) -> float:
-    n = int(n)
-    k = int(k)
-    if n < 0 or k < 0 or k > n:
+def beta_binom_pmf(k, n, a: float, b: float) -> float:
+    # ✅ FIX #2: explicitly guard invalid domains
+    try:
+        n = int(n)
+        k = int(k)
+    except Exception:
         return 0.0
-    lp = _log_choose(n, k) + _betaln(k + a, (n - k) + b) - _betaln(a, b)
-    if not math.isfinite(lp):
-        return 0.0
-    return float(math.exp(lp))
-
-
-def beta_binom_cdf(k: int, n: int, a: float, b: float) -> float:
-    n = int(n)
-    k = int(k)
     if n <= 0:
-        return 1.0
-    if k < 0:
         return 0.0
-    if k >= n:
-        return 1.0
+    if k < 0 or k > n:
+        return 0.0
+
+    lc = _log_choose(n, k)
+    if not math.isfinite(lc):
+        return 0.0
+
+    try:
+        return math.exp(lc + _betaln(k + a, (n - k) + b) - _betaln(a, b))
+    except Exception:
+        return 0.0
+
+
+def beta_binom_cdf(k, n, a: float, b: float) -> float:
+    # sum_{i=0..k} pmf(i)
+    try:
+        n = int(n)
+        k = int(k)
+    except Exception:
+        return 0.0
+    if n <= 0:
+        return 0.0
+    k = max(0, min(k, n))  # ✅ FIX #2: clamp k to [0,n]
+
     s = 0.0
     for i in range(0, k + 1):
         s += beta_binom_pmf(i, n, a, b)
@@ -776,7 +787,8 @@ def beta_binom_cdf(k: int, n: int, a: float, b: float) -> float:
 def threes_prob_over_beta_binom(threes_games, line: float):
     """
     threes_games: [(date, fg3m, fg3a, mins), ...]
-    Returns P(3PM > line) safely.
+    Uses a beta prior inferred from recent makes/misses, and
+    averages beta-binomial P(over line) across recent attempts distribution.
     """
     if not threes_games:
         return None
@@ -784,57 +796,38 @@ def threes_prob_over_beta_binom(threes_games, line: float):
     base = _slice_last(threes_games, BASELINE_GAMES)
     l10 = _slice_last(threes_games, LOOKBACK_GAMES)
 
-    makes = sum(float(x[1] or 0.0) for x in base)
-    atts = sum(float(x[2] or 0.0) for x in base)
-    if atts <= 1e-6:
+    makes = sum(float(x[1]) for x in base)
+    atts = sum(float(x[2]) for x in base)
+    if atts <= 0:
         return None
 
-    # Beta posterior
     a = 1.0 + makes
     b = 1.0 + max(0.0, atts - makes)
 
-    # attempts distribution (prefer L10)
-    att_list = []
-    for x in l10:
-        try:
-            aa = int(round(float(x[2] or 0.0)))
-        except Exception:
-            aa = 0
-        if aa > 0:
-            att_list.append(aa)
-
+    att_list = [int(round(float(x[2]))) for x in l10 if float(x[2]) > 0]
     if len(att_list) < max(3, min(THREES_MIN_ATT_GAMES, LOOKBACK_GAMES // 2)):
-        att_list = []
-        for x in base:
-            try:
-                aa = int(round(float(x[2] or 0.0)))
-            except Exception:
-                aa = 0
-            if aa > 0:
-                att_list.append(aa)
+        att_list = [int(round(float(x[2]))) for x in base if float(x[2]) > 0]
 
     if not att_list:
         return None
 
-    # Over 2.5 => need >= 3
-    need = int(math.floor(float(line) + 1.0))
-    if need <= 0:
-        return 1.0
+    # over line means makes >= floor(line)+1
+    k = int(math.floor(float(line)))
 
     probs = []
     for n_att in att_list:
-        n_att = int(n_att)
+        n_att = int(max(0, n_att))
         if n_att <= 0:
             probs.append(0.0)
             continue
-        if need > n_att:
-            probs.append(0.0)
-            continue
 
-        p_le_need_minus_1 = beta_binom_cdf(need - 1, n_att, a, b)
-        probs.append(1.0 - p_le_need_minus_1)
+        # P(over) = 1 - P(X <= k)
+        p_le_k = beta_binom_cdf(k, n_att, a, b)
+        probs.append(1.0 - p_le_k)
 
-    return sum(probs) / max(1, len(probs))
+    if not probs:
+        return None
+    return sum(probs) / len(probs)
 
 
 # -------------------- STEAM DETECTION --------------------
@@ -886,7 +879,8 @@ def _try_parse_dt(s: str):
     if not s:
         return None
     s = str(s).strip()
-    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z",
+                "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
         try:
             return datetime.strptime(s, fmt)
         except Exception:
@@ -896,8 +890,10 @@ def _try_parse_dt(s: str):
 
 def fetch_lineupexperts_news(now_et: datetime):
     """
-    Uses NBA Core endpoint you verified:
+    ✅ Uses your verified NBA Core endpoint:
       https://api.lineupexperts.com/v1/nba-NewsBySport?key=XXXX
+
+    Returns list[dict] (best-effort).
     """
     if not LINEUPEXPERTS or not LINEUPEXPERTS_KEY:
         return []
@@ -908,6 +904,9 @@ def fetch_lineupexperts_news(now_et: datetime):
     except Exception as e:
         print(f"[WARN] LineupExperts request failed: {type(e).__name__}: {e}")
         return []
+
+    if LINEUPEXPERTS_DEBUG:
+        print(f"[DEBUG] LineupExperts url={r.url} status={r.status_code} bytes={len(r.text)}")
 
     if r.status_code != 200:
         print(f"[WARN] LineupExperts HTTP {r.status_code} for {r.url}: {r.text[:300]}")
@@ -929,7 +928,7 @@ def fetch_lineupexperts_news(now_et: datetime):
     if not isinstance(items, list):
         return []
 
-    items = items[: max(1, LINEUPEXPERTS_MAX_ITEMS)]
+    items = items[:max(1, LINEUPEXPERTS_MAX_ITEMS)]
 
     cutoff = now_et - timedelta(hours=NEWS_LOOKBACK_HOURS)
     out = []
@@ -955,6 +954,10 @@ def fetch_lineupexperts_news(now_et: datetime):
 
 
 def build_news_boost_map(news_items):
+    """
+    boosts keyed by cleaned player name:
+      { "first last": {"boost": float, "confidence": float, "why": str} }
+    """
     boosts = {}
 
     def push(player_name: str, boost: float, confidence: float, why: str):
@@ -972,9 +975,7 @@ def build_news_boost_map(news_items):
 
     out_pat = re.compile(r"\b(ruled out|will miss|out for|out vs|out tonight|inactive)\b", re.I)
     q_pat = re.compile(r"\b(questionable|probable|doubtful|game-time decision|gtd)\b", re.I)
-    min_up_pat = re.compile(
-        r"\b(minutes restriction lifted|minutes limit lifted|expected to start|will start|increase in minutes|bigger role)\b", re.I
-    )
+    min_up_pat = re.compile(r"\b(minutes restriction lifted|minutes limit lifted|expected to start|will start|increase in minutes|bigger role)\b", re.I)
 
     for it in news_items:
         try:
@@ -1024,7 +1025,7 @@ def build_news_boost_map(news_items):
     return boosts
 
 
-def apply_news_to_projection(proj: float, boost_rec: dict | None, cap: float = 0.30):
+def apply_news_to_projection(proj: float, boost_rec, cap: float = 0.30):
     if not boost_rec:
         return proj, 0.0, None
     b = float(boost_rec.get("boost", 0.0))
@@ -1050,7 +1051,7 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
     roster_tuples = []
     for p in roster:
         pid = p.get("id")
-        nm = f"{p.get('first_name','')} {p.get('last_name','')}".strip()
+        nm = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
         if pid is None or not nm:
             continue
         if _clean_name(nm) in exclude_names_lower:
@@ -1085,6 +1086,7 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
 
     cand_ids = [pid for pid, _ in roster_tuples]
 
+    # stats pull
     stats_all = {}
     if prop_type == "threes":
         for chunk_ids in _chunk(cand_ids, STAT_BATCH_SIZE):
@@ -1106,6 +1108,7 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
         if len(games) < 8:
             continue
 
+        # minutes gate (works for both formats)
         if prop_type == "threes":
             m10 = sum(float(x[3]) for x in _slice_last(games, LOOKBACK_GAMES)) / max(1, len(_slice_last(games, LOOKBACK_GAMES)))
             v10 = sum(float(x[1]) for x in _slice_last(games, LOOKBACK_GAMES)) / max(1, len(_slice_last(games, LOOKBACK_GAMES)))
@@ -1129,6 +1132,7 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
         if (v10 - line) > LINE_MIN_GAP:
             continue
 
+        # role trend for injury absorption
         if prop_type == "threes":
             long_slice = _slice_last(games, LOOKBACK_GAMES)
             short_slice = _slice_last(games, SHORT_GAMES)
@@ -1161,9 +1165,9 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
         injury_boost_stat = min(BOOST_CAP_STAT, vac_stat * absorption * 0.65)
         injury_boost_min = min(BOOST_CAP_MIN, vac_min * absorption * 0.25)
 
+        # projection + prob
         if prop_type == "threes" and THREES_BETA_BINOM:
             base_line = float(line)
-
             base = _slice_last(games, BASELINE_GAMES)
             l10 = _slice_last(games, LOOKBACK_GAMES)
             l3 = _slice_last(games, SHORT_GAMES)
@@ -1225,8 +1229,8 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
         team_name = PLAYER_TEAM_CACHE.get(pid) or team_short or ""
 
         base_avg, l10_avg, l3_avg, l10_min, sigma = aux
-        news_note = f" | news_boost≈{news_eff:+.2f}" if 'news_eff' in locals() and news_eff else ""
-        news_note2 = f" ({news_why})" if 'news_why' in locals() and news_why else ""
+        news_note = f" | news_boost≈{news_eff:+.2f}" if (locals().get("news_eff") or 0) else ""
+        news_note2 = f" ({news_why})" if (locals().get("news_why") or "") else ""
 
         why = (
             f"TriggerStrength {trigger_strength:.0f} | Absorb {absorption:.2f}. "
@@ -1235,37 +1239,35 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
             f"(mins L10 {l10_min:.1f}). Role Δmin={min_delta:+.1f}, Δrate={rate_delta:+.2f}. "
             f"Proj {proj:.1f} vs CONS {line:.1f} (n={n_cons}, sharp={n_sharp}) | "
             f"offer {offer['vendor']} {offer['line']:.1f} ({int(offer['over_odds']):+d}) "
-            f"| edge +{edge:.1f} | P≈{prob_over*100:.0f}% (mkt≈{p_market*100:.0f}%, val_edge≈{value_edge:+.2f}) "
+            f"| edge +{edge:.1f} | P≈{prob_over * 100:.0f}% (mkt≈{p_market * 100:.0f}%, val_edge≈{value_edge:+.2f}) "
             f"| EV≈{ev:+.2f}/$1 | steam={steam:.1f}{news_note}{news_note2}."
         )
 
-        ideas.append(
-            {
-                "section": "injury",
-                "prop_type": prop_type,
-                "player_name": nm,
-                "player_id": int(pid),
-                "team": team_name,
-                "gid": gid,
-                "cons_line": float(line),
-                "line": float(offer["line"]),
-                "proj": float(proj),
-                "edge": float(edge),
-                "prob_over": float(prob_over),
-                "market_prob": float(p_market),
-                "value_edge": float(value_edge),
-                "ev": float(ev),
-                "vendor": str(offer["vendor"]),
-                "over_odds": float(offer["over_odds"]),
-                "under_odds": float(offer["under_odds"]),
-                "n_cons": int(n_cons),
-                "n_sharp": int(n_sharp),
-                "steam": float(steam),
-                "trigger_strength": float(trigger_strength),
-                "trigger": f"{injured_name} ({team_short}) {injured_status}",
-                "why": why,
-            }
-        )
+        ideas.append({
+            "section": "injury",
+            "prop_type": prop_type,
+            "player_name": nm,
+            "player_id": int(pid),
+            "team": team_name,
+            "gid": gid,
+            "cons_line": float(line),
+            "line": float(offer["line"]),
+            "proj": float(proj),
+            "edge": float(edge),
+            "prob_over": float(prob_over),
+            "market_prob": float(p_market),
+            "value_edge": float(value_edge),
+            "ev": float(ev),
+            "vendor": str(offer["vendor"]),
+            "over_odds": float(offer["over_odds"]),
+            "under_odds": float(offer["under_odds"]),
+            "n_cons": int(n_cons),
+            "n_sharp": int(n_sharp),
+            "steam": float(steam),
+            "trigger_strength": float(trigger_strength),
+            "trigger": f"{injured_name} ({team_short}) {injured_status}",
+            "why": why,
+        })
 
         remember_market(state, prop_type, pid, offer, line, n_cons, now_ts)
 
@@ -1283,6 +1285,7 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
     if not pids:
         return []
 
+    # pull stats
     stats_all = {}
     if prop_type == "threes" and THREES_BETA_BINOM:
         for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
@@ -1313,6 +1316,7 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
         if not offer:
             continue
 
+        # minutes + sanity check
         if prop_type == "threes":
             v10 = sum(float(x[1]) for x in _slice_last(games, LOOKBACK_GAMES)) / max(1, len(_slice_last(games, LOOKBACK_GAMES)))
             m10 = sum(float(x[3]) for x in _slice_last(games, LOOKBACK_GAMES)) / max(1, len(_slice_last(games, LOOKBACK_GAMES)))
@@ -1326,6 +1330,7 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
         if (v10 - line) > LINE_MIN_GAP:
             continue
 
+        # role trend for explanation
         if prop_type == "threes":
             long_slice = _slice_last(games, LOOKBACK_GAMES)
             short_slice = _slice_last(games, SHORT_GAMES)
@@ -1344,6 +1349,7 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
             rate_delta = rate_s - rate_l
             l10_min = m10
 
+        # projection + prob
         if prop_type == "threes" and THREES_BETA_BINOM:
             base = _slice_last(games, BASELINE_GAMES)
             l10 = _slice_last(games, LOOKBACK_GAMES)
@@ -1403,8 +1409,8 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
         team_name = PLAYER_TEAM_CACHE.get(int(pid), "")
         gid = int(offer.get("gid") or offer.get("game_id") or 0)
 
-        news_note = f" | news_boost≈{news_eff:+.2f}" if 'news_eff' in locals() and news_eff else ""
-        news_note2 = f" ({news_why})" if 'news_why' in locals() and news_why else ""
+        news_note = f" | news_boost≈{news_eff:+.2f}" if (locals().get("news_eff") or 0) else ""
+        news_note2 = f" ({news_why})" if (locals().get("news_why") or "") else ""
 
         if prop_type == "threes":
             base = _slice_last(games, BASELINE_GAMES)
@@ -1419,37 +1425,35 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
             f"(mins L10 {l10_min:.1f}). Role Δmin={min_delta:+.1f}, Δrate={rate_delta:+.2f}. "
             f"Proj {proj:.1f} vs CONS {line:.1f} (n={n_cons}, sharp={n_sharp}) | "
             f"offer {offer['vendor']} {offer['line']:.1f} ({int(offer['over_odds']):+d}) "
-            f"| edge +{edge:.1f} | P≈{prob_over*100:.0f}% (mkt≈{p_market*100:.0f}%, val_edge≈{value_edge:+.2f}) "
+            f"| edge +{edge:.1f} | P≈{prob_over * 100:.0f}% (mkt≈{p_market * 100:.0f}%, val_edge≈{value_edge:+.2f}) "
             f"| EV≈{ev:+.2f}/$1 | steam={steam:.1f}{news_note}{news_note2}."
         )
 
-        ideas.append(
-            {
-                "section": "slate",
-                "prop_type": prop_type,
-                "player_name": name,
-                "player_id": int(pid),
-                "team": team_name,
-                "gid": gid,
-                "cons_line": float(line),
-                "line": float(offer["line"]),
-                "proj": float(proj),
-                "edge": float(edge),
-                "prob_over": float(prob_over),
-                "market_prob": float(p_market),
-                "value_edge": float(value_edge),
-                "ev": float(ev),
-                "vendor": str(offer["vendor"]),
-                "over_odds": float(offer["over_odds"]),
-                "under_odds": float(offer["under_odds"]),
-                "n_cons": int(n_cons),
-                "n_sharp": int(n_sharp),
-                "steam": float(steam),
-                "trigger_strength": 0.0,
-                "trigger": "No injury trigger (league-wide scan)",
-                "why": why,
-            }
-        )
+        ideas.append({
+            "section": "slate",
+            "prop_type": prop_type,
+            "player_name": name,
+            "player_id": int(pid),
+            "team": team_name,
+            "gid": gid,
+            "cons_line": float(line),
+            "line": float(offer["line"]),
+            "proj": float(proj),
+            "edge": float(edge),
+            "prob_over": float(prob_over),
+            "market_prob": float(p_market),
+            "value_edge": float(value_edge),
+            "ev": float(ev),
+            "vendor": str(offer["vendor"]),
+            "over_odds": float(offer["over_odds"]),
+            "under_odds": float(offer["under_odds"]),
+            "n_cons": int(n_cons),
+            "n_sharp": int(n_sharp),
+            "steam": float(steam),
+            "trigger_strength": 0.0,
+            "trigger": "No injury trigger (league-wide scan)",
+            "why": why,
+        })
 
         remember_market(state, prop_type, pid, offer, line, n_cons, now_ts)
 
@@ -1504,13 +1508,10 @@ def apply_exposure_caps(ideas):
         team = (it.get("team") or "").strip().lower()
         gid = int(it.get("gid") or 0)
 
-        if team:
-            if team_ct.get(team, 0) >= MAX_PLAYS_PER_TEAM:
-                continue
-
-        if gid:
-            if game_ct.get(gid, 0) >= MAX_PLAYS_PER_GAME:
-                continue
+        if team and team_ct.get(team, 0) >= MAX_PLAYS_PER_TEAM:
+            continue
+        if gid and game_ct.get(gid, 0) >= MAX_PLAYS_PER_GAME:
+            continue
 
         out.append(it)
 
@@ -1537,7 +1538,7 @@ def run():
         f"ENABLE_STEAM={int(ENABLE_STEAM)} "
         f"MAX_PLAYS_PER_TEAM={MAX_PLAYS_PER_TEAM} MAX_PLAYS_PER_GAME={MAX_PLAYS_PER_GAME} "
         f"THREES_BETA_BINOM={int(THREES_BETA_BINOM)} "
-        f"LINEUPEXPERTS={int(LINEUPEXPERTS)} base_url={LINEUPEXPERTS_BASE_URL}"
+        f"LINEUPEXPERTS={int(LINEUPEXPERTS)} LINEUPEXPERTS_BASE_URL={LINEUPEXPERTS_BASE_URL}"
     )
 
     if TEST_MODE:
@@ -1555,10 +1556,7 @@ def run():
     news_boosts = build_news_boost_map(news_items) if news_items else {}
 
     if LINEUPEXPERTS:
-        print(
-            f"[INFO] LineupExperts news_items={len(news_items)} boosts={len(news_boosts)} "
-            f"base_url={LINEUPEXPERTS_BASE_URL}"
-        )
+        print(f"[INFO] LineupExperts news_items={len(news_items)} boosts={len(news_boosts)} lookback={NEWS_LOOKBACK_HOURS}h base_url={LINEUPEXPERTS_BASE_URL}")
 
     # Injuries
     new_players = {}
@@ -1607,7 +1605,7 @@ def run():
                     lines_map_for_prop=lines_map.get(pt, {}),
                     state=state,
                     now_ts=now_ts,
-                    news_boosts=news_boosts,
+                    news_boosts=news_boosts
                 )
                 if ideas:
                     got_any = True
@@ -1622,7 +1620,9 @@ def run():
         for pt in PROP_TYPES:
             if deadline_exceeded():
                 break
-            slate_ideas_all.extend(slate_scan_edges(now_et, pt, lines_map.get(pt, {}), state=state, now_ts=now_ts, news_boosts=news_boosts))
+            slate_ideas_all.extend(
+                slate_scan_edges(now_et, pt, lines_map.get(pt, {}), state=state, now_ts=now_ts, news_boosts=news_boosts)
+            )
 
     # Combine + best per (market/player)
     combined = injury_ideas_all + slate_ideas_all
@@ -1652,7 +1652,7 @@ def run():
 
         picks = inj + slt
         if MIN_PER_MARKET > 0:
-            picks = picks[: max(MIN_PER_MARKET, MAX_PER_MARKET)]
+            picks = picks[:max(MIN_PER_MARKET, MAX_PER_MARKET)]
         picks = picks[:MAX_PER_MARKET]
         out_by_market[pt] = picks
 
@@ -1662,10 +1662,10 @@ def run():
         final_out.extend(out_by_market.get(pt, []))
     final_out = final_out[:MAX_TOTAL_PLAYS]
 
-    # ✅ Exposure caps AFTER ranking, BEFORE messaging
+    # ✅ Apply exposure caps (team + game) AFTER ranking, BEFORE messaging
     final_out = apply_exposure_caps(final_out)
 
-    # Rebuild out_by_market from capped list
+    # Rebuild out_by_market from capped list (keeps message consistent)
     capped_by_market = {pt: [] for pt in PROP_TYPES}
     for it in final_out:
         capped_by_market[it["prop_type"]].append(it)
@@ -1754,6 +1754,7 @@ def run():
         send_chunked("\n".join(msg).strip())
 
         record_sent(state, final_out, now_ts)
+
     else:
         print("[INFO] No plays cleared thresholds this run.")
 
