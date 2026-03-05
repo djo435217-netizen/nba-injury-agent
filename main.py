@@ -3,7 +3,7 @@ import json
 import re
 import time
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import requests
@@ -36,28 +36,29 @@ PROP_TYPES = [p.strip() for p in PROP_TYPES_RAW.split(",") if p.strip()]
 ENABLE_INJURY_TRIGGERS = os.environ.get("ENABLE_INJURY_TRIGGERS", "1") == "1"
 ENABLE_SLATE_SCAN = os.environ.get("ENABLE_SLATE_SCAN", "1") == "1"
 
-# Consensus + Steam + EV + Plus odds
+# Consensus + Steam + EV + Value-edge
 MIN_VENDORS_FOR_CONSENSUS = int(os.environ.get("MIN_VENDORS_FOR_CONSENSUS", "1"))
+
 ENABLE_STEAM = os.environ.get("ENABLE_STEAM", "0") == "1"
-STEAM_MIN_SCORE = float(os.environ.get("STEAM_MIN_SCORE", "1.0"))  # higher = stricter
+STEAM_MIN_SCORE = float(os.environ.get("STEAM_MIN_SCORE", "1.0"))
 STEAM_MAX_AGE_MIN = int(os.environ.get("STEAM_MAX_AGE_MIN", "240"))
 
-# Exposure caps (quick win)
-MAX_PLAYS_PER_TEAM = int(os.environ.get("MAX_PLAYS_PER_TEAM", "1"))
-MAX_PLAYS_PER_GAME = int(os.environ.get("MAX_PLAYS_PER_GAME", "2"))
-
-# Market respect (sharps)
-MIN_SHARP_VENDORS = int(os.environ.get("MIN_SHARP_VENDORS", "1"))
-SHARP_VENDORS_RAW = os.environ.get(
-    "SHARP_VENDORS",
-    "draftkings,caesars,betmgm,bet365,fanatics,fanduel,betway,betparx"
-).strip().lower()
-SHARP_VENDORS = {v.strip() for v in SHARP_VENDORS_RAW.split(",") if v.strip()}
+EV_MIN = float(os.environ.get("EV_MIN", "0.00"))
+VALUE_EDGE_MIN = float(os.environ.get("VALUE_EDGE_MIN", "0.00"))
 
 # Output sizing
 MIN_PER_MARKET = int(os.environ.get("MIN_PER_MARKET", "0"))
 MAX_PER_MARKET = int(os.environ.get("MAX_PER_MARKET", "6"))
 MAX_TOTAL_PLAYS = int(os.environ.get("MAX_TOTAL_PLAYS", "10"))
+
+# Exposure caps (NEW)
+MAX_PLAYS_PER_TEAM = int(os.environ.get("MAX_PLAYS_PER_TEAM", "1"))
+MAX_PLAYS_PER_GAME = int(os.environ.get("MAX_PLAYS_PER_GAME", "2"))
+
+# Market respect / sharp vendor requirement (NEW)
+MIN_SHARP_VENDORS = int(os.environ.get("MIN_SHARP_VENDORS", "0"))
+SHARP_VENDORS_RAW = os.environ.get("SHARP_VENDORS", "draftkings,caesars,betmgm,bet365,circa,superbook").strip().lower()
+SHARP_VENDORS = {v.strip() for v in SHARP_VENDORS_RAW.split(",") if v.strip()}
 
 # Windows
 BASELINE_GAMES = int(os.environ.get("BASELINE_GAMES", "30"))
@@ -68,10 +69,6 @@ SHORT_GAMES = int(os.environ.get("SHORT_GAMES", "3"))
 MIN_EDGE = float(os.environ.get("MIN_EDGE", "2.5"))
 MIN_PROB = float(os.environ.get("MIN_PROB", "0.62"))
 STD_FLOOR = float(os.environ.get("STD_FLOOR", "5.0"))
-
-# EV filter
-EV_MIN = float(os.environ.get("EV_MIN", "0.00"))  # 0.00 => keep non-negative EV only
-VALUE_EDGE_MIN = float(os.environ.get("VALUE_EDGE_MIN", "0.00"))  # (model_prob - vigfree_market_prob)
 
 # Guardrails
 MIN_L10_MIN = float(os.environ.get("MIN_L10_MIN", "10"))
@@ -84,9 +81,9 @@ IMPACT_ONLY_CHANGES = os.environ.get("IMPACT_ONLY_CHANGES", "1") == "1"
 
 MIN_VAC_MIN = float(os.environ.get("MIN_VAC_MIN", "10.0"))
 MIN_VAC_STAT = float(os.environ.get("MIN_VAC_PTS", os.environ.get("MIN_VAC_STAT", "6.0")))
-BOOST_CAP_RATE = float(os.environ.get("BOOST_CAP_RATE", "0.20"))  # applied to rate*boost_minutes
-BOOST_CAP_STAT = float(os.environ.get("BOOST_CAP_STAT", "5.5"))   # direct stat boost cap
-BOOST_CAP_MIN = float(os.environ.get("BOOST_CAP_MIN", "6.0"))     # minutes boost cap
+BOOST_CAP_RATE = float(os.environ.get("BOOST_CAP_RATE", "0.20"))
+BOOST_CAP_STAT = float(os.environ.get("BOOST_CAP_STAT", "5.5"))
+BOOST_CAP_MIN = float(os.environ.get("BOOST_CAP_MIN", "6.0"))
 
 # Cooldown
 BET_COOLDOWN_MIN = int(os.environ.get("BET_COOLDOWN_MIN", "180"))
@@ -94,29 +91,40 @@ EDGE_JUMP_TO_RESEND = float(os.environ.get("EDGE_JUMP_TO_RESEND", "1.5"))
 
 # Runtime guard
 RUN_MAX_SECONDS = int(os.environ.get("RUN_MAX_SECONDS", "170"))
-STAT_BATCH_SIZE = int(os.environ.get("STAT_BATCH_SIZE", "90"))  # reduce timeouts
+STAT_BATCH_SIZE = int(os.environ.get("STAT_BATCH_SIZE", "90"))
 
 DEBUG_PROP_SAMPLE_TYPES = os.environ.get("DEBUG_PROP_SAMPLE_TYPES", "0").strip().lower()
 
 # Plus-odds bucket
-PLUS_ODDS_MIN = float(os.environ.get("PLUS_ODDS_MIN", "100"))  # +100 or higher
+PLUS_ODDS_MIN = float(os.environ.get("PLUS_ODDS_MIN", "100"))
 PLUS_ODDS_TOPN = int(os.environ.get("PLUS_ODDS_TOPN", "3"))
 
-# Ladder longshots (SYNTHETIC)
+# SYNTH LADDER (longshots)
 ENABLE_SYNTH_LADDER = os.environ.get("ENABLE_SYNTH_LADDER", "1") == "1"
-SYNTH_LADDER_MIN_ODDS = float(os.environ.get("SYNTH_LADDER_MIN_ODDS", "250"))  # you wanted +250
+SYNTH_LADDER_MIN_ODDS = float(os.environ.get("SYNTH_LADDER_MIN_ODDS", "250"))
 SYNTH_LADDER_MAX_ODDS = float(os.environ.get("SYNTH_LADDER_MAX_ODDS", "450"))
 SYNTH_LADDER_RUNG_STEPS_RAW = os.environ.get("SYNTH_LADDER_RUNG_STEPS", "3,4,5,6")
 SYNTH_LADDER_RUNG_STEPS = [int(x.strip()) for x in SYNTH_LADDER_RUNG_STEPS_RAW.split(",") if x.strip().isdigit()]
 SYNTH_LADDER_TOPN = int(os.environ.get("SYNTH_LADDER_TOPN", "6"))
 SYNTH_LADDER_MIN_L10_MIN = float(os.environ.get("SYNTH_LADDER_MIN_L10_MIN", "18"))
 
-# Threes model (beta-binomial)
-THREES_ALPHA0 = float(os.environ.get("THREES_ALPHA0", "1.5"))
-THREES_BETA0 = float(os.environ.get("THREES_BETA0", "3.5"))
-THREES_ATT_WINDOW = int(os.environ.get("THREES_ATT_WINDOW", str(LOOKBACK_GAMES)))
-THREES_ATT_MAX = int(os.environ.get("THREES_ATT_MAX", "18"))  # cap attempts mixture
-THREES_POISSON_MAX_K = int(os.environ.get("THREES_POISSON_MAX_K", "22"))
+# Threes beta-binomial controls (NEW)
+THREES_USE_BETA_BINOM = os.environ.get("THREES_USE_BETA_BINOM", "1") == "1"
+THREES_ATTEMPT_LOOKBACK = int(os.environ.get("THREES_ATTEMPT_LOOKBACK", "10"))
+THREES_MIN_AVG_ATTEMPTS = float(os.environ.get("THREES_MIN_AVG_ATTEMPTS", "2.5"))
+
+# LineupExperts / FantasyNerds style (NEW; optional + safe)
+ENABLE_LINEUPEXPERTS = os.environ.get("ENABLE_LINEUPEXPERTS", "1") == "1"
+LINEUPEXPERTS_API_KEY = os.environ.get("LINEUPEXPERTS_API_KEY", "").strip()
+
+LINEUPEXPERTS_BASE_URL = os.environ.get("LINEUPEXPERTS_BASE_URL", "https://api.fantasynerds.com/v1").strip().rstrip("/")
+LINEUPEXPERTS_INJURIES_PATH = os.environ.get("LINEUPEXPERTS_INJURIES_PATH", "/nba/injuries").strip()
+LINEUPEXPERTS_NEWS_PATH = os.environ.get("LINEUPEXPERTS_NEWS_PATH", "/nba/player-news").strip()
+LINEUPEXPERTS_LINEUPS_PATH = os.environ.get("LINEUPEXPERTS_LINEUPS_PATH", "/nba/starting-lineups").strip()
+
+NEWS_MAX_AGE_MIN = int(os.environ.get("NEWS_MAX_AGE_MIN", "360"))
+NEWS_START_KEYWORDS = ("will start", "starting", "named starter", "enters starting", "starting lineup")
+NEWS_LIMIT_KEYWORDS = ("minutes restriction", "will be limited", "limit", "cap")
 
 # -------------------- RUNTIME DEADLINE --------------------
 RUN_START = time.time()
@@ -176,10 +184,11 @@ def prob_to_american(p: float) -> float:
     p = max(1e-9, min(1 - 1e-9, float(p)))
     dec = 1.0 / p
     if dec >= 2.0:
-        return round((dec - 1.0) * 100.0, 0)   # +odds
-    return round(-100.0 / (dec - 1.0), 0)      # -odds
+        return (dec - 1.0) * 100.0   # +odds
+    return -100.0 / (dec - 1.0)      # -odds
 
 def avg_stat_min_std(games):
+    # games items may be: (date, val, mins, extra_attempts, team_id)
     if not games:
         return 0.0, 0.0, 0.0
     vals = [x[1] for x in games]
@@ -262,6 +271,17 @@ def _chunk(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
+def _parse_iso_dt_maybe(s: str):
+    if not s:
+        return None
+    try:
+        # handle "2026-03-04T13:31:24.792Z" etc
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
 # -------------------- SPORTRADAR (injuries) --------------------
 def fetch_sportradar_injuries():
     url = "https://api.sportradar.com/nba/trial/v8/en/league/injuries.json"
@@ -291,6 +311,106 @@ def parse_injuries(data):
             flat_by_player[pid] = {"name": name, "team": team_name, "status": status, "detail": detail}
     return flat_by_player
 
+# -------------------- LINEUPEXPERTS (FantasyNerds style) --------------------
+def _le_get(path: str, params=None, timeout: int = 20):
+    if not ENABLE_LINEUPEXPERTS or not LINEUPEXPERTS_API_KEY:
+        return None
+    url = f"{LINEUPEXPERTS_BASE_URL}{path}"
+    qp = dict(params or {})
+    qp["apikey"] = LINEUPEXPERTS_API_KEY
+    try:
+        r = requests.get(url, params=qp, timeout=timeout)
+        if r.status_code != 200:
+            print(f"[WARN] LineupExperts HTTP {r.status_code} for {path}: {r.text[:120]}")
+            return None
+        return r.json()
+    except Exception as e:
+        print(f"[WARN] LineupExperts error for {path}: {type(e).__name__}: {e}")
+        return None
+
+def le_fetch_injuries_map():
+    """
+    Returns name_key -> dict(status, team, detail)
+    We intentionally key by cleaned player name (since provider IDs vary).
+    """
+    data = _le_get(LINEUPEXPERTS_INJURIES_PATH)
+    if not data:
+        return {}
+
+    # Try common shapes: {"Injuries":[...]} or list[...]
+    rows = data.get("Injuries") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return {}
+
+    out = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        name = (r.get("PlayerName") or r.get("player") or r.get("name") or "").strip()
+        if not name:
+            continue
+        status = (r.get("Status") or r.get("status") or "").strip().lower()
+        # normalize to your statuses
+        if "out" in status:
+            st = "out"
+        elif "doubt" in status:
+            st = "doubtful"
+        elif "ques" in status or "prob" in status:
+            st = "questionable"
+        else:
+            continue
+        team = (r.get("Team") or r.get("team") or "").strip()
+        detail = (r.get("Injury") or r.get("injury") or r.get("Notes") or r.get("notes") or "").strip()
+        out[_clean_name(name)] = {"status": st, "team": team, "detail": detail}
+    return out
+
+def le_fetch_news_boosts():
+    """
+    Returns name_key -> {"start_boost":bool, "limit_flag":bool, "age_min":float}
+    """
+    data = _le_get(LINEUPEXPERTS_NEWS_PATH)
+    if not data:
+        return {}
+
+    rows = data.get("PlayerNews") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return {}
+
+    out = {}
+    now_utc = datetime.now(timezone.utc)
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        name = (r.get("PlayerName") or r.get("player") or r.get("name") or "").strip()
+        if not name:
+            continue
+        txt = (r.get("News") or r.get("news") or r.get("Report") or r.get("report") or "").strip()
+        if not txt:
+            continue
+
+        dt = _parse_iso_dt_maybe(r.get("Updated") or r.get("updated") or r.get("Date") or r.get("date") or "")
+        age_min = None
+        if dt is not None:
+            try:
+                dt_utc = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+                age_min = (now_utc - dt_utc).total_seconds() / 60.0
+            except Exception:
+                age_min = None
+
+        # If we can't parse recency, keep but treat as old
+        if age_min is not None and age_min > NEWS_MAX_AGE_MIN:
+            continue
+
+        lo = txt.lower()
+        start_boost = any(k in lo for k in NEWS_START_KEYWORDS)
+        limit_flag = any(k in lo for k in NEWS_LIMIT_KEYWORDS)
+
+        if not (start_boost or limit_flag):
+            continue
+
+        out[_clean_name(name)] = {"start_boost": start_boost, "limit_flag": limit_flag, "age_min": float(age_min) if age_min is not None else None}
+    return out
+
 # -------------------- BALLDONTLIE --------------------
 BDL_HEADERS = {"Authorization": BALLDONTLIE_API_KEY}
 BDL_PREFIXES = ["/nba", ""]
@@ -301,9 +421,9 @@ BDL_PER_PAGE = int(os.environ.get("BDL_PER_PAGE", "100"))
 BDL_MAX_PAGES = int(os.environ.get("BDL_MAX_PAGES", "10"))
 
 TEAM_CACHE = None
-PLAYER_NAME_CACHE = {}  # pid -> "First Last"
-PLAYER_TEAM_CACHE = {}  # pid -> team name/abbr
-PROPS_CACHE = {}        # (gid, vendor, prop_type) -> list[rows]
+PLAYER_NAME_CACHE = {}   # pid -> "First Last"
+PLAYER_TEAM_CACHE = {}   # pid -> team_id (from stats)
+PROPS_CACHE = {}         # (gid, vendor, prop_type) -> list[rows]
 
 def _bdl_get(path: str, params=None, timeout: int = 20) -> dict:
     last_err = None
@@ -394,8 +514,8 @@ def bdl_find_player_id_on_team(team_short: str, full_name: str):
 
 def bdl_last_n_games_stats(player_ids, season: int, n: int, stat_key: str):
     """
-    Returns: pid -> list[(date, value, minutes)]
-    Also populates PLAYER_NAME_CACHE and PLAYER_TEAM_CACHE opportunistically.
+    Returns dict pid -> list[(date, val, mins, extra_attempts, team_id)]
+    extra_attempts is fg3a when stat_key is fg3m, else None.
     """
     out = {int(pid): [] for pid in player_ids}
     if not player_ids:
@@ -425,18 +545,28 @@ def bdl_last_n_games_stats(player_ids, season: int, n: int, stat_key: str):
             if (fn or ln) and pid not in PLAYER_NAME_CACHE:
                 PLAYER_NAME_CACHE[pid] = f"{fn} {ln}".strip()
 
-            # team cache
-            t = row.get("team") or {}
-            tname = (t.get("abbreviation") or t.get("name") or t.get("full_name") or "").strip()
-            if tname and pid not in PLAYER_TEAM_CACHE:
-                PLAYER_TEAM_CACHE[pid] = tname
+            team = row.get("team") or {}
+            team_id = team.get("id")
+            if team_id is not None:
+                try:
+                    PLAYER_TEAM_CACHE[pid] = int(team_id)
+                except Exception:
+                    pass
 
             game = row.get("game") or {}
             date = game.get("date")
             val = float(row.get(stat_key, 0) or 0)
             mins = _parse_minutes(row.get("min"))
+
+            extra_attempts = None
+            if stat_key == "fg3m":
+                try:
+                    extra_attempts = float(row.get("fg3a", 0) or 0)
+                except Exception:
+                    extra_attempts = None
+
             if date:
-                out[pid].append((date, val, mins))
+                out[pid].append((date, val, mins, extra_attempts, PLAYER_TEAM_CACHE.get(pid)))
 
         if all(len(out[int(pid)]) >= n for pid in player_ids):
             break
@@ -452,66 +582,7 @@ def bdl_last_n_games_stats(player_ids, season: int, n: int, stat_key: str):
         out[pid] = g[-n:]
     return out
 
-def bdl_last_n_games_two_stats(player_ids, season: int, n: int, stat_key_a: str, stat_key_b: str):
-    """
-    For threes model: returns pid -> list[(date, a_val, b_val, minutes)]
-    """
-    out = {int(pid): [] for pid in player_ids}
-    if not player_ids:
-        return out
-
-    cursor = None
-    pages = 0
-    while pages < BDL_MAX_PAGES and (not deadline_exceeded()):
-        params = {"per_page": min(BDL_PER_PAGE, 100), "seasons[]": [season], "player_ids[]": player_ids}
-        if cursor is not None:
-            params["cursor"] = cursor
-
-        resp = _bdl_get("/v1/stats", params=params)
-        rows = resp.get("data") or []
-
-        for row in rows:
-            p = row.get("player") or {}
-            pid = p.get("id")
-            if pid is None:
-                continue
-            pid = int(pid)
-            if pid not in out:
-                continue
-
-            fn = (p.get("first_name") or "").strip()
-            ln = (p.get("last_name") or "").strip()
-            if (fn or ln) and pid not in PLAYER_NAME_CACHE:
-                PLAYER_NAME_CACHE[pid] = f"{fn} {ln}".strip()
-
-            t = row.get("team") or {}
-            tname = (t.get("abbreviation") or t.get("name") or t.get("full_name") or "").strip()
-            if tname and pid not in PLAYER_TEAM_CACHE:
-                PLAYER_TEAM_CACHE[pid] = tname
-
-            game = row.get("game") or {}
-            date = game.get("date")
-            a_val = float(row.get(stat_key_a, 0) or 0)
-            b_val = float(row.get(stat_key_b, 0) or 0)
-            mins = _parse_minutes(row.get("min"))
-            if date:
-                out[pid].append((date, a_val, b_val, mins))
-
-        if all(len(out[int(pid)]) >= n for pid in player_ids):
-            break
-
-        cursor = (resp.get("meta") or {}).get("next_cursor")
-        pages += 1
-        if not cursor:
-            break
-
-    for pid in list(out.keys()):
-        g = out[pid]
-        g.sort(key=lambda x: x[0])
-        out[pid] = g[-n:]
-    return out
-
-def bdl_fetch_props_for_game(game_id: int, vendor, prop_type: str):
+def bdl_fetch_props_for_game(game_id: int, vendor: str | None, prop_type: str):
     key = (int(game_id), (vendor or "NO_VENDOR"), prop_type)
     if key in PROPS_CACHE:
         return PROPS_CACHE[key]
@@ -594,7 +665,7 @@ def build_today_props(now_et: datetime):
                 row = {
                     "pid": pid,
                     "gid": int(pp.get("game_id")) if pp.get("game_id") is not None else int(gid),
-                    "vendor": (pp.get("vendor") or (pp.get("book") or "no_vendor")).strip().lower(),
+                    "vendor": (pp.get("vendor") or (v or "no_vendor")).strip().lower(),
                     "prop_type": (pp.get("prop_type") or pt),
                     "line": float(line),
                     "over_odds": float(over_odds),
@@ -612,13 +683,12 @@ def _round_to_half(x: float) -> float:
 def consensus_line(rows):
     """
     Returns:
-      (consensus_line, n_vendors, sharp_vendor_count)
+      (cons_line, n_vendors, vendors_set, sharp_vendor_count)
     """
     if not rows:
-        return None, 0, 0
-    by_vendor = {}
-    sharp_vendors_present = set()
+        return None, 0, set(), 0
 
+    by_vendor = {}
     for r in rows:
         v = str(r.get("vendor") or "").strip().lower()
         if not v:
@@ -628,19 +698,19 @@ def consensus_line(rows):
         except Exception:
             continue
         by_vendor.setdefault(v, _round_to_half(line))
-        if v in SHARP_VENDORS:
-            sharp_vendors_present.add(v)
 
+    vendors = set(by_vendor.keys())
     lines = sorted(by_vendor.values())
     n = len(lines)
-    sharp_n = len(sharp_vendors_present)
-
     if n == 0:
-        return None, 0, sharp_n
+        return None, 0, vendors, 0
+
+    sharp_cnt = sum(1 for v in vendors if v in SHARP_VENDORS)
+
     mid = n // 2
     if n % 2 == 1:
-        return float(lines[mid]), n, sharp_n
-    return float(0.5 * (lines[mid - 1] + lines[mid])), n, sharp_n
+        return float(lines[mid]), n, vendors, sharp_cnt
+    return float(0.5 * (lines[mid - 1] + lines[mid])), n, vendors, sharp_cnt
 
 def best_offer_near_consensus(rows, cons_line: float):
     if not rows or cons_line is None:
@@ -654,15 +724,21 @@ def best_offer_near_consensus(rows, cons_line: float):
         near = [r for r in rows if abs(float(r.get("line", 9e9)) - cons_line) <= 0.5 + 1e-9]
         pool = near if near else rows
 
-    # prefer best price on OVER (bigger american is better)
-    pool = [r for r in pool if isinstance(r.get("over_odds"), (int, float)) and isinstance(r.get("under_odds"), (int, float))]
+    # prefer best over odds, then closest line
+    def score(r):
+        try:
+            return (float(r["over_odds"]), -abs(float(r["line"]) - cons_line))
+        except Exception:
+            return (-1e9, -1e9)
+
+    pool = [r for r in pool if isinstance(r.get("over_odds"), (int, float))]
     if not pool:
         return None
-    pool.sort(key=lambda r: (float(r["over_odds"]), -abs(float(r["line"]) - cons_line)), reverse=True)
+    pool.sort(key=score, reverse=True)
     return pool[0]
 
 # -------------------- PROJECTION CORE (POINTS) --------------------
-def compute_projection_and_prob_normal(games_all, line, w_base=0.45, w_l10=0.35, w_l3=0.10, w_line=0.10):
+def compute_projection_and_prob(games_all, line, w_base=0.45, w_l10=0.35, w_l3=0.10, w_line=0.10):
     base_slice = _slice_last(games_all, BASELINE_GAMES)
     l10_slice = _slice_last(games_all, LOOKBACK_GAMES)
     l3_slice = _slice_last(games_all, SHORT_GAMES)
@@ -679,92 +755,104 @@ def compute_projection_and_prob_normal(games_all, line, w_base=0.45, w_l10=0.35,
     prob_over = _norm_cdf(z)
     return proj, edge, prob_over, (base_avg, l10_avg, l3_avg, l10_min, sigma)
 
-# -------------------- THREES MODEL (BETA-BINOMIAL + ATTEMPT MIXTURE) --------------------
-def _lgamma(x):  # tiny helper
-    return math.lgamma(x)
+# -------------------- THREES MODEL (BETA-BINOMIAL) --------------------
+def _log_beta(a, b):
+    return math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
 
 def _log_choose(n, k):
-    return _lgamma(n + 1) - _lgamma(k + 1) - _lgamma(n - k + 1)
+    return math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)
 
-def _log_beta(a, b):
-    return _lgamma(a) + _lgamma(b) - _lgamma(a + b)
-
-def _beta_binom_log_pmf(k, n, a, b):
-    # C(n,k) * B(k+a, n-k+b)/B(a,b)
-    return _log_choose(n, k) + _log_beta(k + a, n - k + b) - _log_beta(a, b)
-
-def _beta_binom_cdf(k, n, a, b):
-    if k < 0:
+def beta_binom_tail_prob(n, a, b, k_min):
+    """
+    P(X >= k_min) where X ~ BetaBinomial(n, a, b)
+    """
+    if n <= 0:
         return 0.0
-    if k >= n:
+    k_min = int(k_min)
+    if k_min <= 0:
         return 1.0
-    # sum pmf up to k (n is small for 3PA)
+    if k_min > n:
+        return 0.0
+
+    lb_ab = _log_beta(a, b)
     s = 0.0
-    for i in range(0, k + 1):
-        s += math.exp(_beta_binom_log_pmf(i, n, a, b))
+    for k in range(k_min, n + 1):
+        lp = _log_choose(n, k) + _log_beta(k + a, n - k + b) - lb_ab
+        s += math.exp(lp)
     return max(0.0, min(1.0, s))
 
-def _poisson_pmf(k, lam):
-    if k < 0:
-        return 0.0
-    return math.exp(-lam) * (lam ** k) / math.factorial(k)
-
-def threes_prob_over_beta_binom(games_fg3m_fg3a, line: float):
+def threes_prob_over_beta_binom(games_all, line):
     """
-    games_fg3m_fg3a: list[(date, fg3m, fg3a, minutes)]
-    Returns: (proj_3pm, prob_over, sigma_like)
+    Uses last THREES_ATTEMPT_LOOKBACK games.
+    games tuple: (date, fg3m, mins, fg3a, team_id)
     """
-    if not games_fg3m_fg3a:
-        return 0.0, 0.0, 0.0
+    sl = _slice_last(games_all, THREES_ATTEMPT_LOOKBACK)
+    makes = []
+    atts = []
+    mins = []
+    for _, m, mn, a, _tid in sl:
+        if a is None:
+            continue
+        try:
+            a = float(a)
+            m = float(m)
+        except Exception:
+            continue
+        if a < 0:
+            continue
+        makes.append(m)
+        atts.append(a)
+        mins.append(mn)
 
-    # recent window for attempts mean
-    recent = _slice_last(games_fg3m_fg3a, THREES_ATT_WINDOW)
-    att = [max(0.0, g[2]) for g in recent]  # fg3a
-    makes = [max(0.0, g[1]) for g in recent]  # fg3m
+    if len(atts) < 5:
+        return None
 
-    lam = sum(att) / max(1, len(att))
-    lam = min(float(lam), float(THREES_ATT_MAX))
+    avg_att = sum(atts) / len(atts)
+    if avg_att < THREES_MIN_AVG_ATTEMPTS:
+        return None
 
-    # beta posterior for make%
-    total_a = sum(att)
-    total_m = sum(makes)
-    a_post = THREES_ALPHA0 + total_m
-    b_post = THREES_BETA0 + (total_a - total_m)
+    # Empirical mean/var of make% (smoothed)
+    p_list = []
+    for m, a in zip(makes, atts):
+        if a <= 0:
+            continue
+        p_list.append(m / a)
 
-    # expected makes ~= E[p]*E[A]
-    mean_p = a_post / max(a_post + b_post, 1e-9)
-    proj = mean_p * lam
+    if len(p_list) < 5:
+        return None
 
-    # Probability makes > line: for typical OU line of 0.5/1.5/2.5
-    k = int(math.floor(float(line)))
-    prob_over = 0.0
-    # mixture over attempts (0..K)
-    max_k = max(THREES_POISSON_MAX_K, int(lam + 6.0 * math.sqrt(max(lam, 1e-9))))
-    max_k = int(min(max_k, 35))  # hard safety
+    mu = sum(p_list) / len(p_list)
+    var = sum((p - mu) ** 2 for p in p_list) / max(1, len(p_list))
 
-    # normalize truncated poisson
-    weights = []
-    for A in range(0, max_k + 1):
-        weights.append(_poisson_pmf(A, lam))
-    z = sum(weights) or 1.0
-    weights = [w / z for w in weights]
+    # Convert mean/var -> beta(a,b) with a modest prior strength
+    # If var is tiny, fall back to prior-strength
+    prior_strength = 20.0
+    if var <= 1e-6 or mu <= 1e-6 or mu >= 1 - 1e-6:
+        a = max(1.0, mu * prior_strength)
+        b = max(1.0, (1 - mu) * prior_strength)
+    else:
+        # k = mu*(1-mu)/var - 1
+        k = (mu * (1 - mu) / max(var, 1e-6)) - 1.0
+        if k <= 0:
+            k = prior_strength
+        a = max(1.0, mu * k)
+        b = max(1.0, (1 - mu) * k)
 
-    for A, w in enumerate(weights):
-        # P(M > k | A) under beta-binomial
-        cdf = _beta_binom_cdf(k, A, a_post, b_post)
-        prob_over += w * (1.0 - cdf)
+    n_att = max(1, int(round(avg_att)))
+    k_min = int(math.floor(line + 1e-9)) + 1  # over 2.5 => need 3
+    p_over = beta_binom_tail_prob(n_att, a, b, k_min)
 
-    prob_over = max(0.0, min(1.0, prob_over))
-
-    # sigma-like for reporting (rough): sqrt(var)
-    # Var(M) approx E[A]*E[p(1-p)] + Var(A)*E[p]^2 (very rough)
-    varA = lam  # Poisson
-    Ep = mean_p
-    Ep1p = (a_post * b_post) / (((a_post + b_post) ** 2) * (a_post + b_post + 1.0))
-    var = lam * Ep1p + varA * (Ep ** 2)
-    sigma_like = math.sqrt(max(var, 1e-9))
-
-    return proj, prob_over, sigma_like
+    proj = n_att * (a / (a + b))
+    edge = proj - float(line)
+    return {
+        "p_over": float(p_over),
+        "proj": float(proj),
+        "edge": float(edge),
+        "avg_att": float(avg_att),
+        "n_att": int(n_att),
+        "a": float(a),
+        "b": float(b),
+    }
 
 # -------------------- STEAM DETECTION --------------------
 def steam_score(prev, cur):
@@ -776,7 +864,7 @@ def steam_score(prev, cur):
     except Exception:
         return 0.0
 
-    line_move = (prev_line - cur_line)  # + means good for over
+    line_move = (prev_line - cur_line)  # + means better for over
     odds_move = (cur_over - prev_over) / 50.0
     score = (line_move / 0.5) * 0.9 + odds_move * 0.6
     return float(score)
@@ -807,18 +895,12 @@ def get_prev_market(state, prop_type, pid, now_ts):
     return prev
 
 # -------------------- ENGINES --------------------
-def _passes_market_respect(n_cons: int, sharp_n: int) -> bool:
-    if n_cons < MIN_VENDORS_FOR_CONSENSUS:
-        return False
-    if sharp_n < MIN_SHARP_VENDORS:
-        return False
-    return True
-
-def build_injury_edges(team_short, injured_name, injured_status, exclude_names_lower, now_et, prop_type, lines_map_for_prop, state, now_ts):
+def build_injury_edges(team_short, injured_name, injured_status, exclude_names_lower, now_et, prop_type, lines_map_for_prop, state, now_ts, news_boosts):
     if deadline_exceeded():
         return []
 
     season = _season_year(now_et)
+    stat_key = STAT_KEY_BY_PROP.get(prop_type, "pts")
 
     roster = bdl_active_roster(team_short)
     if not roster:
@@ -838,13 +920,7 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
     if not injured_pid:
         return []
 
-    # vac based on the same stat market (points uses pts, threes uses fg3m)
-    if prop_type in ("threes", "three_pointers_made"):
-        # for injury vacancy in threes, use fg3m baseline
-        inj_games = bdl_last_n_games_stats([injured_pid], season, BASELINE_GAMES, "fg3m").get(injured_pid, [])
-    else:
-        inj_games = bdl_last_n_games_stats([injured_pid], season, BASELINE_GAMES, "pts").get(injured_pid, [])
-
+    inj_games = bdl_last_n_games_stats([injured_pid], season, BASELINE_GAMES, stat_key).get(injured_pid, [])
     ip10, im10, _ = avg_stat_min_std(_slice_last(inj_games, LOOKBACK_GAMES))
     if len(inj_games) < 3:
         return []
@@ -860,135 +936,13 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
     trigger_strength = min(100.0, (vac_min * 1.2 + vac_stat * 1.5))
 
     cand_ids = [pid for pid, _ in roster_tuples]
-
-    ideas = []
-
-    if prop_type in ("threes", "three_pointers_made"):
-        # Pull fg3m + fg3a for better model
-        stats_all = {}
-        for chunk_ids in _chunk(cand_ids, STAT_BATCH_SIZE):
-            if deadline_exceeded():
-                break
-            stats_all.update(bdl_last_n_games_two_stats(chunk_ids, season, BASELINE_GAMES, "fg3m", "fg3a"))
-
-        for pid, nm in roster_tuples:
-            if deadline_exceeded():
-                break
-
-            games2 = stats_all.get(pid, [])
-            if len(games2) < 8:
-                continue
-
-            # minutes guard
-            mins10 = [g[3] for g in _slice_last(games2, LOOKBACK_GAMES)]
-            m10 = sum(mins10) / max(1, len(mins10))
-            if m10 < MIN_L10_MIN:
-                continue
-
-            rows = (lines_map_for_prop or {}).get(pid, [])
-            cons, n_cons, sharp_n = consensus_line(rows)
-            if cons is None or (not _passes_market_respect(n_cons, sharp_n)):
-                continue
-            offer = best_offer_near_consensus(rows, cons)
-            if not offer:
-                continue
-
-            line = float(cons)
-
-            # absorption (minutes trend)
-            # use made/attempts doesn’t give "rate"; we keep minutes-based absorb
-            # build a pseudo "trend" from makes (fg3m)
-            games_for_trend = [(g[0], g[1], g[3]) for g in games2]  # date, makes, minutes
-            min_s, min_l, rate_s, rate_l = _role_trend(games_for_trend)
-            min_delta = min_s - min_l
-            rate_delta = rate_s - rate_l
-
-            absorption = 0.0
-            if m10 >= 28:
-                absorption += 0.30
-            if m10 >= 34:
-                absorption += 0.10
-            if min_delta >= 2.0:
-                absorption += 0.15
-            if rate_delta > 0.05:
-                absorption += 0.10
-            absorption = min(0.65, absorption)
-
-            # injury boost for threes: only modest direct bump
-            injury_boost_stat = min(2.0, vac_stat * absorption * 0.35)
-
-            proj, prob_over, sigma_like = threes_prob_over_beta_binom(games2, line=line)
-            proj = proj + injury_boost_stat
-            edge = proj - line
-
-            if edge < MIN_EDGE or prob_over < MIN_PROB:
-                continue
-
-            p_over = american_to_prob(float(offer["over_odds"]))
-            p_under = american_to_prob(float(offer["under_odds"]))
-            p_market = p_over / max(p_over + p_under, 1e-9)
-
-            value_edge = prob_over - p_market
-            if value_edge < VALUE_EDGE_MIN:
-                continue
-
-            ev = ev_per_dollar(prob_over, float(offer["over_odds"]))
-            if ev < EV_MIN:
-                continue
-
-            steam = 0.0
-            if ENABLE_STEAM:
-                prev = get_prev_market(state, prop_type, pid, now_ts)
-                if prev:
-                    cur = {"line": line, "over_odds": offer["over_odds"], "under_odds": offer["under_odds"], "ts": now_ts}
-                    steam = steam_score(prev, cur)
-
-            why = (
-                f"TriggerStrength {trigger_strength:.0f} | Absorb {absorption:.2f}. "
-                f"{injured_name} {injured_status.upper()} vacates ~{vac_stat:.1f} 3PM / {vac_min:.1f} min. "
-                f"3P model beta-binomial: proj≈{proj:.2f}, sigma≈{sigma_like:.2f}. "
-                f"Proj {proj:.2f} vs CONS {line:.1f} (n={n_cons}, sharp={sharp_n}) | offer {offer['vendor']} {offer['line']:.1f} ({int(offer['over_odds']):+d}) "
-                f"| edge +{edge:.2f} | P≈{prob_over*100:.0f}% (mkt≈{p_market*100:.0f}%, val_edge≈{value_edge:+.2f}) "
-                f"| EV≈{ev:+.2f}/$1 | steam={steam:.1f}."
-            )
-
-            ideas.append({
-                "section": "injury",
-                "prop_type": prop_type,
-                "player_name": nm,
-                "player_id": int(pid),
-                "team": PLAYER_TEAM_CACHE.get(int(pid), ""),
-                "gid": int(offer.get("gid") or 0),
-                "cons_line": float(line),
-                "line": float(offer["line"]),
-                "proj": float(proj),
-                "edge": float(edge),
-                "prob_over": float(prob_over),
-                "market_prob": float(p_market),
-                "value_edge": float(value_edge),
-                "ev": float(ev),
-                "vendor": str(offer["vendor"]),
-                "over_odds": float(offer["over_odds"]),
-                "under_odds": float(offer["under_odds"]),
-                "n_cons": int(n_cons),
-                "steam": float(steam),
-                "trigger_strength": float(trigger_strength),
-                "trigger": f"{injured_name} ({team_short}) {injured_status}",
-                "why": why,
-            })
-
-            remember_market(state, prop_type, pid, offer, line, n_cons, now_ts)
-
-        ideas.sort(key=lambda x: (x["trigger_strength"], x["ev"], x["value_edge"], x["edge"], x["prob_over"]), reverse=True)
-        return ideas
-
-    # ---------------- points engine ----------------
     stats_all = {}
     for chunk_ids in _chunk(cand_ids, STAT_BATCH_SIZE):
         if deadline_exceeded():
             break
-        stats_all.update(bdl_last_n_games_stats(chunk_ids, season, BASELINE_GAMES, "pts"))
+        stats_all.update(bdl_last_n_games_stats(chunk_ids, season, BASELINE_GAMES, stat_key))
 
+    ideas = []
     for pid, nm in roster_tuples:
         if deadline_exceeded():
             break
@@ -1002,9 +956,13 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
             continue
 
         rows = (lines_map_for_prop or {}).get(pid, [])
-        cons, n_cons, sharp_n = consensus_line(rows)
-        if cons is None or (not _passes_market_respect(n_cons, sharp_n)):
+        cons, n_cons, vendors_set, sharp_cnt = consensus_line(rows)
+
+        if cons is None or n_cons < MIN_VENDORS_FOR_CONSENSUS:
             continue
+        if MIN_SHARP_VENDORS > 0 and sharp_cnt < MIN_SHARP_VENDORS:
+            continue
+
         offer = best_offer_near_consensus(rows, cons)
         if not offer:
             continue
@@ -1031,14 +989,43 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
         injury_boost_stat = min(BOOST_CAP_STAT, vac_stat * absorption * 0.65)
         injury_boost_min = min(BOOST_CAP_MIN, vac_min * absorption * 0.25)
 
-        proj, edge, prob_over, aux = compute_projection_and_prob_normal(games_all=games, line=line)
-        base_avg, l10_avg, l3_avg, l10_min, sigma = aux
+        # ---------- model core ----------
+        if prop_type in ("threes", "three_pointers_made") and THREES_USE_BETA_BINOM:
+            bb = threes_prob_over_beta_binom(games, line)
+            if not bb:
+                continue
+            proj = bb["proj"]
+            edge = bb["edge"]
+            prob_over = bb["p_over"]
+            sigma = None
+            base_avg = l10_avg = l3_avg = l10_min = None
+        else:
+            proj, edge, prob_over, aux = compute_projection_and_prob(games_all=games, line=line)
+            base_avg, l10_avg, l3_avg, l10_min, sigma = aux
 
-        rate = l10_avg / max(l10_min, 1e-6)
-        proj = proj + injury_boost_stat + (injury_boost_min * rate * BOOST_CAP_RATE)
-        edge = proj - line
-        z = (proj - line) / max(sigma, 1e-6)
-        prob_over = _norm_cdf(z)
+            # apply injury boost after base projection (points model)
+            rate = l10_avg / max(l10_min, 1e-6)
+            proj = proj + injury_boost_stat + (injury_boost_min * rate * BOOST_CAP_RATE)
+            edge = proj - line
+            z = (proj - line) / max(sigma, 1e-6)
+            prob_over = _norm_cdf(z)
+
+        # ---------- news adjustments ----------
+        nb = news_boosts.get(_clean_name(nm))
+        news_tags = []
+        if nb:
+            if nb.get("start_boost"):
+                # small bump (won't explode your model)
+                proj += 0.6 if prop_type == "points" else 0.15
+                edge = proj - line
+                # nudge prob a bit (small + bounded)
+                prob_over = min(0.99, prob_over + 0.02)
+                news_tags.append("news:start")
+            if nb.get("limit_flag"):
+                proj *= 0.92
+                edge = proj - line
+                prob_over = max(0.01, prob_over - 0.03)
+                news_tags.append("news:limit")
 
         if edge < MIN_EDGE or prob_over < MIN_PROB:
             continue
@@ -1062,23 +1049,49 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
                 cur = {"line": line, "over_odds": offer["over_odds"], "under_odds": offer["under_odds"], "ts": now_ts}
                 steam = steam_score(prev, cur)
 
-        why = (
+        # for caps
+        team_id = PLAYER_TEAM_CACHE.get(pid)
+        gid = int(offer.get("gid") or offer.get("game_id") or offer.get("gid") or 0) or int(offer.get("gid", 0) or 0)
+        try:
+            gid = int(offer.get("gid", offer.get("game_id", offer.get("gid", 0))) or offer.get("gid") or offer.get("game_id") or offer.get("gid") or 0)
+        except Exception:
+            gid = int(offer.get("gid") or offer.get("game_id") or 0)
+
+        # offer row already has gid, but make sure:
+        gid = int(offer.get("gid", offer.get("game_id", 0)) or 0)
+
+        why_core = (
             f"TriggerStrength {trigger_strength:.0f} | Absorb {absorption:.2f}. "
-            f"{injured_name} {injured_status.upper()} vacates ~{vac_stat:.1f} Points / {vac_min:.1f} min. "
-            f"{nm} base(L{BASELINE_GAMES}) {base_avg:.1f}, L10 {l10_avg:.1f}, L3 {l3_avg:.1f} "
-            f"(mins L10 {l10_min:.1f}). Role Δmin={min_delta:+.1f}, Δrate={rate_delta:+.2f}. "
-            f"Proj {proj:.1f} vs CONS {line:.1f} (n={n_cons}, sharp={sharp_n}) | offer {offer['vendor']} {offer['line']:.1f} ({int(offer['over_odds']):+d}) "
-            f"| edge +{edge:.1f} | P≈{prob_over*100:.0f}% (mkt≈{p_market*100:.0f}%, val_edge≈{value_edge:+.2f}) "
-            f"| EV≈{ev:+.2f}/$1 | steam={steam:.1f}."
+            f"{injured_name} {injured_status.upper()} vacates ~{vac_stat:.1f} {prop_type.title()} / {vac_min:.1f} min. "
         )
+
+        if prop_type in ("threes", "three_pointers_made") and THREES_USE_BETA_BINOM:
+            why_model = (
+                f"{nm} beta-binomial(3PA) model. "
+                f"Proj {proj:.2f} vs CONS {line:.1f} (n={n_cons}, sharp={sharp_cnt}) | "
+                f"offer {offer['vendor']} {offer['line']:.1f} ({int(offer['over_odds']):+d}). "
+            )
+        else:
+            why_model = (
+                f"{nm} base(L{BASELINE_GAMES}) {base_avg:.1f}, L10 {l10_avg:.1f}, L3 {l3_avg:.1f} "
+                f"(mins L10 {l10_min:.1f}). Role Δmin={min_delta:+.1f}, Δrate={rate_delta:+.2f}. "
+                f"Proj {proj:.1f} vs CONS {line:.1f} (n={n_cons}, sharp={sharp_cnt}) | "
+                f"offer {offer['vendor']} {offer['line']:.1f} ({int(offer['over_odds']):+d}) "
+            )
+
+        why_tail = (
+            f"| edge +{edge:.1f} | P≈{prob_over*100:.0f}% (mkt≈{p_market*100:.0f}%, val_edge≈{value_edge:+.2f}) "
+            f"| EV≈{ev:+.2f}/$1 | steam={steam:.1f}"
+        )
+
+        if news_tags:
+            why_tail += f" | {' '.join(news_tags)}"
 
         ideas.append({
             "section": "injury",
             "prop_type": prop_type,
             "player_name": nm,
             "player_id": int(pid),
-            "team": PLAYER_TEAM_CACHE.get(int(pid), ""),
-            "gid": int(offer.get("gid") or 0),
             "cons_line": float(line),
             "line": float(offer["line"]),
             "proj": float(proj),
@@ -1091,10 +1104,13 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
             "over_odds": float(offer["over_odds"]),
             "under_odds": float(offer["under_odds"]),
             "n_cons": int(n_cons),
+            "sharp_cnt": int(sharp_cnt),
             "steam": float(steam),
             "trigger_strength": float(trigger_strength),
             "trigger": f"{injured_name} ({team_short}) {injured_status}",
-            "why": why,
+            "why": (why_core + why_model + why_tail + "."),
+            "team_id": int(team_id) if team_id is not None else None,
+            "gid": int(gid) if gid else None,
         })
 
         remember_market(state, prop_type, pid, offer, line, n_cons, now_ts)
@@ -1102,119 +1118,24 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
     ideas.sort(key=lambda x: (x["trigger_strength"], x["ev"], x["value_edge"], x["edge"], x["prob_over"]), reverse=True)
     return ideas
 
-def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts):
+def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_boosts):
     if not ENABLE_SLATE_SCAN or deadline_exceeded():
         return []
 
     season = _season_year(now_et)
+    stat_key = STAT_KEY_BY_PROP.get(prop_type, "pts")
 
     pids = list((lines_map_for_prop or {}).keys())
     if not pids:
         return []
 
-    ideas = []
-
-    if prop_type in ("threes", "three_pointers_made"):
-        stats_all = {}
-        for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
-            if deadline_exceeded():
-                break
-            stats_all.update(bdl_last_n_games_two_stats(chunk_ids, season, BASELINE_GAMES, "fg3m", "fg3a"))
-
-        for pid in pids:
-            if deadline_exceeded():
-                break
-
-            games2 = stats_all.get(int(pid), [])
-            if len(games2) < 8:
-                continue
-
-            mins10 = [g[3] for g in _slice_last(games2, LOOKBACK_GAMES)]
-            m10 = sum(mins10) / max(1, len(mins10))
-            if m10 < MIN_L10_MIN:
-                continue
-
-            rows = (lines_map_for_prop or {}).get(int(pid), [])
-            cons, n_cons, sharp_n = consensus_line(rows)
-            if cons is None or (not _passes_market_respect(n_cons, sharp_n)):
-                continue
-            offer = best_offer_near_consensus(rows, cons)
-            if not offer:
-                continue
-
-            line = float(cons)
-
-            proj, prob_over, sigma_like = threes_prob_over_beta_binom(games2, line=line)
-            edge = proj - line
-
-            if edge < MIN_EDGE or prob_over < MIN_PROB:
-                continue
-
-            p_over = american_to_prob(float(offer["over_odds"]))
-            p_under = american_to_prob(float(offer["under_odds"]))
-            p_market = p_over / max(p_over + p_under, 1e-9)
-
-            value_edge = prob_over - p_market
-            if value_edge < VALUE_EDGE_MIN:
-                continue
-
-            ev = ev_per_dollar(prob_over, float(offer["over_odds"]))
-            if ev < EV_MIN:
-                continue
-
-            steam = 0.0
-            if ENABLE_STEAM:
-                prev = get_prev_market(state, prop_type, int(pid), now_ts)
-                if prev:
-                    cur = {"line": line, "over_odds": offer["over_odds"], "under_odds": offer["under_odds"], "ts": now_ts}
-                    steam = steam_score(prev, cur)
-
-            name = PLAYER_NAME_CACHE.get(int(pid), f"Player {pid}")
-
-            why = (
-                f"SlateScan. 3P beta-binomial: proj≈{proj:.2f}, sigma≈{sigma_like:.2f}. "
-                f"Proj {proj:.2f} vs CONS {line:.1f} (n={n_cons}, sharp={sharp_n}) | offer {offer['vendor']} {offer['line']:.1f} ({int(offer['over_odds']):+d}) "
-                f"| edge +{edge:.2f} | P≈{prob_over*100:.0f}% (mkt≈{p_market*100:.0f}%, val_edge≈{value_edge:+.2f}) "
-                f"| EV≈{ev:+.2f}/$1 | steam={steam:.1f}."
-            )
-
-            ideas.append({
-                "section": "slate",
-                "prop_type": prop_type,
-                "player_name": name,
-                "player_id": int(pid),
-                "team": PLAYER_TEAM_CACHE.get(int(pid), ""),
-                "gid": int(offer.get("gid") or 0),
-                "cons_line": float(line),
-                "line": float(offer["line"]),
-                "proj": float(proj),
-                "edge": float(edge),
-                "prob_over": float(prob_over),
-                "market_prob": float(p_market),
-                "value_edge": float(value_edge),
-                "ev": float(ev),
-                "vendor": str(offer["vendor"]),
-                "over_odds": float(offer["over_odds"]),
-                "under_odds": float(offer["under_odds"]),
-                "n_cons": int(n_cons),
-                "steam": float(steam),
-                "trigger_strength": 0.0,
-                "trigger": "No injury trigger (league-wide scan)",
-                "why": why,
-            })
-
-            remember_market(state, prop_type, int(pid), offer, line, n_cons, now_ts)
-
-        ideas.sort(key=lambda x: (x["ev"], x["value_edge"], x["edge"], x["prob_over"]), reverse=True)
-        return ideas
-
-    # ---------------- points slate scan ----------------
     stats_all = {}
     for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
         if deadline_exceeded():
             break
-        stats_all.update(bdl_last_n_games_stats(chunk_ids, season, BASELINE_GAMES, "pts"))
+        stats_all.update(bdl_last_n_games_stats(chunk_ids, season, BASELINE_GAMES, stat_key))
 
+    ideas = []
     for pid in pids:
         if deadline_exceeded():
             break
@@ -1224,9 +1145,13 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts):
             continue
 
         rows = (lines_map_for_prop or {}).get(int(pid), [])
-        cons, n_cons, sharp_n = consensus_line(rows)
-        if cons is None or (not _passes_market_respect(n_cons, sharp_n)):
+        cons, n_cons, vendors_set, sharp_cnt = consensus_line(rows)
+
+        if cons is None or n_cons < MIN_VENDORS_FOR_CONSENSUS:
             continue
+        if MIN_SHARP_VENDORS > 0 and sharp_cnt < MIN_SHARP_VENDORS:
+            continue
+
         offer = best_offer_near_consensus(rows, cons)
         if not offer:
             continue
@@ -1243,8 +1168,34 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts):
         min_delta = min_s - min_l
         rate_delta = rate_s - rate_l
 
-        proj, edge, prob_over, aux = compute_projection_and_prob_normal(games_all=games, line=line)
-        base_avg, l10_avg, l3_avg, l10_min, sigma = aux
+        # ---------- model core ----------
+        if prop_type in ("threes", "three_pointers_made") and THREES_USE_BETA_BINOM:
+            bb = threes_prob_over_beta_binom(games, line)
+            if not bb:
+                continue
+            proj = bb["proj"]
+            edge = bb["edge"]
+            prob_over = bb["p_over"]
+            base_avg = l10_avg = l3_avg = l10_min = None
+        else:
+            proj, edge, prob_over, aux = compute_projection_and_prob(games_all=games, line=line)
+            base_avg, l10_avg, l3_avg, l10_min, sigma = aux
+
+        # ---------- news adjustments ----------
+        name = PLAYER_NAME_CACHE.get(int(pid), f"Player {pid}")
+        nb = news_boosts.get(_clean_name(name))
+        news_tags = []
+        if nb:
+            if nb.get("start_boost"):
+                proj += 0.6 if prop_type == "points" else 0.15
+                edge = proj - line
+                prob_over = min(0.99, prob_over + 0.02)
+                news_tags.append("news:start")
+            if nb.get("limit_flag"):
+                proj *= 0.92
+                edge = proj - line
+                prob_over = max(0.01, prob_over - 0.03)
+                news_tags.append("news:limit")
 
         if edge < MIN_EDGE or prob_over < MIN_PROB:
             continue
@@ -1263,28 +1214,40 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts):
 
         steam = 0.0
         if ENABLE_STEAM:
-            prev = get_prev_market(state, prop_type, int(pid), now_ts)
+            prev = get_prev_market(state, prop_type, pid, now_ts)
             if prev:
                 cur = {"line": line, "over_odds": offer["over_odds"], "under_odds": offer["under_odds"], "ts": now_ts}
                 steam = steam_score(prev, cur)
 
-        name = PLAYER_NAME_CACHE.get(int(pid), f"Player {pid}")
+        team_id = PLAYER_TEAM_CACHE.get(int(pid))
+        gid = int(offer.get("gid", offer.get("game_id", 0)) or 0)
 
-        why = (
-            f"SlateScan. base(L{BASELINE_GAMES}) {base_avg:.1f}, L10 {l10_avg:.1f}, L3 {l3_avg:.1f} "
-            f"(mins L10 {l10_min:.1f}). Role Δmin={min_delta:+.1f}, Δrate={rate_delta:+.2f}. "
-            f"Proj {proj:.1f} vs CONS {line:.1f} (n={n_cons}, sharp={sharp_n}) | offer {offer['vendor']} {offer['line']:.1f} ({int(offer['over_odds']):+d}) "
+        if prop_type in ("threes", "three_pointers_made") and THREES_USE_BETA_BINOM:
+            why_model = (
+                f"SlateScan. beta-binomial(3PA) threes model. "
+                f"Proj {proj:.2f} vs CONS {line:.1f} (n={n_cons}, sharp={sharp_cnt}) | "
+                f"offer {offer['vendor']} {offer['line']:.1f} ({int(offer['over_odds']):+d}) "
+            )
+        else:
+            why_model = (
+                f"SlateScan. base(L{BASELINE_GAMES}) {base_avg:.1f}, L10 {l10_avg:.1f}, L3 {l3_avg:.1f} "
+                f"(mins L10 {l10_min:.1f}). Role Δmin={min_delta:+.1f}, Δrate={rate_delta:+.2f}. "
+                f"Proj {proj:.1f} vs CONS {line:.1f} (n={n_cons}, sharp={sharp_cnt}) | "
+                f"offer {offer['vendor']} {offer['line']:.1f} ({int(offer['over_odds']):+d}) "
+            )
+
+        why_tail = (
             f"| edge +{edge:.1f} | P≈{prob_over*100:.0f}% (mkt≈{p_market*100:.0f}%, val_edge≈{value_edge:+.2f}) "
-            f"| EV≈{ev:+.2f}/$1 | steam={steam:.1f}."
+            f"| EV≈{ev:+.2f}/$1 | steam={steam:.1f}"
         )
+        if news_tags:
+            why_tail += f" | {' '.join(news_tags)}"
 
         ideas.append({
             "section": "slate",
             "prop_type": prop_type,
             "player_name": name,
             "player_id": int(pid),
-            "team": PLAYER_TEAM_CACHE.get(int(pid), ""),
-            "gid": int(offer.get("gid") or 0),
             "cons_line": float(line),
             "line": float(offer["line"]),
             "proj": float(proj),
@@ -1297,22 +1260,23 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts):
             "over_odds": float(offer["over_odds"]),
             "under_odds": float(offer["under_odds"]),
             "n_cons": int(n_cons),
+            "sharp_cnt": int(sharp_cnt),
             "steam": float(steam),
             "trigger_strength": 0.0,
             "trigger": "No injury trigger (league-wide scan)",
-            "why": why,
+            "why": (why_model + why_tail + "."),
+            "team_id": int(team_id) if team_id is not None else None,
+            "gid": int(gid) if gid else None,
         })
 
-        remember_market(state, prop_type, int(pid), offer, line, n_cons, now_ts)
+        remember_market(state, prop_type, pid, offer, line, n_cons, now_ts)
 
     ideas.sort(key=lambda x: (x["ev"], x["value_edge"], x["edge"], x["prob_over"]), reverse=True)
     return ideas
 
 # -------------------- SYNTH LADDER (LONGSHOTS) --------------------
 def synth_ladder_from_model(points_ideas, stats_cache_by_pid):
-    if not ENABLE_SYNTH_LADDER:
-        return []
-    if not points_ideas:
+    if not ENABLE_SYNTH_LADDER or not points_ideas:
         return []
 
     out = []
@@ -1332,7 +1296,6 @@ def synth_ladder_from_model(points_ideas, stats_cache_by_pid):
             continue
 
         proj = float(idea["proj"])
-
         base_slice = _slice_last(games, BASELINE_GAMES)
         l10_slice = _slice_last(games, LOOKBACK_GAMES)
         _, _, base_std = avg_stat_min_std(base_slice)
@@ -1358,8 +1321,6 @@ def synth_ladder_from_model(points_ideas, stats_cache_by_pid):
                 "prop_type": "points_ladder",
                 "player_name": idea["player_name"],
                 "player_id": pid,
-                "team": PLAYER_TEAM_CACHE.get(int(pid), ""),
-                "gid": int(idea.get("gid") or 0),
                 "rung": rung,
                 "model_prob": float(p),
                 "model_implied_odds": float(imp_odds),
@@ -1418,37 +1379,41 @@ def record_sent(state, ideas, now_ts: int):
             sent[key] = {"ts": now_ts, "edge": float(i.get("edge", 0.0))}
     state["sent_bets"] = sent
 
-# -------------------- EXPOSURE CAPS --------------------
-def apply_exposure_caps(picks):
+# -------------------- EXPOSURE CAPS (NEW) --------------------
+def apply_exposure_caps(ideas):
     """
     Enforces:
       - MAX_PLAYS_PER_TEAM
       - MAX_PLAYS_PER_GAME
-    Uses fields: team, gid
+    Only applies if we have team_id/gid; otherwise it won't incorrectly drop plays.
     """
-    if not picks:
-        return picks
+    if not ideas:
+        return ideas
 
     team_ct = {}
     game_ct = {}
     out = []
-    for x in picks:
-        team = (x.get("team") or "").strip()
-        gid = int(x.get("gid") or 0)
 
-        if MAX_PLAYS_PER_GAME > 0:
-            if gid and game_ct.get(gid, 0) >= MAX_PLAYS_PER_GAME:
+    for i in ideas:
+        tid = i.get("team_id")
+        gid = i.get("gid")
+
+        if gid is not None:
+            gk = int(gid)
+            if MAX_PLAYS_PER_GAME > 0 and game_ct.get(gk, 0) >= MAX_PLAYS_PER_GAME:
                 continue
 
-        if MAX_PLAYS_PER_TEAM > 0 and team:
-            if team_ct.get(team, 0) >= MAX_PLAYS_PER_TEAM:
+        if tid is not None:
+            tk = int(tid)
+            if MAX_PLAYS_PER_TEAM > 0 and team_ct.get(tk, 0) >= MAX_PLAYS_PER_TEAM:
                 continue
 
-        out.append(x)
-        if gid:
-            game_ct[gid] = game_ct.get(gid, 0) + 1
-        if team:
-            team_ct[team] = team_ct.get(team, 0) + 1
+        out.append(i)
+
+        if gid is not None:
+            game_ct[int(gid)] = game_ct.get(int(gid), 0) + 1
+        if tid is not None:
+            team_ct[int(tid)] = team_ct.get(int(tid), 0) + 1
 
     return out
 
@@ -1463,8 +1428,10 @@ def run():
         f"PROP_TYPES={','.join(PROP_TYPES)} MIN_PER_MARKET={MIN_PER_MARKET} MAX_PER_MARKET={MAX_PER_MARKET} "
         f"MAX_TOTAL_PLAYS={MAX_TOTAL_PLAYS} BOOK_VENDORS={','.join(BOOK_VENDORS)} "
         f"ENABLE_SLATE_SCAN={int(ENABLE_SLATE_SCAN)} ENABLE_INJURY_TRIGGERS={int(ENABLE_INJURY_TRIGGERS)} "
-        f"MIN_VENDORS_FOR_CONSENSUS={MIN_VENDORS_FOR_CONSENSUS} MIN_SHARP_VENDORS={MIN_SHARP_VENDORS} "
-        f"ENABLE_STEAM={int(ENABLE_STEAM)} MAX_PLAYS_PER_TEAM={MAX_PLAYS_PER_TEAM} MAX_PLAYS_PER_GAME={MAX_PLAYS_PER_GAME}"
+        f"MIN_VENDORS_FOR_CONSENSENSUS={MIN_VENDORS_FOR_CONSENSUS} "
+        f"MIN_SHARP_VENDORS={MIN_SHARP_VENDORS} ENABLE_STEAM={int(ENABLE_STEAM)} "
+        f"MAX_PLAYS_PER_TEAM={MAX_PLAYS_PER_TEAM} MAX_PLAYS_PER_GAME={MAX_PLAYS_PER_GAME} "
+        f"THREES_BETA_BINOM={int(THREES_USE_BETA_BINOM)} LINEUPEXPERTS={int(ENABLE_LINEUPEXPERTS and bool(LINEUPEXPERTS_API_KEY))}"
     )
 
     if TEST_MODE:
@@ -1474,8 +1441,14 @@ def run():
     state = load_state()
     old_players = state.get("players", {})
 
+    # Build today props
     lines_map = build_today_props(now_et)
 
+    # LineupExperts add-ons (safe; never hard-fail)
+    le_inj = le_fetch_injuries_map()
+    le_news = le_fetch_news_boosts()
+
+    # Sportradar injuries
     new_players = {}
     triggers = []
     injury_ideas_all = []
@@ -1488,13 +1461,27 @@ def run():
             print(f"[WARN] Sportradar injuries failed: {e}")
             new_players = {}
 
+        # merge in lineup experts injuries as additional triggers (by name only)
+        # NOTE: we do NOT try to manufacture player IDs; we just use it to widen trigger list safely.
+        # We'll add "synthetic" keys like "LE:<name>" to old/new tracking to avoid spam.
+        if le_inj:
+            for name_key, info in le_inj.items():
+                fake_pid = f"LE:{name_key}"
+                new_players[fake_pid] = {
+                    "name": name_key.title(),
+                    "team": info.get("team", ""),
+                    "status": info.get("status", ""),
+                    "detail": info.get("detail", ""),
+                }
+
         exclude_names_lower = {_clean_name(v.get("name", "")) for v in new_players.values() if v.get("name")}
 
         for pid, cur in new_players.items():
             if deadline_exceeded():
                 break
 
-            if not status_in_scope(cur.get("status", "")):
+            st = cur.get("status", "")
+            if not status_in_scope(st):
                 continue
 
             prev = old_players.get(pid)
@@ -1521,7 +1508,8 @@ def run():
                     prop_type=pt,
                     lines_map_for_prop=lines_map.get(pt, {}),
                     state=state,
-                    now_ts=now_ts
+                    now_ts=now_ts,
+                    news_boosts=le_news
                 )
                 if ideas:
                     got_any = True
@@ -1530,18 +1518,18 @@ def run():
             if got_any:
                 triggers.append(f"{injured_name} ({team_short}) {injured_status}")
 
+    # Slate scan
     slate_ideas_all = []
     if ENABLE_SLATE_SCAN and (not deadline_exceeded()):
         for pt in PROP_TYPES:
             if deadline_exceeded():
                 break
             slate_ideas_all.extend(
-                slate_scan_edges(now_et, pt, lines_map.get(pt, {}), state=state, now_ts=now_ts)
+                slate_scan_edges(now_et, pt, lines_map.get(pt, {}), state=state, now_ts=now_ts, news_boosts=le_news)
             )
 
+    # Combine + dedupe best per player/market
     combined = injury_ideas_all + slate_ideas_all
-
-    # Dedup per prop_type/player: keep best EV/value_edge first
     best = {}
     for i in combined:
         k = (i["prop_type"], int(i["player_id"]))
@@ -1557,13 +1545,7 @@ def run():
     combined = [v[1] for v in best.values()]
     combined = apply_cooldown(state, combined, now_ts)
 
-    # Sort globally first (bettor view)
-    combined.sort(key=lambda x: (x.get("ev", 0.0), x.get("value_edge", 0.0), x.get("steam", 0.0), x.get("edge", 0.0)), reverse=True)
-
-    # Exposure caps across ALL picks (fixes “3 Bucks”)
-    combined = apply_exposure_caps(combined)
-
-    # Per market buckets (still keep your structure)
+    # Per market ordering + limits
     out_by_market = {}
     for pt in PROP_TYPES:
         inj = [x for x in combined if x["prop_type"] == pt and x["section"] == "injury"]
@@ -1578,12 +1560,17 @@ def run():
         picks = picks[:MAX_PER_MARKET]
         out_by_market[pt] = picks
 
+    # Flatten + global cap
     final_out = []
     for pt in PROP_TYPES:
         final_out.extend(out_by_market.get(pt, []))
+    final_out = final_out[:MAX_TOTAL_PLAYS * 3]  # build bigger list before exposure caps
+
+    # Apply exposure caps (NEW)
+    final_out = apply_exposure_caps(final_out)
     final_out = final_out[:MAX_TOTAL_PLAYS]
 
-    # Plus odds bucket (from final_out)
+    # Plus odds bucket
     plus_bucket = []
     for x in final_out:
         try:
@@ -1607,9 +1594,8 @@ def run():
         points_ideas = [x for x in final_out if x.get("prop_type") == "points"]
         synth_ladder = synth_ladder_from_model(points_ideas, stats_cache)
         synth_ladder = apply_cooldown(state, synth_ladder, now_ts)
-        # apply exposure caps here too (optional but consistent)
-        synth_ladder = apply_exposure_caps(synth_ladder)
 
+    # Message
     if final_out or synth_ladder:
         msg = [f"💰 FanDuel Props ({ts_et})", ""]
 
@@ -1622,8 +1608,9 @@ def run():
                 msg.append(f"- …and {len(triggers)-8} more")
             msg.append("")
 
+        # Build market sections
         for pt in PROP_TYPES:
-            picks = out_by_market.get(pt, [])
+            picks = [x for x in final_out if x.get("prop_type") == pt]
             if not picks:
                 continue
 
@@ -1646,7 +1633,6 @@ def run():
                     msg.append(f"  Trigger: {i['trigger']}")
                     msg.append(f"  Why: {i['why']}")
                     msg.append("")
-
             if slt:
                 msg.append("🌎 League-Wide Slate Scan (no injury required):")
                 msg.append("")
@@ -1658,7 +1644,6 @@ def run():
                     )
                     msg.append(f"  Why: {i['why']}")
                     msg.append("")
-
             msg.append("")
 
         if plus_bucket:
@@ -1686,7 +1671,6 @@ def run():
 
         record_sent(state, final_out, now_ts)
         record_sent(state, synth_ladder, now_ts)
-
     else:
         print("[INFO] No plays cleared thresholds this run.")
 
