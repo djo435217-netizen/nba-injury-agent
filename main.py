@@ -98,7 +98,7 @@ DEBUG_PROP_SAMPLE_TYPES = os.environ.get("DEBUG_PROP_SAMPLE_TYPES", "0").strip()
 PLUS_ODDS_MIN = float(os.environ.get("PLUS_ODDS_MIN", "100"))
 PLUS_ODDS_TOPN = int(os.environ.get("PLUS_ODDS_TOPN", "3"))
 
-# Plus-odds aggressive hunt thresholds (NEW)
+# Plus-odds aggressive hunt thresholds
 PLUS_HUNT_ENABLED = os.environ.get("PLUS_HUNT_ENABLED", "1") == "1"
 PLUS_HUNT_MIN_PROB = float(os.environ.get("PLUS_HUNT_MIN_PROB", "0.52"))
 PLUS_HUNT_MIN_VALUE_EDGE = float(os.environ.get("PLUS_HUNT_MIN_VALUE_EDGE", "0.03"))
@@ -122,7 +122,7 @@ NEWS_BOOST_QUESTIONABLE = float(os.environ.get("NEWS_BOOST_QUESTIONABLE", "0.08"
 NEWS_BOOST_MINUTES = float(os.environ.get("NEWS_BOOST_MINUTES", "0.05"))
 NEWS_MIN_CONFIDENCE = float(os.environ.get("NEWS_MIN_CONFIDENCE", "0.25"))
 
-# Optional debug helpers (keep off in prod unless needed)
+# Optional debug helpers
 LE_DEBUG = os.environ.get("LE_DEBUG", "0") == "1"
 LE_NO_TIME_FILTER = os.environ.get("LE_NO_TIME_FILTER", "0") == "1"
 
@@ -190,14 +190,6 @@ def ev_per_dollar(p_win: float, odds: float) -> float:
     return p_win * b - (1.0 - p_win)
 
 
-def prob_to_american(p: float) -> float:
-    p = max(1e-9, min(1 - 1e-9, float(p)))
-    dec = 1.0 / p
-    if dec >= 2.0:
-        return round((dec - 1.0) * 100.0, 0)  # +odds
-    return round(-100.0 / (dec - 1.0), 0)  # -odds
-
-
 def avg_stat_min_std(games):
     if not games:
         return 0.0, 0.0, 0.0
@@ -213,7 +205,7 @@ def avg_stat_min_std(games):
 def _slice_last(games, n):
     if not games:
         return []
-    return games[-min(len(games), n) :]
+    return games[-min(len(games), n):]
 
 
 def _role_trend(games, long_n=LOOKBACK_GAMES, short_n=SHORT_GAMES):
@@ -331,9 +323,9 @@ BDL_PER_PAGE = int(os.environ.get("BDL_PER_PAGE", "100"))
 BDL_MAX_PAGES = int(os.environ.get("BDL_MAX_PAGES", "10"))
 
 TEAM_CACHE = None
-PLAYER_NAME_CACHE = {}  # pid -> "First Last"
-PLAYER_TEAM_CACHE = {}  # pid -> team name (best-effort)
-PROPS_CACHE = {}  # (gid, vendor, prop_type) -> list[rows]
+PLAYER_NAME_CACHE = {}
+PLAYER_TEAM_CACHE = {}
+PROPS_CACHE = {}
 
 
 def _bdl_get(path: str, params=None, timeout: int = 20) -> dict:
@@ -439,10 +431,6 @@ def bdl_find_player_id_on_team(team_short: str, full_name: str):
 
 
 def bdl_last_n_games_stats(player_ids, season: int, n: int, stat_key: str):
-    """
-    Returns {pid: [(date, val, mins), ...]} sorted by date.
-    Also fills PLAYER_NAME_CACHE and PLAYER_TEAM_CACHE best-effort.
-    """
     out = {int(pid): [] for pid in player_ids}
     if not player_ids:
         return out
@@ -499,10 +487,6 @@ def bdl_last_n_games_stats(player_ids, season: int, n: int, stat_key: str):
 
 
 def bdl_last_n_games_threes(player_ids, season: int, n: int):
-    """
-    Returns {pid: [(date, fg3m, fg3a, mins), ...]} sorted by date.
-    Uses /v1/stats once and reads fg3m + fg3a.
-    """
     out = {int(pid): [] for pid in player_ids}
     if not player_ids:
         return out
@@ -584,11 +568,6 @@ def bdl_fetch_props_for_game(game_id: int, vendor: str | None, prop_type: str):
 
 # -------------------- PROP COLLECTION (FAST) --------------------
 def build_today_props(now_et: datetime):
-    """
-    One pass: fetch props for all games today for each prop_type.
-    Returns:
-      lines_map[prop_type][pid] -> list of dict rows for over_under
-    """
     games_map = bdl_games_today(now_et)
     game_ids = list(games_map.keys())
     lines_map = {pt: {} for pt in PROP_TYPES}
@@ -655,9 +634,6 @@ def _round_to_half(x: float) -> float:
 
 
 def consensus_line(rows):
-    """
-    Returns (median_line, n_vendors, n_sharp_vendors)
-    """
     if not rows:
         return None, 0, 0
 
@@ -703,7 +679,6 @@ def best_offer_near_consensus(rows, cons_line: float):
         near = [r for r in rows if abs(float(r.get("line", 9e9)) - cons_line) <= 0.5 + 1e-9]
         pool = near if near else rows
 
-    # maximize over_odds (best payout) while staying close to consensus
     def score(r):
         try:
             return (float(r["over_odds"]), -abs(float(r["line"]) - cons_line))
@@ -742,7 +717,6 @@ def _betaln(a: float, b: float) -> float:
 
 
 def _log_choose(n: int, k: int) -> float:
-    # Robust guards (prevents lgamma errors)
     try:
         n = int(n)
         k = int(k)
@@ -764,7 +738,6 @@ def beta_binom_pmf(k: int, n: int, a: float, b: float) -> float:
 
 
 def beta_binom_cdf(k: int, n: int, a: float, b: float) -> float:
-    # sum_{i=0..k} pmf(i)
     try:
         n = int(n)
         k = int(k)
@@ -780,11 +753,6 @@ def beta_binom_cdf(k: int, n: int, a: float, b: float) -> float:
 
 
 def threes_prob_over_beta_binom(threes_games, line: float):
-    """
-    threes_games: [(date, fg3m, fg3a, mins), ...]
-    Uses a beta prior inferred from recent makes/misses, and
-    averages beta-binomial P(over) across recent attempts distribution.
-    """
     if not threes_games:
         return None
 
@@ -806,7 +774,7 @@ def threes_prob_over_beta_binom(threes_games, line: float):
     if not att_list:
         return None
 
-    k = int(math.floor(float(line)))  # over line means >= k+1
+    k = int(math.floor(float(line)))
     probs = []
     for n_att in att_list:
         n_att = max(0, int(n_att))
@@ -831,7 +799,7 @@ def steam_score(prev, cur):
     except Exception:
         return 0.0
 
-    line_move = (prev_line - cur_line)  # + means good for over
+    line_move = (prev_line - cur_line)
     odds_move = (cur_over - prev_over) / 50.0
     score = (line_move / 0.5) * 0.9 + odds_move * 0.6
     return float(score)
@@ -875,7 +843,7 @@ def _try_parse_dt(s: str):
         "%Y-%m-%dT%H:%M:%S.%f%z",
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d %H:%M:%S",
-        "%b %d, %Y",  # "Mar 5, 2026"
+        "%b %d, %Y",
         "%b %d, %Y %I:%M %p",
         "%b %d, %Y %H:%M",
         "%b %d, %Y %I:%M%p",
@@ -888,17 +856,9 @@ def _try_parse_dt(s: str):
 
 
 def fetch_lineupexperts_news(now_et: datetime):
-    """
-    Uses NBA Core endpoint:
-      https://api.lineupexperts.com/v1/nba-NewsBySport?key=XXXX
-
-    Returns list[dict] canonicalized items with keys:
-      {"player": "First Last", "title": "...", "date": "...", "url": "...", "publisher": "..."}
-    """
     if not LINEUPEXPERTS or not LINEUPEXPERTS_KEY:
         return []
 
-    # Primary endpoint you validated works (case sensitive on some systems)
     url = f"{LINEUPEXPERTS_BASE_URL}/nba-NewsBySport"
 
     try:
@@ -922,15 +882,12 @@ def fetch_lineupexperts_news(now_et: datetime):
 
     items = []
 
-    # Schema A: list or {"data":[...]}
     if isinstance(data, list):
         items = data
     elif isinstance(data, dict):
         if isinstance(data.get("data"), list):
             items = data["data"]
         else:
-            # Schema B (what your logs show): dict keyed by PlayerID, each has PlayerInfo + Stories[]
-            # Example: {"5994": {"PlayerInfo": {"PlayerName":"LJ Cryer"}, "Stories":[{"Title":...,"Date":"Mar 5, 2026"}]}}
             for _, v in data.items():
                 if not isinstance(v, dict):
                     continue
@@ -955,12 +912,10 @@ def fetch_lineupexperts_news(now_et: datetime):
     else:
         items = []
 
-    # Normalize + limit payload
     if not isinstance(items, list):
         return []
     items = items[: max(1, LINEUPEXPERTS_MAX_ITEMS)]
 
-    # Time filter
     if LE_NO_TIME_FILTER:
         return items
 
@@ -984,12 +939,6 @@ def fetch_lineupexperts_news(now_et: datetime):
 
 
 def build_news_boost_map(news_items):
-    """
-    Returns boosts keyed by cleaned player name:
-      { "first last": {"boost": float, "confidence": float, "why": str} }
-
-    This is the piece that MULTIPLICATIVELY boosts projections everywhere.
-    """
     boosts = {}
 
     def push(player_name: str, boost: float, confidence: float, why: str):
@@ -1058,10 +1007,6 @@ def build_news_boost_map(news_items):
 
 
 def build_news_score_map(news_items):
-    """
-    NEW: ranking-only signal for Plus-Odds hunting.
-    Does NOT replace the projection boost map (build_news_boost_map).
-    """
     out = {}
 
     pos_strong = re.compile(r"\b(will start|expected to start|starting lineup|draws start|named starter)\b", re.I)
@@ -1125,9 +1070,6 @@ def build_news_score_map(news_items):
 
 
 def apply_news_to_projection(proj: float, boost_rec: dict | None, cap: float = 0.30):
-    """
-    Applies news boost multiplicatively to projection. Capped to avoid chaos.
-    """
     if not boost_rec:
         return proj, 0.0, None
     b = float(boost_rec.get("boost", 0.0))
@@ -1169,8 +1111,7 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
         ip10 = sum(float(x[1]) for x in _slice_last(inj_games, LOOKBACK_GAMES)) / max(1, len(_slice_last(inj_games, LOOKBACK_GAMES)))
         im10 = sum(float(x[3]) for x in _slice_last(inj_games, LOOKBACK_GAMES)) / max(1, len(_slice_last(inj_games, LOOKBACK_GAMES)))
     else:
-        stat_key = "pts"
-        inj_games = bdl_last_n_games_stats([injured_pid], season, BASELINE_GAMES, stat_key).get(injured_pid, [])
+        inj_games = bdl_last_n_games_stats([injured_pid], season, BASELINE_GAMES, "pts").get(injured_pid, [])
         ip10, im10, _ = avg_stat_min_std(_slice_last(inj_games, LOOKBACK_GAMES))
 
     if len(inj_games) < 3:
@@ -1232,7 +1173,6 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
         if (v10 - line) > LINE_MIN_GAP:
             continue
 
-        # role trend for injury absorption
         if prop_type == "threes":
             long_slice = _slice_last(games, LOOKBACK_GAMES)
             short_slice = _slice_last(games, SHORT_GAMES)
@@ -1265,10 +1205,8 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
         injury_boost_stat = min(BOOST_CAP_STAT, vac_stat * absorption * 0.65)
         injury_boost_min = min(BOOST_CAP_MIN, vac_min * absorption * 0.25)
 
-        # projection + prob
         if prop_type == "threes" and THREES_BETA_BINOM:
             base_line = float(line)
-
             base = _slice_last(games, BASELINE_GAMES)
             l10 = _slice_last(games, LOOKBACK_GAMES)
             l3 = _slice_last(games, SHORT_GAMES)
@@ -1276,7 +1214,6 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
             l10_avg = sum(float(x[1]) for x in l10) / max(1, len(l10))
             l3_avg = sum(float(x[1]) for x in l3) / max(1, len(l3))
             proj = 0.45 * base_avg + 0.35 * l10_avg + 0.10 * l3_avg + 0.10 * base_line
-
             proj = proj + min(0.6, injury_boost_min * 0.03) + min(0.4, injury_boost_stat * 0.05)
 
             boost_rec = news_boosts.get(_clean_name(nm))
@@ -1326,10 +1263,10 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
                 cur = {"line": line, "over_odds": offer["over_odds"], "under_odds": offer["under_odds"], "ts": now_ts}
                 steam = steam_score(prev, cur)
 
-        gid = int(offer.get("gid") or offer.get("game_id") or offer.get("gid", 0) or 0)
+        gid = int(offer.get("gid") or offer.get("game_id") or 0)
         team_name = PLAYER_TEAM_CACHE.get(pid) or team_short or ""
 
-        base_avg, l10_avg, l3_avg, l10_min, sigma = aux
+        base_avg, l10_avg, l3_avg, l10_min, _ = aux
         news_note = f" | LE_boost≈{news_eff:+.2f}" if news_eff else ""
         news_note2 = f" ({news_why})" if news_why else ""
 
@@ -1383,7 +1320,6 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
         return []
 
     season = _season_year(now_et)
-
     pids = list((lines_map_for_prop or {}).keys())
     if not pids:
         return []
@@ -1447,7 +1383,7 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
             edge = proj - float(line)
         else:
             proj, edge, prob_over, aux = compute_projection_and_prob_points(games_all=games, line=line)
-            base_avg, l10_avg, l3_avg, l10_min, sigma = aux
+            _, _, _, _, sigma = aux
 
             name = PLAYER_NAME_CACHE.get(int(pid), f"Player {pid}")
             boost_rec = news_boosts.get(_clean_name(name))
@@ -1528,10 +1464,6 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
 
 
 def plus_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_boosts, news_scores):
-    """
-    NEW: Aggressive plus-odds hunter (separate pool from your main card).
-    Keeps LE projection boost (news_boosts) and ALSO uses news_scores for ranking.
-    """
     if not PLUS_HUNT_ENABLED or deadline_exceeded():
         return []
 
@@ -1585,7 +1517,6 @@ def plus_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, n
 
         line = float(cons)
 
-        # small role bonus
         role_bonus = 0.0
         if prop_type == "threes":
             long_slice = _slice_last(games, LOOKBACK_GAMES)
@@ -1779,10 +1710,8 @@ def run():
     state = load_state()
     old_players = state.get("players", {})
 
-    # Props + games
-    lines_map, games_map = build_today_props(now_et)
+    lines_map, _games_map = build_today_props(now_et)
 
-    # News boosts + scoring
     news_items = fetch_lineupexperts_news(now_et) if LINEUPEXPERTS else []
     news_boosts = build_news_boost_map(news_items) if news_items else {}
     news_scores = build_news_score_map(news_items) if news_items else {}
@@ -1790,7 +1719,6 @@ def run():
     if LINEUPEXPERTS:
         print(f"[INFO] LineupExperts news_items={len(news_items)} boosts={len(news_boosts)} lookback={NEWS_LOOKBACK_HOURS}h base_url={LINEUPEXPERTS_BASE_URL}")
 
-    # Injuries
     new_players = {}
     triggers = []
     injury_ideas_all = []
@@ -1846,7 +1774,6 @@ def run():
             if got_any:
                 triggers.append(f"{injured_name} ({team_short}) {injured_status}")
 
-    # Slate scan
     slate_ideas_all = []
     if ENABLE_SLATE_SCAN and (not deadline_exceeded()):
         for pt in PROP_TYPES:
@@ -1854,7 +1781,6 @@ def run():
                 break
             slate_ideas_all.extend(slate_scan_edges(now_et, pt, lines_map.get(pt, {}), state=state, now_ts=now_ts, news_boosts=news_boosts))
 
-    # NEW: Plus-odds hunt list (separate)
     plus_ideas_all = []
     if ENABLE_SLATE_SCAN and PLUS_HUNT_ENABLED and (not deadline_exceeded()):
         for pt in PROP_TYPES:
@@ -1873,19 +1799,22 @@ def run():
             )
     plus_ideas_all = plus_ideas_all[:PLUS_HUNT_TOPN]
 
-    # Combine + best per (market/player)
     combined = injury_ideas_all + slate_ideas_all
     best = {}
     for i in combined:
         k = (i["prop_type"], int(i["player_id"]))
-        score = (float(i.get("ev", 0.0)), float(i.get("value_edge", 0.0)), float(i.get("edge", 0.0)), float(i.get("prob_over", 0.0)))
+        score = (
+            float(i.get("ev", 0.0)),
+            float(i.get("value_edge", 0.0)),
+            float(i.get("edge", 0.0)),
+            float(i.get("prob_over", 0.0)),
+        )
         if (k not in best) or (score > best[k][0]):
             best[k] = (score, i)
 
     combined = [v[1] for v in best.values()]
     combined = apply_cooldown(state, combined, now_ts)
 
-    # Per market limits
     out_by_market = {}
     for pt in PROP_TYPES:
         inj = [x for x in combined if x["prop_type"] == pt and x["section"] == "injury"]
@@ -1900,22 +1829,18 @@ def run():
         picks = picks[:MAX_PER_MARKET]
         out_by_market[pt] = picks
 
-    # Flatten global cap
     final_out = []
     for pt in PROP_TYPES:
         final_out.extend(out_by_market.get(pt, []))
     final_out = final_out[:MAX_TOTAL_PLAYS]
 
-    # Apply exposure caps AFTER ranking
     final_out = apply_exposure_caps(final_out)
 
-    # Rebuild out_by_market from capped list
     capped_by_market = {pt: [] for pt in PROP_TYPES}
     for it in final_out:
         capped_by_market[it["prop_type"]].append(it)
     out_by_market = capped_by_market
 
-    # Existing plus bucket from capped output (simple)
     plus_bucket = []
     for x in final_out:
         try:
@@ -1926,7 +1851,6 @@ def run():
     plus_bucket.sort(key=lambda x: (x["ev"], x["value_edge"], x["prob_over"]), reverse=True)
     plus_bucket = plus_bucket[:PLUS_ODDS_TOPN]
 
-    # Message
     if final_out:
         msg = [f"💰 FanDuel Props ({ts_et})", ""]
 
@@ -1956,7 +1880,7 @@ def run():
             slt = [x for x in picks if x["section"] == "slate"]
 
             if inj:
-                msg.append("🚑 Injury-Triggered Plays:")
+                msg.append("🚑 Injury Picks:")
                 msg.append("")
                 for i in inj:
                     fire = " 🔥" if i.get("ev", 0) >= 0.25 else ""
@@ -1994,7 +1918,6 @@ def run():
                 )
             msg.append("")
 
-        # NEW: aggressive plus hunt list
         if plus_ideas_all:
             msg.append("💎 Plus-Odds Attack List (aggressive hunt):")
             msg.append("")
