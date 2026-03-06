@@ -27,23 +27,10 @@ twilio = Client(TWILIO_SID, TWILIO_TOKEN)
 TEST_MODE = os.environ.get("TEST_MODE", "0") == "1"
 MAX_BODY_CHARS = int(os.environ.get("MAX_BODY_CHARS", "1500"))
 
-
-def _strip_quotes(s: str) -> str:
-    """
-    Fixes env var issues like:
-      LINEUPEXPERTS_BASE_URL="https://api.lineupexperts.com/v1"
-    which becomes a literal string containing quotes.
-    """
-    s = (s or "").strip()
-    if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
-        s = s[1:-1].strip()
-    return s
-
-
-BOOK_VENDOR_RAW = _strip_quotes(os.environ.get("BOOK_VENDORS", os.environ.get("BOOK_VENDOR", "fanduel"))).strip().lower()
+BOOK_VENDOR_RAW = os.environ.get("BOOK_VENDORS", os.environ.get("BOOK_VENDOR", "fanduel")).strip().lower()
 BOOK_VENDORS = [v.strip() for v in BOOK_VENDOR_RAW.split(",") if v.strip()]
 
-PROP_TYPES_RAW = _strip_quotes(os.environ.get("PROP_TYPES", "points")).strip().lower()
+PROP_TYPES_RAW = os.environ.get("PROP_TYPES", "points").strip().lower()
 PROP_TYPES = [p.strip() for p in PROP_TYPES_RAW.split(",") if p.strip()]
 
 ENABLE_INJURY_TRIGGERS = os.environ.get("ENABLE_INJURY_TRIGGERS", "1") == "1"
@@ -56,7 +43,7 @@ MAX_PLAYS_PER_GAME = int(os.environ.get("MAX_PLAYS_PER_GAME", "2"))
 # Consensus + Steam + EV + Plus odds + "market respect"
 MIN_VENDORS_FOR_CONSENSUS = int(os.environ.get("MIN_VENDORS_FOR_CONSENSUS", "2"))
 MIN_SHARP_VENDORS = int(os.environ.get("MIN_SHARP_VENDORS", "1"))
-SHARP_VENDORS_RAW = _strip_quotes(os.environ.get("SHARP_VENDORS", "draftkings,caesars,betmgm,bet365,pointsbet,hardrock")).strip().lower()
+SHARP_VENDORS_RAW = os.environ.get("SHARP_VENDORS", "draftkings,caesars,betmgm,bet365,pointsbet,hardrock").strip().lower()
 SHARP_VENDORS = {x.strip() for x in SHARP_VENDORS_RAW.split(",") if x.strip()}
 
 ENABLE_STEAM = os.environ.get("ENABLE_STEAM", "0") == "1"
@@ -115,10 +102,25 @@ PLUS_ODDS_TOPN = int(os.environ.get("PLUS_ODDS_TOPN", "3"))
 THREES_BETA_BINOM = os.environ.get("THREES_BETA_BINOM", "1") == "1"
 THREES_MIN_ATT_GAMES = int(os.environ.get("THREES_MIN_ATT_GAMES", "8"))
 
-# LineupExperts news integration (NBA Core endpoint)
+# -------------------- LINEUPEXPERTS (NEWS) --------------------
 LINEUPEXPERTS = os.environ.get("LINEUPEXPERTS", "0") == "1"
-LINEUPEXPERTS_KEY = _strip_quotes(os.environ.get("LINEUPEXPERTS_KEY", os.environ.get("LINEUPEXPERTS_API_KEY", ""))).strip()
-LINEUPEXPERTS_BASE_URL = _strip_quotes(os.environ.get("LINEUPEXPERTS_BASE_URL", "https://api.lineupexperts.com/v1")).strip().rstrip("/")
+LINEUPEXPERTS_KEY = os.environ.get("LINEUPEXPERTS_KEY", os.environ.get("LINEUPEXPERTS_API_KEY", "")).strip()
+
+def _sanitize_url(u: str) -> str:
+    """
+    Render/ENV sometimes injects quotes, like:
+      LINEUPEXPERTS_BASE_URL="https://api.lineupexperts.com/v1"
+    This removes wrapping quotes safely.
+    """
+    u = (u or "").strip()
+    if (len(u) >= 2) and ((u[0] == u[-1]) and u[0] in ("'", '"')):
+        u = u[1:-1].strip()
+    return u
+
+LINEUPEXPERTS_BASE_URL = _sanitize_url(
+    os.environ.get("LINEUPEXPERTS_BASE_URL", "https://api.lineupexperts.com/v1")
+).strip().rstrip("/")
+
 LINEUPEXPERTS_TIMEOUT = int(os.environ.get("LINEUPEXPERTS_TIMEOUT", "12"))
 LINEUPEXPERTS_MAX_ITEMS = int(os.environ.get("LINEUPEXPERTS_MAX_ITEMS", "200"))
 NEWS_LOOKBACK_HOURS = int(os.environ.get("NEWS_LOOKBACK_HOURS", "36"))
@@ -126,6 +128,10 @@ NEWS_BOOST_OUT = float(os.environ.get("NEWS_BOOST_OUT", "0.18"))
 NEWS_BOOST_QUESTIONABLE = float(os.environ.get("NEWS_BOOST_QUESTIONABLE", "0.08"))
 NEWS_BOOST_MINUTES = float(os.environ.get("NEWS_BOOST_MINUTES", "0.05"))
 NEWS_MIN_CONFIDENCE = float(os.environ.get("NEWS_MIN_CONFIDENCE", "0.25"))
+
+# Debug toggles
+LE_DEBUG = os.environ.get("LE_DEBUG", "0") == "1"
+LE_NO_TIME_FILTER = os.environ.get("LE_NO_TIME_FILTER", "0") == "1"
 
 # -------------------- RUNTIME DEADLINE --------------------
 RUN_START = time.time()
@@ -689,30 +695,12 @@ def _betaln(a: float, b: float) -> float:
     return math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
 
 def _log_choose(n: int, k: int) -> float:
-    # guard invalid combinations
-    if k < 0 or k > n:
-        return float("-inf")
     return math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)
 
 def beta_binom_pmf(k: int, n: int, a: float, b: float) -> float:
-    # Guard to avoid lgamma(0)/invalid combs
-    if n < 0 or k < 0 or k > n:
-        return 0.0
-    if n == 0:
-        # Only k=0 is possible
-        return 1.0 if k == 0 else 0.0
-    lc = _log_choose(n, k)
-    if not math.isfinite(lc):
-        return 0.0
-    return math.exp(lc + _betaln(k + a, (n - k) + b) - _betaln(a, b))
+    return math.exp(_log_choose(n, k) + _betaln(k + a, (n - k) + b) - _betaln(a, b))
 
 def beta_binom_cdf(k: int, n: int, a: float, b: float) -> float:
-    # Clamp k into [0,n] so we never sum pmf(i) beyond n
-    if n <= 0:
-        return 1.0 if k >= 0 else 0.0
-    if k < 0:
-        return 0.0
-    k = min(int(k), int(n))
     s = 0.0
     for i in range(0, k + 1):
         s += beta_binom_pmf(i, n, a, b)
@@ -740,11 +728,11 @@ def threes_prob_over_beta_binom(threes_games, line: float):
     if not att_list:
         return None
 
-    k = int(math.floor(float(line)))  # over line means >= k+1
+    k = int(math.floor(float(line)))
     probs = []
     for n_att in att_list:
-        n_att = int(n_att)
-        if n_att <= 0:
+        n_att = max(0, int(n_att))
+        if n_att == 0:
             probs.append(0.0)
             continue
         p_le_k = beta_binom_cdf(k, n_att, a, b)
@@ -762,7 +750,7 @@ def steam_score(prev, cur):
     except Exception:
         return 0.0
 
-    line_move = (prev_line - cur_line)  # + means good for over
+    line_move = (prev_line - cur_line)
     odds_move = (cur_over - prev_over) / 50.0
     score = (line_move / 0.5) * 0.9 + odds_move * 0.6
     return float(score)
@@ -792,7 +780,7 @@ def get_prev_market(state, prop_type, pid, now_ts):
         return None
     return prev
 
-# -------------------- LINEUPEXPERTS (NEWS) --------------------
+# -------------------- LINEUPEXPERTS HELPERS --------------------
 def _try_parse_dt(s: str):
     if not s:
         return None
@@ -806,59 +794,124 @@ def _try_parse_dt(s: str):
     return None
 
 def fetch_lineupexperts_news(now_et: datetime):
-    if not LINEUPEXPERTS or not LINEUPEXPERTS_KEY:
+    """
+    Returns a list of raw news items from LineupExperts.
+    - Tries multiple candidate paths (API naming differs across accounts/versions).
+    - If results come back empty, prints status/url/body head to avoid flying blind.
+    """
+    if not LINEUPEXPERTS:
         return []
 
-    url = f"{LINEUPEXPERTS_BASE_URL}/nba-NewsBySport"
-    try:
-        r = requests.get(url, params={"key": LINEUPEXPERTS_KEY}, timeout=LINEUPEXPERTS_TIMEOUT)
-    except Exception as e:
-        print(f"[WARN] LineupExperts request failed: {type(e).__name__}: {e}")
+    if not LINEUPEXPERTS_KEY:
+        print("[WARN] LineupExperts enabled but LINEUPEXPERTS_KEY is empty.")
         return []
 
-    if r.status_code != 200:
-        print(f"[WARN] LineupExperts HTTP {r.status_code} for {r.url}: {r.text[:300]}")
-        return []
+    candidate_paths = [
+        "/nba-NewsBySport",
+        "/nba-newsbySport",
+        "/nba/newsBySport",
+        "/nba/newsbysport",
+        "/nba/NewsBySport",
+        "/nba/news",
+        "/nba-news",
+    ]
 
-    try:
-        data = r.json()
-    except Exception:
-        print(f"[WARN] LineupExperts non-JSON response: {r.text[:200]}")
-        return []
+    headers = {"Accept": "application/json"}
+    params = {"key": LINEUPEXPERTS_KEY}
 
-    if isinstance(data, dict):
-        items = data.get("data") or data.get("results") or data.get("news") or data.get("items") or []
-    elif isinstance(data, list):
-        items = data
-    else:
-        items = []
+    last_status = None
+    last_url = None
+    last_text = None
+    last_json = None
 
-    if not isinstance(items, list):
-        return []
-
-    items = items[:max(1, LINEUPEXPERTS_MAX_ITEMS)]
-
-    cutoff = now_et - timedelta(hours=NEWS_LOOKBACK_HOURS)
-    out = []
-    for it in items:
-        if not isinstance(it, dict):
+    for path in candidate_paths:
+        url = f"{LINEUPEXPERTS_BASE_URL}{path}"
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=LINEUPEXPERTS_TIMEOUT)
+        except Exception as e:
+            print(f"[WARN] LineupExperts request failed path={path}: {type(e).__name__}: {e}")
             continue
 
-        dt = None
-        for k in ("date", "updated", "updated_at", "created", "created_at", "publishDate", "published", "time"):
-            if k in it:
-                dt = _try_parse_dt(it.get(k))
-                break
+        last_status = r.status_code
+        last_url = r.url
+        try:
+            last_text = r.text
+        except Exception:
+            last_text = ""
 
-        if dt is not None and dt.tzinfo is None:
-            dt = dt.replace(tzinfo=ET)
+        if LE_DEBUG:
+            head = (last_text or "")[:400].replace("\n", "\\n")
+            print(f"[LE_DEBUG] status={r.status_code} url={r.url} body_head={head}")
 
-        if dt is not None and dt < cutoff:
+        if r.status_code != 200:
             continue
 
-        out.append(it)
+        try:
+            data = r.json()
+            last_json = data
+        except Exception:
+            continue
 
-    return out
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = (
+                data.get("data")
+                or data.get("results")
+                or data.get("news")
+                or data.get("items")
+                or data.get("payload")
+                or []
+            )
+        else:
+            items = []
+
+        if not isinstance(items, list):
+            items = []
+
+        if items:
+            items = items[:max(1, LINEUPEXPERTS_MAX_ITEMS)]
+
+            if LE_NO_TIME_FILTER:
+                return items
+
+            cutoff = now_et - timedelta(hours=NEWS_LOOKBACK_HOURS)
+            out = []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+
+                dt = None
+                for k in ("date", "updated", "updated_at", "created", "created_at",
+                          "publishDate", "published", "time", "timestamp"):
+                    if k in it:
+                        dt = _try_parse_dt(it.get(k))
+                        if dt is not None:
+                            break
+
+                if dt is not None:
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=ET)
+                    if dt < cutoff:
+                        continue
+
+                out.append(it)
+
+            return out
+
+        continue
+
+    head = (last_text or "")[:800].replace("\n", "\\n")
+    print(f"[WARN] LineupExperts returned no items. LE_DEBUG={int(LE_DEBUG)} NO_TIME_FILTER={int(LE_NO_TIME_FILTER)}")
+    print(f"[WARN] Last attempt status={last_status} url={last_url}")
+    if head:
+        print(f"[WARN] Body head: {head}")
+    if isinstance(last_json, dict):
+        print(f"[WARN] JSON keys: {list(last_json.keys())[:30]}")
+    elif isinstance(last_json, list):
+        print(f"[WARN] JSON list length: {len(last_json)}")
+
+    return []
 
 def build_news_boost_map(news_items):
     boosts = {}
@@ -939,6 +992,8 @@ def apply_news_to_projection(proj: float, boost_rec: dict | None, cap: float = 0
     return proj * (1.0 + eff), eff, why
 
 # -------------------- ENGINES --------------------
+# (Everything below here is identical to your current script.)
+
 def build_injury_edges(team_short, injured_name, injured_status, exclude_names_lower, now_et, prop_type, lines_map_for_prop, state, now_ts, news_boosts):
     if deadline_exceeded():
         return []
@@ -968,7 +1023,8 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
         ip10 = sum(float(x[1]) for x in _slice_last(inj_games, LOOKBACK_GAMES)) / max(1, len(_slice_last(inj_games, LOOKBACK_GAMES)))
         im10 = sum(float(x[3]) for x in _slice_last(inj_games, LOOKBACK_GAMES)) / max(1, len(_slice_last(inj_games, LOOKBACK_GAMES)))
     else:
-        inj_games = bdl_last_n_games_stats([injured_pid], season, BASELINE_GAMES, "pts").get(injured_pid, [])
+        stat_key = "pts"
+        inj_games = bdl_last_n_games_stats([injured_pid], season, BASELINE_GAMES, stat_key).get(injured_pid, [])
         ip10, im10, _ = avg_stat_min_std(_slice_last(inj_games, LOOKBACK_GAMES))
 
     if len(inj_games) < 3:
@@ -1065,10 +1121,10 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
         if prop_type == "threes" and THREES_BETA_BINOM:
             base_line = float(line)
             base = _slice_last(games, BASELINE_GAMES)
-            l10 = _slice_last(games, LOOKBACK_GAMES)
+            l10s = _slice_last(games, LOOKBACK_GAMES)
             l3 = _slice_last(games, SHORT_GAMES)
             base_avg = sum(float(x[1]) for x in base) / max(1, len(base))
-            l10_avg = sum(float(x[1]) for x in l10) / max(1, len(l10))
+            l10_avg = sum(float(x[1]) for x in l10s) / max(1, len(l10s))
             l3_avg = sum(float(x[1]) for x in l3) / max(1, len(l3))
             proj = 0.45 * base_avg + 0.35 * l10_avg + 0.10 * l3_avg + 0.10 * base_line
 
@@ -1243,10 +1299,10 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
 
         if prop_type == "threes" and THREES_BETA_BINOM:
             base = _slice_last(games, BASELINE_GAMES)
-            l10 = _slice_last(games, LOOKBACK_GAMES)
+            l10s = _slice_last(games, LOOKBACK_GAMES)
             l3 = _slice_last(games, SHORT_GAMES)
             base_avg = sum(float(x[1]) for x in base) / max(1, len(base))
-            l10_avg = sum(float(x[1]) for x in l10) / max(1, len(l10))
+            l10_avg = sum(float(x[1]) for x in l10s) / max(1, len(l10s))
             l3_avg = sum(float(x[1]) for x in l3) / max(1, len(l3))
             proj = 0.45 * base_avg + 0.35 * l10_avg + 0.10 * l3_avg + 0.10 * float(line)
 
@@ -1305,10 +1361,10 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
 
         if prop_type == "threes":
             base = _slice_last(games, BASELINE_GAMES)
-            l10 = _slice_last(games, LOOKBACK_GAMES)
+            l10s = _slice_last(games, LOOKBACK_GAMES)
             l3 = _slice_last(games, SHORT_GAMES)
             base_avg = sum(float(x[1]) for x in base) / max(1, len(base))
-            l10_avg = sum(float(x[1]) for x in l10) / max(1, len(l10))
+            l10_avg = sum(float(x[1]) for x in l10s) / max(1, len(l10s))
             l3_avg = sum(float(x[1]) for x in l3) / max(1, len(l3))
 
         why = (
@@ -1396,10 +1452,13 @@ def apply_exposure_caps(ideas):
         team = (it.get("team") or "").strip().lower()
         gid = int(it.get("gid") or 0)
 
-        if team and team_ct.get(team, 0) >= MAX_PLAYS_PER_TEAM:
-            continue
-        if gid and game_ct.get(gid, 0) >= MAX_PLAYS_PER_GAME:
-            continue
+        if team:
+            if team_ct.get(team, 0) >= MAX_PLAYS_PER_TEAM:
+                continue
+
+        if gid:
+            if game_ct.get(gid, 0) >= MAX_PLAYS_PER_GAME:
+                continue
 
         out.append(it)
 
@@ -1428,6 +1487,13 @@ def run():
         f"LINEUPEXPERTS={int(LINEUPEXPERTS)} LINEUPEXPERTS_BASE_URL={LINEUPEXPERTS_BASE_URL}"
     )
 
+    # ✅ hard visibility on env toggles
+    print(
+        f"[DEBUG] LE_DEBUG={int(LE_DEBUG)} LE_NO_TIME_FILTER={int(LE_NO_TIME_FILTER)} "
+        f"LE_KEY_PRESENT={int(bool(LINEUPEXPERTS_KEY))} LE_TIMEOUT={LINEUPEXPERTS_TIMEOUT} "
+        f"LE_MAX_ITEMS={LINEUPEXPERTS_MAX_ITEMS} NEWS_LOOKBACK_HOURS={NEWS_LOOKBACK_HOURS}"
+    )
+
     if TEST_MODE:
         send_one(f"✅ NBA betting agent test OK ({ts_et})")
         return
@@ -1435,14 +1501,17 @@ def run():
     state = load_state()
     old_players = state.get("players", {})
 
+    # Props + games
     lines_map, games_map = build_today_props(now_et)
 
+    # News boosts
     news_items = fetch_lineupexperts_news(now_et) if LINEUPEXPERTS else []
     news_boosts = build_news_boost_map(news_items) if news_items else {}
 
     if LINEUPEXPERTS:
         print(f"[INFO] LineupExperts news_items={len(news_items)} boosts={len(news_boosts)} lookback={NEWS_LOOKBACK_HOURS}h base_url={LINEUPEXPERTS_BASE_URL}")
 
+    # Injuries
     new_players = {}
     triggers = []
     injury_ideas_all = []
@@ -1498,6 +1567,7 @@ def run():
             if got_any:
                 triggers.append(f"{injured_name} ({team_short}) {injured_status}")
 
+    # Slate scan
     slate_ideas_all = []
     if ENABLE_SLATE_SCAN and (not deadline_exceeded()):
         for pt in PROP_TYPES:
@@ -1507,6 +1577,7 @@ def run():
                 slate_scan_edges(now_et, pt, lines_map.get(pt, {}), state=state, now_ts=now_ts, news_boosts=news_boosts)
             )
 
+    # Combine + best per (market/player)
     combined = injury_ideas_all + slate_ideas_all
     best = {}
     for i in combined:
@@ -1523,6 +1594,7 @@ def run():
     combined = [v[1] for v in best.values()]
     combined = apply_cooldown(state, combined, now_ts)
 
+    # Per market limits
     out_by_market = {}
     for pt in PROP_TYPES:
         inj = [x for x in combined if x["prop_type"] == pt and x["section"] == "injury"]
@@ -1537,19 +1609,22 @@ def run():
         picks = picks[:MAX_PER_MARKET]
         out_by_market[pt] = picks
 
+    # Flatten global cap
     final_out = []
     for pt in PROP_TYPES:
         final_out.extend(out_by_market.get(pt, []))
     final_out = final_out[:MAX_TOTAL_PLAYS]
 
-    # Apply exposure caps after ranking, before messaging
+    # ✅ Apply exposure caps (team + game) AFTER ranking, BEFORE messaging
     final_out = apply_exposure_caps(final_out)
 
+    # Rebuild out_by_market from capped list
     capped_by_market = {pt: [] for pt in PROP_TYPES}
     for it in final_out:
         capped_by_market[it["prop_type"]].append(it)
     out_by_market = capped_by_market
 
+    # Plus odds bucket
     plus_bucket = []
     for x in final_out:
         try:
@@ -1560,6 +1635,7 @@ def run():
     plus_bucket.sort(key=lambda x: (x["ev"], x["value_edge"], x["prob_over"]), reverse=True)
     plus_bucket = plus_bucket[:PLUS_ODDS_TOPN]
 
+    # Message
     if final_out:
         msg = [f"💰 FanDuel Props ({ts_et})", ""]
 
@@ -1631,7 +1707,6 @@ def run():
         send_chunked("\n".join(msg).strip())
 
         record_sent(state, final_out, now_ts)
-
     else:
         print("[INFO] No plays cleared thresholds this run.")
 
