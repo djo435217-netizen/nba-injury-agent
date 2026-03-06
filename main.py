@@ -40,12 +40,12 @@ ENABLE_SLATE_SCAN = os.environ.get("ENABLE_SLATE_SCAN", "1") == "1"
 MAX_PLAYS_PER_TEAM = int(os.environ.get("MAX_PLAYS_PER_TEAM", "2"))
 MAX_PLAYS_PER_GAME = int(os.environ.get("MAX_PLAYS_PER_GAME", "2"))
 
-# Consensus + steam + EV + market respect
+# Consensus + steam + EV + plus odds + market respect
 MIN_VENDORS_FOR_CONSENSUS = int(os.environ.get("MIN_VENDORS_FOR_CONSENSUS", "2"))
 MIN_SHARP_VENDORS = int(os.environ.get("MIN_SHARP_VENDORS", "1"))
 SHARP_VENDORS_RAW = os.environ.get(
     "SHARP_VENDORS",
-    "draftkings,caesars,betmgm,bet365,pointsbet,hardrock"
+    "draftkings,caesars,betmgm,bet365,pointsbet,hardrock",
 ).strip().lower()
 SHARP_VENDORS = {x.strip() for x in SHARP_VENDORS_RAW.split(",") if x.strip()}
 
@@ -102,7 +102,7 @@ STAT_BATCH_SIZE = int(os.environ.get("STAT_BATCH_SIZE", "90"))
 
 DEBUG_PROP_SAMPLE_TYPES = os.environ.get("DEBUG_PROP_SAMPLE_TYPES", "0").strip().lower()
 
-# Plus-odds bucket
+# Plus-odds bucket (existing)
 PLUS_ODDS_MIN = float(os.environ.get("PLUS_ODDS_MIN", "100"))
 PLUS_ODDS_TOPN = int(os.environ.get("PLUS_ODDS_TOPN", "3"))
 
@@ -127,7 +127,7 @@ MINUTES_PROJ_CAP = float(os.environ.get("MINUTES_PROJ_CAP", "40"))
 THREES_BETA_BINOM = os.environ.get("THREES_BETA_BINOM", "1") == "1"
 THREES_MIN_ATT_GAMES = int(os.environ.get("THREES_MIN_ATT_GAMES", "8"))
 
-# LineupExperts news integration
+# LineupExperts news integration (NBA Core endpoint)
 LINEUPEXPERTS = os.environ.get("LINEUPEXPERTS", "0") == "1"
 LINEUPEXPERTS_KEY = os.environ.get("LINEUPEXPERTS_KEY", os.environ.get("LINEUPEXPERTS_API_KEY", "")).strip()
 LINEUPEXPERTS_BASE_URL = os.environ.get("LINEUPEXPERTS_BASE_URL", "https://api.lineupexperts.com/v1").strip()
@@ -471,7 +471,7 @@ def _bdl_get(path: str, params=None, timeout: int = 20) -> dict:
                     break
                 if r.status_code in (429, 500, 502, 503, 504):
                     retry_after = r.headers.get("Retry-After")
-                    sleep_s = float(retry_after) if retry_after else (BDL_RETRY_BASE_SEC * (2 ** attempt))
+                    sleep_s = float(retry_after) if retry_after else (BDL_RETRY_BASE_SEC * (2**attempt))
                     last_err = f"{r.status_code} {r.text[:120]}"
                     time.sleep(min(sleep_s, 20.0))
                     continue
@@ -480,7 +480,7 @@ def _bdl_get(path: str, params=None, timeout: int = 20) -> dict:
                 return r.json()
             except Exception as e:
                 last_err = str(e)
-                time.sleep(min(BDL_RETRY_BASE_SEC * (2 ** attempt), 20.0))
+                time.sleep(min(BDL_RETRY_BASE_SEC * (2**attempt), 20.0))
                 continue
     raise RuntimeError(f"BallDontLie request failed for {path}. Last error: {last_err}")
 
@@ -2024,14 +2024,7 @@ def run():
             if deadline_exceeded():
                 break
             slate_ideas_all.extend(
-                slate_scan_edges(
-                    now_et,
-                    pt,
-                    lines_map.get(pt, {}),
-                    state=state,
-                    now_ts=now_ts,
-                    news_boosts=news_boosts,
-                )
+                slate_scan_edges(now_et, pt, lines_map.get(pt, {}), state=state, now_ts=now_ts, news_boosts=news_boosts)
             )
 
     plus_ideas_all = []
