@@ -2180,7 +2180,19 @@ def run():
                 msg.append(f"  Why: {i['why']}")
                 msg.append("")
             msg.append("")
+# -------------------- LINEUPEXPERTS SIGNAL PLAYS --------------------
+le_picks = [x for x in final_out if "LE_boost≈" in x.get("why","")]
 
+if le_picks:
+    msg.append("📰 LineupExperts Signal Plays:")
+    msg.append("")
+    for i in le_picks:
+        msg.append(
+            f"• {i['player_name']} OVER {i['cons_line']:.1f} "
+            f"(edge +{i['edge']:.1f}, P≈{i['prob_over']*100:.0f}%, EV≈{i['ev']:+.2f}/$1)"
+        )
+        msg.append(f"  Why: {i['why']}")
+        msg.append("")
         msg.append(f"🧢 Exposure caps applied: team≤{MAX_PLAYS_PER_TEAM}, game≤{MAX_PLAYS_PER_GAME}")
         print(f"[INFO] sending message final_out={len(final_out)} plus_hunt={len(plus_ideas_all)}")
         send_chunked("\n".join(msg).strip())
