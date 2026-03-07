@@ -1722,6 +1722,68 @@ def run():
             f"lookback={NEWS_LOOKBACK_HOURS}h base_url={LINEUPEXPERTS_BASE_URL}"
         )
 
+    # NEW: exact boosted player names from LineupExperts
+    boosted_names = sorted(news_boosts.keys())
+    print(f"[INFO] LE boosted player names={boosted_names}")
+
+    # NEW: build LE watchlist from boosted players who also have props on the current slate
+    le_watchlist = []
+    le_watch_seen = set()
+
+    season = _season_year(now_et)
+    all_prop_pids = []
+    for pt in PROP_TYPES:
+        all_prop_pids.extend(list(lines_map.get(pt, {}).keys()))
+    all_prop_pids = list({int(x) for x in all_prop_pids})
+
+    if all_prop_pids:
+        if "threes" in PROP_TYPES and THREES_BETA_BINOM:
+            for chunk_ids in _chunk(all_prop_pids, STAT_BATCH_SIZE):
+                if deadline_exceeded():
+                    break
+                try:
+                    bdl_last_n_games_threes(chunk_ids, season, max(LOOKBACK_GAMES, 8))
+                except Exception as e:
+                    print(f"[WARN] LE watchlist threes warmup failed: {e}")
+
+        for chunk_ids in _chunk(all_prop_pids, STAT_BATCH_SIZE):
+            if deadline_exceeded():
+                break
+            try:
+                bdl_last_n_games_stats(chunk_ids, season, max(LOOKBACK_GAMES, 8), "pts")
+            except Exception as e:
+                print(f"[WARN] LE watchlist points warmup failed: {e}")
+
+    for pt in PROP_TYPES:
+        for pid, rows in lines_map.get(pt, {}).items():
+            name = PLAYER_NAME_CACHE.get(int(pid), f"Player {pid}")
+            boost_rec = news_boosts.get(_clean_name(name))
+            if not boost_rec:
+                continue
+
+            key = (int(pid), pt)
+            if key in le_watch_seen:
+                continue
+            le_watch_seen.add(key)
+
+            le_watchlist.append(
+                {
+                    "player_name": name,
+                    "player_id": int(pid),
+                    "prop_type": pt,
+                    "boost": float(boost_rec.get("boost", 0.0)),
+                    "confidence": float(boost_rec.get("confidence", 0.0)),
+                    "why": boost_rec.get("why", ""),
+                }
+            )
+
+    print(f"[INFO] LE watchlist matches on slate={len(le_watchlist)}")
+    for w in le_watchlist[:20]:
+        print(
+            f"[INFO] LE WATCH: {w['player_name']} {w['prop_type']} "
+            f"boost={w['boost']:+.2f} conf={w['confidence']:.2f}"
+        )
+
     new_players = {}
     triggers = []
     injury_ideas_all = []
@@ -1863,7 +1925,7 @@ def run():
     plus_bucket.sort(key=lambda x: (x["ev"], x["value_edge"], x["prob_over"]), reverse=True)
     plus_bucket = plus_bucket[:PLUS_ODDS_TOPN]
 
-    # NEW: explicit LE final-card debug
+    # Existing LE final-card debug
     le_debug = [x for x in final_out if "LE_boost≈" in x.get("why", "")]
     print(f"[INFO] LineupExperts plays in final card={len(le_debug)}")
     for p in le_debug:
@@ -1887,6 +1949,19 @@ def run():
             if len(triggers) > 8:
                 msg.append(f"- …and {len(triggers)-8} more")
             msg.append("")
+
+        # NEW: show LE watchlist even if none made final card
+        if le_watchlist:
+            msg.append("📰 LineupExperts Watchlist:")
+            msg.append("")
+            for x in le_watchlist[:10]:
+                label = "Points" if x["prop_type"] == "points" else ("3PT Made" if x["prop_type"] in ("threes", "three_pointers_made") else x["prop_type"])
+                msg.append(
+                    f"• {x['player_name']} [{label}] "
+                    f"(boost={x['boost']:+.2f}, conf={x['confidence']:.2f})"
+                )
+                msg.append(f"  Why: {x['why']}")
+                msg.append("")
 
         for pt in PROP_TYPES:
             picks = out_by_market.get(pt, [])
@@ -1952,7 +2027,7 @@ def run():
                 msg.append("")
             msg.append("")
 
-        # NEW: explicit LineupExperts plays section
+        # Existing final-card LE section
         le_picks = [x for x in final_out if "LE_boost≈" in x.get("why", "")]
         if le_picks:
             msg.append("📰 LineupExperts Signal Plays:")
