@@ -43,7 +43,10 @@ MAX_PLAYS_PER_GAME = int(os.environ.get("MAX_PLAYS_PER_GAME", "2"))
 # Consensus + steam + EV + plus odds + "market respect"
 MIN_VENDORS_FOR_CONSENSUS = int(os.environ.get("MIN_VENDORS_FOR_CONSENSUS", "2"))
 MIN_SHARP_VENDORS = int(os.environ.get("MIN_SHARP_VENDORS", "1"))
-SHARP_VENDORS_RAW = os.environ.get("SHARP_VENDORS", "draftkings,caesars,betmgm,bet365,pointsbet,hardrock").strip().lower()
+SHARP_VENDORS_RAW = os.environ.get(
+    "SHARP_VENDORS",
+    "draftkings,caesars,betmgm,bet365,pointsbet,hardrock"
+).strip().lower()
 SHARP_VENDORS = {x.strip() for x in SHARP_VENDORS_RAW.split(",") if x.strip()}
 
 ENABLE_STEAM = os.environ.get("ENABLE_STEAM", "0") == "1"
@@ -66,8 +69,8 @@ MIN_PROB = float(os.environ.get("MIN_PROB", "0.62"))
 STD_FLOOR = float(os.environ.get("STD_FLOOR", "5.0"))
 
 # EV filter
-EV_MIN = float(os.environ.get("EV_MIN", "0.00"))  # keep >= 0 EV by default
-VALUE_EDGE_MIN = float(os.environ.get("VALUE_EDGE_MIN", "0.00"))  # model_prob - vigfree_market_prob
+EV_MIN = float(os.environ.get("EV_MIN", "0.00"))
+VALUE_EDGE_MIN = float(os.environ.get("VALUE_EDGE_MIN", "0.00"))
 
 # Guardrails
 MIN_L10_MIN = float(os.environ.get("MIN_L10_MIN", "10"))
@@ -121,6 +124,18 @@ NEWS_BOOST_OUT = float(os.environ.get("NEWS_BOOST_OUT", "0.18"))
 NEWS_BOOST_QUESTIONABLE = float(os.environ.get("NEWS_BOOST_QUESTIONABLE", "0.08"))
 NEWS_BOOST_MINUTES = float(os.environ.get("NEWS_BOOST_MINUTES", "0.05"))
 NEWS_MIN_CONFIDENCE = float(os.environ.get("NEWS_MIN_CONFIDENCE", "0.25"))
+
+# LineupExperts tuning
+NEWS_DECAY_HOURS_FULL = float(os.environ.get("NEWS_DECAY_HOURS_FULL", "2"))
+NEWS_DECAY_HOURS_MID = float(os.environ.get("NEWS_DECAY_HOURS_MID", "8"))
+NEWS_DECAY_HOURS_MAX = float(os.environ.get("NEWS_DECAY_HOURS_MAX", "36"))
+
+LE_HARD_START_BOOST = float(os.environ.get("LE_HARD_START_BOOST", "0.14"))
+LE_SOFT_AVAIL_BOOST = float(os.environ.get("LE_SOFT_AVAIL_BOOST", "0.02"))
+LE_NEGATIVE_TAG_PENALTY = float(os.environ.get("LE_NEGATIVE_TAG_PENALTY", "0.08"))
+LE_MINUTES_UP_BOOST = float(os.environ.get("LE_MINUTES_UP_BOOST", "0.10"))
+LE_MINUTES_DOWN_PENALTY = float(os.environ.get("LE_MINUTES_DOWN_PENALTY", "0.12"))
+LE_BENCH_PENALTY = float(os.environ.get("LE_BENCH_PENALTY", "0.08"))
 
 # Optional debug helpers
 LE_DEBUG = os.environ.get("LE_DEBUG", "0") == "1"
@@ -571,6 +586,7 @@ def build_today_props(now_et: datetime):
     games_map = bdl_games_today(now_et)
     game_ids = list(games_map.keys())
     lines_map = {pt: {} for pt in PROP_TYPES}
+    seen_rows = set()
 
     for gid in game_ids:
         if deadline_exceeded():
@@ -613,10 +629,26 @@ def build_today_props(now_et: datetime):
                 if not isinstance(over_odds, (int, float)) or not isinstance(under_odds, (int, float)):
                     continue
 
+                vendor_name = str((pp.get("vendor") or (v or "no_vendor"))).strip().lower()
+                game_id = int(pp.get("game_id")) if pp.get("game_id") is not None else int(gid)
+
+                dedupe_key = (
+                    game_id,
+                    pid,
+                    pt,
+                    vendor_name,
+                    float(line),
+                    float(over_odds),
+                    float(under_odds),
+                )
+                if dedupe_key in seen_rows:
+                    continue
+                seen_rows.add(dedupe_key)
+
                 row = {
                     "pid": pid,
-                    "gid": int(pp.get("game_id")) if pp.get("game_id") is not None else int(gid),
-                    "vendor": str((pp.get("vendor") or (v or "no_vendor"))).strip().lower(),
+                    "gid": game_id,
+                    "vendor": vendor_name,
                     "prop_type": (pp.get("prop_type") or pt),
                     "line": float(line),
                     "over_odds": float(over_odds),
@@ -855,6 +887,29 @@ def _try_parse_dt(s: str):
     return None
 
 
+def _hours_ago_from_now(dt: datetime | None, now_et: datetime) -> float | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ET)
+    try:
+        return max(0.0, (now_et - dt.astimezone(ET)).total_seconds() / 3600.0)
+    except Exception:
+        return None
+
+
+def _news_recency_multiplier(hours_ago: float | None) -> float:
+    if hours_ago is None:
+        return 0.60
+    if hours_ago <= NEWS_DECAY_HOURS_FULL:
+        return 1.00
+    if hours_ago <= NEWS_DECAY_HOURS_MID:
+        return 0.80
+    if hours_ago <= NEWS_DECAY_HOURS_MAX:
+        return 0.55
+    return 0.30
+
+
 def fetch_lineupexperts_news(now_et: datetime):
     if not LINEUPEXPERTS or not LINEUPEXPERTS_KEY:
         return []
@@ -868,7 +923,7 @@ def fetch_lineupexperts_news(now_et: datetime):
         return []
 
     if LE_DEBUG:
-        print(f"[LE_DEBUG] status={r.status_code} url={r.url} body_head={r.text[:220].replace(chr(10),' ')}")
+        print(f"[LE_DEBUG] status={r.status_code} url={r.url} body_head={r.text[:220].replace(chr(10), ' ')}")
 
     if r.status_code != 200:
         print(f"[WARN] LineupExperts HTTP {r.status_code} for {r.url}: {r.text[:300]}")
@@ -899,13 +954,16 @@ def fetch_lineupexperts_news(now_et: datetime):
                 for st in stories:
                     if not isinstance(st, dict):
                         continue
+                    raw_date = st.get("Date") or st.get("date") or ""
+                    parsed_dt = _try_parse_dt(raw_date)
                     items.append(
                         {
                             "player": pname,
                             "title": st.get("Title") or st.get("title") or "",
                             "publisher": st.get("Publisher") or st.get("publisher") or "",
                             "url": st.get("URL") or st.get("url") or "",
-                            "date": st.get("Date") or st.get("date") or "",
+                            "date": raw_date,
+                            "parsed_dt": parsed_dt,
                             "raw": st,
                         }
                     )
@@ -924,15 +982,22 @@ def fetch_lineupexperts_news(now_et: datetime):
     for it in items:
         if not isinstance(it, dict):
             continue
-        dt = None
-        for k in ("date", "updated", "updated_at", "created", "created_at", "publishDate", "published", "time", "Date"):
-            if k in it:
-                dt = _try_parse_dt(it.get(k))
-                break
+
+        dt = it.get("parsed_dt")
+        if dt is None:
+            for k in ("date", "updated", "updated_at", "created", "created_at", "publishDate", "published", "time", "Date"):
+                if k in it:
+                    dt = _try_parse_dt(it.get(k))
+                    break
+
         if dt is not None and dt.tzinfo is None:
             dt = dt.replace(tzinfo=ET)
+
+        it["parsed_dt"] = dt
+
         if dt is not None and dt < cutoff:
             continue
+
         out.append(it)
 
     return out
@@ -940,6 +1005,17 @@ def fetch_lineupexperts_news(now_et: datetime):
 
 def build_news_boost_map(news_items):
     boosts = {}
+
+    hard_out_pat = re.compile(r"\b(ruled out|will miss|out for|out vs|out tonight|inactive)\b", re.I)
+    hard_start_pat = re.compile(r"\b(will start|expected to start|starting lineup|draws start|named starter|moves into starting lineup)\b", re.I)
+    minutes_up_pat = re.compile(r"\b(minutes restriction lifted|minutes limit lifted|no minutes limit|workload increased|bigger role|increased role|increase in minutes|should see more run)\b", re.I)
+
+    soft_avail_pat = re.compile(r"\b(available|cleared|active|returns|good to go)\b", re.I)
+    probable_pat = re.compile(r"\bprobable\b", re.I)
+
+    negative_tag_pat = re.compile(r"\b(questionable|doubtful|game-time decision|gtd)\b", re.I)
+    minutes_down_pat = re.compile(r"\b(minutes restriction|minutes monitored|limited to)\b", re.I)
+    bench_pat = re.compile(r"\b(coming off the bench|bench role|not starting)\b", re.I)
 
     def push(player_name: str, boost: float, confidence: float, why: str):
         if not player_name:
@@ -949,56 +1025,85 @@ def build_news_boost_map(news_items):
             return
         if confidence < NEWS_MIN_CONFIDENCE:
             return
-        cur = boosts.get(k)
-        score = boost * confidence
-        if (cur is None) or (score > (cur["boost"] * cur["confidence"])):
-            boosts[k] = {"boost": float(boost), "confidence": float(confidence), "why": why[:220]}
 
-    out_pat = re.compile(r"\b(ruled out|will miss|out for|out vs|out tonight|inactive)\b", re.I)
-    q_pat = re.compile(r"\b(questionable|probable|doubtful|game-time decision|gtd)\b", re.I)
-    min_up_pat = re.compile(r"\b(minutes restriction lifted|minutes limit lifted|expected to start|will start|increase in minutes|bigger role)\b", re.I)
+        cur = boosts.get(k)
+        score = abs(boost) * confidence
+        if (cur is None) or (score > (abs(cur["boost"]) * cur["confidence"])):
+            boosts[k] = {
+                "boost": float(boost),
+                "confidence": float(confidence),
+                "why": why[:220],
+            }
+
+    now_et = _now_et()
 
     for it in news_items:
         try:
             title = str(it.get("title") or it.get("headline") or "").strip()
             body = str(it.get("news") or it.get("description") or it.get("content") or it.get("analysis") or "").strip()
             player = str(it.get("player") or it.get("playerName") or it.get("full_name") or "").strip()
+            parsed_dt = it.get("parsed_dt")
         except Exception:
+            continue
+
+        if not player:
             continue
 
         text = f"{title}\n{body}".strip()
         if not text:
             continue
 
-        conf = None
-        for ck in ("confidence", "impact", "weight", "rating", "score"):
-            if ck in it:
-                try:
-                    conf = float(it.get(ck))
-                    break
-                except Exception:
-                    pass
-        if conf is None:
-            conf = 0.35
-            if out_pat.search(text) or q_pat.search(text):
-                conf = 0.55
+        hours_ago = _hours_ago_from_now(parsed_dt, now_et)
+        recency_mult = _news_recency_multiplier(hours_ago)
 
-        if not player:
-            continue
+        conf = 0.45
+        if hard_out_pat.search(text) or hard_start_pat.search(text) or minutes_up_pat.search(text):
+            conf = 0.70
+        elif negative_tag_pat.search(text) or minutes_down_pat.search(text):
+            conf = 0.60
+        elif probable_pat.search(text) or soft_avail_pat.search(text):
+            conf = 0.35
 
         boost = 0.0
         why_bits = []
-        if out_pat.search(text):
+
+        if hard_out_pat.search(text):
             boost += NEWS_BOOST_OUT
             why_bits.append("out-news")
-        if q_pat.search(text):
-            boost += NEWS_BOOST_QUESTIONABLE
-            why_bits.append("status-news")
-        if min_up_pat.search(text):
-            boost += NEWS_BOOST_MINUTES
-            why_bits.append("minutes-news")
 
-        if boost <= 0:
+        if hard_start_pat.search(text):
+            boost += LE_HARD_START_BOOST
+            why_bits.append("starter-news")
+
+        if minutes_up_pat.search(text):
+            boost += LE_MINUTES_UP_BOOST
+            why_bits.append("minutes-up")
+
+        if soft_avail_pat.search(text) and not hard_start_pat.search(text):
+            boost += LE_SOFT_AVAIL_BOOST
+            why_bits.append("available")
+
+        if probable_pat.search(text) and not (
+            hard_out_pat.search(text) or hard_start_pat.search(text) or minutes_up_pat.search(text)
+        ):
+            boost += 0.01
+            why_bits.append("probable-lite")
+
+        if negative_tag_pat.search(text):
+            boost -= LE_NEGATIVE_TAG_PENALTY
+            why_bits.append("negative-tag")
+
+        if minutes_down_pat.search(text):
+            boost -= LE_MINUTES_DOWN_PENALTY
+            why_bits.append("minutes-down")
+
+        if bench_pat.search(text):
+            boost -= LE_BENCH_PENALTY
+            why_bits.append("bench")
+
+        boost *= recency_mult
+
+        if abs(boost) < 0.015:
             continue
 
         push(player, boost, conf, f"{'|'.join(why_bits)}: {title or body}")
@@ -1009,13 +1114,14 @@ def build_news_boost_map(news_items):
 def build_news_score_map(news_items):
     out = {}
 
-    pos_strong = re.compile(r"\b(will start|expected to start|starting lineup|draws start|named starter)\b", re.I)
-    pos_med = re.compile(r"\b(available|cleared|returns|good to go|active)\b", re.I)
-    pos_min = re.compile(r"\b(minutes restriction lifted|no minutes limit|minutes limit lifted|workload increased)\b", re.I)
+    pos_strong = re.compile(r"\b(will start|expected to start|starting lineup|draws start|named starter|moves into starting lineup)\b", re.I)
+    pos_minutes = re.compile(r"\b(minutes restriction lifted|no minutes limit|minutes limit lifted|workload increased|bigger role|increase in minutes|should see more run)\b", re.I)
+    pos_soft = re.compile(r"\b(available|cleared|returns|good to go|active)\b", re.I)
+    probable_pat = re.compile(r"\bprobable\b", re.I)
 
     neg_status = re.compile(r"\b(questionable|doubtful|game-time decision|gtd)\b", re.I)
     neg_limit = re.compile(r"\b(minutes restriction|minutes monitored|limited to)\b", re.I)
-    neg_bench = re.compile(r"\b(coming off the bench|bench role)\b", re.I)
+    neg_bench = re.compile(r"\b(coming off the bench|bench role|not starting)\b", re.I)
 
     def push(player_name, score, why):
         k = _clean_name(player_name)
@@ -1025,12 +1131,17 @@ def build_news_score_map(news_items):
         if (cur is None) or (abs(score) > abs(cur["score"])):
             out[k] = {"score": float(score), "why": why[:220]}
 
+    now_et = _now_et()
+
     for it in news_items:
         if not isinstance(it, dict):
             continue
+
         title = str(it.get("title") or it.get("headline") or "").strip()
         body = str(it.get("news") or it.get("description") or it.get("content") or "").strip()
         player = str(it.get("player") or it.get("playerName") or it.get("full_name") or "").strip()
+        parsed_dt = it.get("parsed_dt")
+
         if not player:
             continue
 
@@ -1038,30 +1149,43 @@ def build_news_score_map(news_items):
         if not text:
             continue
 
+        hours_ago = _hours_ago_from_now(parsed_dt, now_et)
+        recency_mult = _news_recency_multiplier(hours_ago)
+
         score = 0.0
         why_bits = []
 
         if pos_strong.search(text):
-            score += 1.0
+            score += 1.25
             why_bits.append("start")
-        if pos_min.search(text):
-            score += 0.8
+
+        if pos_minutes.search(text):
+            score += 1.00
             why_bits.append("mins_up")
-        if pos_med.search(text):
-            score += 0.4
+
+        if pos_soft.search(text) and not pos_strong.search(text):
+            score += 0.20
             why_bits.append("available")
 
+        if probable_pat.search(text) and not (pos_strong.search(text) or pos_minutes.search(text)):
+            score += 0.05
+            why_bits.append("probable-lite")
+
         if neg_status.search(text):
-            score -= 0.8
+            score -= 0.80
             why_bits.append("qtag")
+
         if neg_limit.search(text):
-            score -= 0.9
+            score -= 1.00
             why_bits.append("mins_cap")
+
         if neg_bench.search(text):
-            score -= 0.4
+            score -= 0.65
             why_bits.append("bench")
 
-        if score == 0.0:
+        score *= recency_mult
+
+        if abs(score) < 0.05:
             continue
 
         push(player, score, f"{'|'.join(why_bits)}: {title or body}")
@@ -1074,8 +1198,8 @@ def apply_news_to_projection(proj: float, boost_rec: dict | None, cap: float = 0
         return proj, 0.0, None
     b = float(boost_rec.get("boost", 0.0))
     c = float(boost_rec.get("confidence", 0.0))
-    eff = max(0.0, min(cap, b * c))
-    if eff <= 0:
+    eff = max(-cap, min(cap, b * c))
+    if abs(eff) <= 0:
         return proj, 0.0, None
     why = boost_rec.get("why") or ""
     return proj * (1.0 + eff), eff, why
@@ -1267,7 +1391,7 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
         team_name = PLAYER_TEAM_CACHE.get(pid) or team_short or ""
 
         base_avg, l10_avg, l3_avg, l10_min, _ = aux
-        news_note = f" | LE_boost≈{news_eff:+.2f}" if news_eff else ""
+        news_note = f" | LE_boost≈{news_eff:+.2f}" if abs(news_eff) > 0 else ""
         news_note2 = f" ({news_why})" if news_why else ""
 
         why = (
@@ -1311,7 +1435,16 @@ def build_injury_edges(team_short, injured_name, injured_status, exclude_names_l
 
         remember_market(state, prop_type, pid, offer, line, n_cons, now_ts)
 
-    ideas.sort(key=lambda x: (x["trigger_strength"], x["ev"], x["value_edge"], x["edge"], x["prob_over"]), reverse=True)
+    ideas.sort(
+        key=lambda x: (
+            x["trigger_strength"],
+            x["ev"],
+            x["value_edge"],
+            x["edge"],
+            x["prob_over"],
+        ),
+        reverse=True,
+    )
     return ideas
 
 
@@ -1419,7 +1552,7 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
         team_name = PLAYER_TEAM_CACHE.get(int(pid), "")
         gid = int(offer.get("gid") or offer.get("game_id") or 0)
 
-        news_note = f" | LE_boost≈{news_eff:+.2f}" if news_eff else ""
+        news_note = f" | LE_boost≈{news_eff:+.2f}" if abs(news_eff) > 0 else ""
         news_note2 = f" ({news_why})" if news_why else ""
 
         why = (
@@ -1584,7 +1717,7 @@ def plus_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, n
             f"PlusHunt. offer {offer['vendor']} {offer['line']:.1f} ({int(offer['over_odds']):+d}) "
             f"| P≈{prob_over*100:.0f}% (mkt≈{p_market*100:.0f}%, val_edge≈{value_edge:+.2f}) "
             f"| EV≈{ev:+.2f}/$1 | news_score={news_score:+.2f} role_bonus={role_bonus:+.2f} plus_score={plus_score:.1f} "
-            f"| LE_boost≈{news_eff:+.2f}{(' ('+news_why+')') if news_why else ''}"
+            f"| LE_boost≈{news_eff:+.2f}{(' (' + news_why + ')') if news_why else ''}"
         )
 
         ideas.append(
@@ -1722,11 +1855,9 @@ def run():
             f"lookback={NEWS_LOOKBACK_HOURS}h base_url={LINEUPEXPERTS_BASE_URL}"
         )
 
-    # NEW: exact boosted player names from LineupExperts
     boosted_names = sorted(news_boosts.keys())
     print(f"[INFO] LE boosted player names={boosted_names}")
 
-    # NEW: build LE watchlist from boosted players who also have props on the current slate
     le_watchlist = []
     le_watch_seen = set()
 
@@ -1755,7 +1886,7 @@ def run():
                 print(f"[WARN] LE watchlist points warmup failed: {e}")
 
     for pt in PROP_TYPES:
-        for pid, rows in lines_map.get(pt, {}).items():
+        for pid, _rows in lines_map.get(pt, {}).items():
             name = PLAYER_NAME_CACHE.get(int(pid), f"Player {pid}")
             boost_rec = news_boosts.get(_clean_name(name))
             if not boost_rec:
@@ -1808,7 +1939,9 @@ def run():
             prev = old_players.get(pid)
             if IMPACT_ONLY_CHANGES:
                 is_new = prev is None
-                is_changed = (not is_new) and ((prev.get("status"), prev.get("detail")) != (cur.get("status"), cur.get("detail")))
+                is_changed = (not is_new) and (
+                    (prev.get("status"), prev.get("detail")) != (cur.get("status"), cur.get("detail"))
+                )
                 if not (is_new or is_changed):
                     continue
 
@@ -1894,7 +2027,16 @@ def run():
         inj = [x for x in combined if x["prop_type"] == pt and x["section"] == "injury"]
         slt = [x for x in combined if x["prop_type"] == pt and x["section"] == "slate"]
 
-        inj.sort(key=lambda x: (x["trigger_strength"], x["ev"], x["value_edge"], x["edge"], x["prob_over"]), reverse=True)
+        inj.sort(
+            key=lambda x: (
+                x["trigger_strength"],
+                x["ev"],
+                x["value_edge"],
+                x["edge"],
+                x["prob_over"],
+            ),
+            reverse=True,
+        )
         slt.sort(key=lambda x: (x["ev"], x["value_edge"], x["edge"], x["prob_over"]), reverse=True)
 
         picks = inj + slt
@@ -1925,20 +2067,29 @@ def run():
     plus_bucket.sort(key=lambda x: (x["ev"], x["value_edge"], x["prob_over"]), reverse=True)
     plus_bucket = plus_bucket[:PLUS_ODDS_TOPN]
 
-    # Existing LE final-card debug
-    le_debug = [x for x in final_out if "LE_boost≈" in x.get("why", "")]
+    le_debug = []
+    for x in final_out:
+        nm = _clean_name(x.get("player_name", ""))
+        if nm in news_boosts:
+            le_debug.append(x)
+
     print(f"[INFO] LineupExperts plays in final card={len(le_debug)}")
     for p in le_debug:
+        rec = news_boosts.get(_clean_name(p["player_name"]), {})
         print(
             f"[INFO] LE PLAY: {p['player_name']} {p['prop_type']} "
-            f"over {p['cons_line']:.1f} edge={p['edge']:.2f}"
+            f"over {p['cons_line']:.1f} edge={p['edge']:.2f} "
+            f"boost={float(rec.get('boost', 0.0)):+.2f} conf={float(rec.get('confidence', 0.0)):.2f}"
         )
 
     if final_out:
         msg = [f"💰 FanDuel Props ({ts_et})", ""]
 
         if LINEUPEXPERTS:
-            msg.append(f"📰 News signals: items={len(news_items)}, boosted_players={len(news_boosts)} (lookback {NEWS_LOOKBACK_HOURS}h)")
+            msg.append(
+                f"📰 News signals: items={len(news_items)}, boosted_players={len(news_boosts)} "
+                f"(lookback {NEWS_LOOKBACK_HOURS}h)"
+            )
             msg.append("")
 
         if triggers:
@@ -1950,15 +2101,17 @@ def run():
                 msg.append(f"- …and {len(triggers)-8} more")
             msg.append("")
 
-        # NEW: show LE watchlist even if none made final card
         if le_watchlist:
             msg.append("📰 LineupExperts Watchlist:")
             msg.append("")
             for x in le_watchlist[:10]:
-                label = "Points" if x["prop_type"] == "points" else ("3PT Made" if x["prop_type"] in ("threes", "three_pointers_made") else x["prop_type"])
+                label = "Points" if x["prop_type"] == "points" else (
+                    "3PT Made" if x["prop_type"] in ("threes", "three_pointers_made") else x["prop_type"]
+                )
+                signal_tag = "UP" if x["boost"] > 0 else "DOWN"
                 msg.append(
                     f"• {x['player_name']} [{label}] "
-                    f"(boost={x['boost']:+.2f}, conf={x['confidence']:.2f})"
+                    f"({signal_tag} | boost={x['boost']:+.2f}, conf={x['confidence']:.2f})"
                 )
                 msg.append(f"  Why: {x['why']}")
                 msg.append("")
@@ -1968,7 +2121,9 @@ def run():
             if not picks:
                 continue
 
-            label = "Points" if pt == "points" else ("3PT Made" if pt in ("threes", "three_pointers_made") else pt)
+            label = "Points" if pt == "points" else (
+                "3PT Made" if pt in ("threes", "three_pointers_made") else pt
+            )
             msg.append(f"🏷️ {label}")
             msg.append("")
 
@@ -2020,15 +2175,19 @@ def run():
             for i in plus_ideas_all:
                 msg.append(
                     f"• {i['player_name']} OVER {i['cons_line']:.1f}  "
-                    f"(offer {i['vendor']} {int(i['over_odds']):+d}, P≈{i['prob_over']*100:.0f}%, EV≈{i['ev']:+.2f}/$1, "
-                    f"news_score={i.get('news_score',0):+.2f})"
+                    f"(offer {i['vendor']} {int(i['over_odds']):+d}, P≈{i['prob_over']*100:.0f}%, "
+                    f"EV≈{i['ev']:+.2f}/$1, news_score={i.get('news_score', 0):+.2f})"
                 )
                 msg.append(f"  Why: {i['why']}")
                 msg.append("")
             msg.append("")
 
-        # Existing final-card LE section
-        le_picks = [x for x in final_out if "LE_boost≈" in x.get("why", "")]
+        le_picks = []
+        for x in final_out:
+            nm = _clean_name(x.get("player_name", ""))
+            if nm in news_boosts:
+                le_picks.append(x)
+
         if le_picks:
             msg.append("📰 LineupExperts Signal Plays:")
             msg.append("")
