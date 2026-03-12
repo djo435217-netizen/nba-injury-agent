@@ -40,12 +40,12 @@ ENABLE_SLATE_SCAN = os.environ.get("ENABLE_SLATE_SCAN", "1") == "1"
 MAX_PLAYS_PER_TEAM = int(os.environ.get("MAX_PLAYS_PER_TEAM", "2"))
 MAX_PLAYS_PER_GAME = int(os.environ.get("MAX_PLAYS_PER_GAME", "4"))
 
-# Consensus + steam + EV + plus odds + market respect
+# Consensus + steam + EV + market respect
 MIN_VENDORS_FOR_CONSENSUS = int(os.environ.get("MIN_VENDORS_FOR_CONSENSUS", "2"))
 MIN_SHARP_VENDORS = int(os.environ.get("MIN_SHARP_VENDORS", "1"))
 SHARP_VENDORS_RAW = os.environ.get(
     "SHARP_VENDORS",
-    "draftkings,caesars,betmgm,bet365,pointsbet,hardrock,betparx,betway,betrivers"
+    "draftkings,caesars,betmgm,bet365,pointsbet,hardrock,betparx,betway,betrivers",
 ).strip().lower()
 SHARP_VENDORS = {x.strip() for x in SHARP_VENDORS_RAW.split(",") if x.strip()}
 
@@ -121,13 +121,16 @@ LINEUPEXPERTS_BASE_URL = LINEUPEXPERTS_BASE_URL.strip().strip('"').strip("'").rs
 LINEUPEXPERTS_TIMEOUT = int(os.environ.get("LINEUPEXPERTS_TIMEOUT", "12"))
 LINEUPEXPERTS_MAX_ITEMS = int(os.environ.get("LINEUPEXPERTS_MAX_ITEMS", "200"))
 NEWS_LOOKBACK_HOURS = int(os.environ.get("NEWS_LOOKBACK_HOURS", "36"))
-NEWS_BOOST_OUT = float(os.environ.get("NEWS_BOOST_OUT", "0.18"))
-NEWS_BOOST_QUESTIONABLE = float(os.environ.get("NEWS_BOOST_QUESTIONABLE", "0.08"))
-NEWS_BOOST_MINUTES = float(os.environ.get("NEWS_BOOST_MINUTES", "0.05"))
 NEWS_MIN_CONFIDENCE = float(os.environ.get("NEWS_MIN_CONFIDENCE", "0.25"))
 
 LE_DEBUG = os.environ.get("LE_DEBUG", "0") == "1"
 LE_NO_TIME_FILTER = os.environ.get("LE_NO_TIME_FILTER", "0") == "1"
+
+# NEW: LE-only league news engine
+LE_NEWS_ENGINE_ENABLED = os.environ.get("LE_NEWS_ENGINE_ENABLED", "1") == "1"
+LE_NEWS_MIN_SCORE = float(os.environ.get("LE_NEWS_MIN_SCORE", "0.50"))
+LE_NEWS_MIN_EFFECT = float(os.environ.get("LE_NEWS_MIN_EFFECT", "0.03"))
+LE_NEWS_TOPN = int(os.environ.get("LE_NEWS_TOPN", "5"))
 
 # Final ranking weights
 FINAL_SCORE_EV_W = float(os.environ.get("FINAL_SCORE_EV_W", "30.0"))
@@ -340,8 +343,6 @@ def volatility_penalty(sigma: float | None) -> float:
 
 
 def matchup_adjustment(team_name: str, player_name: str, prop_type: str) -> tuple[float, str]:
-    # Placeholder hook: wire opponent pace/defense feed later.
-    # Neutral for now.
     return 0.0, "neutral"
 
 
@@ -782,7 +783,6 @@ def compute_projection_components_points(games_all, line):
     rate_l10 = _safe_rate(l10_avg, l10_min)
     rate_l3 = _safe_rate(l3_avg, l3_min)
 
-    proj_rate = (0.45 * rate_base) + (0.35 * rate_l10) + (0.20 * rate_l3)
     sigma = max(STD_FLOOR, (l10_std if l10_std > 0 else base_std if base_std > 0 else STD_FLOOR))
 
     return {
@@ -795,7 +795,6 @@ def compute_projection_components_points(games_all, line):
         "rate_base": rate_base,
         "rate_l10": rate_l10,
         "rate_l3": rate_l3,
-        "proj_rate": proj_rate,
         "sigma": sigma,
         "line": float(line),
     }
@@ -1029,7 +1028,22 @@ def fetch_lineupexperts_news(now_et: datetime):
 
 
 def build_news_boost_map(news_items):
+    """
+    Positive = role / starter / probable / available / no limit / workload up
+    Negative = questionable / doubtful / out / minutes cap / bench role
+    """
     boosts = {}
+
+    probable_pat = re.compile(r"\b(probable|available|cleared|active|returns?|good to go)\b", re.I)
+    questionable_pat = re.compile(r"\b(questionable|game-time decision|gtd)\b", re.I)
+    doubtful_pat = re.compile(r"\b(doubtful)\b", re.I)
+    out_pat = re.compile(r"\b(ruled out|will miss|out for|out vs|out tonight|inactive)\b", re.I)
+
+    starter_pat = re.compile(r"\b(will start|expected to start|starting lineup|named starter|draws start)\b", re.I)
+    bench_pat = re.compile(r"\b(returning to bench role|coming off the bench|bench role)\b", re.I)
+
+    minutes_up_pat = re.compile(r"\b(minutes restriction lifted|minutes limit lifted|no minutes limit|workload increased|bigger role)\b", re.I)
+    minutes_down_pat = re.compile(r"\b(minutes restriction|minutes monitored|limited to)\b", re.I)
 
     def push(player_name: str, boost: float, confidence: float, why: str):
         if not player_name:
@@ -1040,15 +1054,9 @@ def build_news_boost_map(news_items):
         if confidence < NEWS_MIN_CONFIDENCE:
             return
         cur = boosts.get(k)
-        score = boost * confidence
-        if (cur is None) or (score > (cur["boost"] * cur["confidence"])):
+        score = abs(boost) * confidence
+        if (cur is None) or (score > (abs(cur["boost"]) * cur["confidence"])):
             boosts[k] = {"boost": float(boost), "confidence": float(confidence), "why": why[:220]}
-
-    out_pat = re.compile(r"\b(ruled out|will miss|out for|out vs|out tonight|inactive)\b", re.I)
-    q_pat = re.compile(r"\b(questionable|probable|doubtful|game-time decision|gtd)\b", re.I)
-    min_up_pat = re.compile(r"\b(minutes restriction lifted|minutes limit lifted|expected to start|will start|increase in minutes|bigger role)\b", re.I)
-    start_pat = re.compile(r"\b(will start|expected to start|starting lineup|named starter|draws start)\b", re.I)
-    bench_pat = re.compile(r"\b(returning to bench role|coming off the bench|bench role)\b", re.I)
 
     for it in news_items:
         try:
@@ -1062,37 +1070,54 @@ def build_news_boost_map(news_items):
         if not text or not player:
             continue
 
-        conf = 0.35
-        if out_pat.search(text) or q_pat.search(text):
-            conf = 0.55
-        if start_pat.search(text):
-            conf = 0.70
-        if bench_pat.search(text):
-            conf = 0.45
-
         boost = 0.0
+        confidence = 0.40
         why_bits = []
 
-        if out_pat.search(text):
-            boost += NEWS_BOOST_OUT
-            why_bits.append("out-news")
-        if q_pat.search(text):
-            boost += NEWS_BOOST_QUESTIONABLE
-            why_bits.append("status-news")
-        if min_up_pat.search(text):
-            boost += NEWS_BOOST_MINUTES
-            why_bits.append("minutes-news")
-        if start_pat.search(text):
-            boost += 0.08
+        if starter_pat.search(text):
+            boost += 0.12
+            confidence = max(confidence, 0.70)
             why_bits.append("starter-news")
+
+        if minutes_up_pat.search(text):
+            boost += 0.10
+            confidence = max(confidence, 0.70)
+            why_bits.append("minutes-up")
+
+        if probable_pat.search(text):
+            boost += 0.05
+            confidence = max(confidence, 0.55)
+            why_bits.append("positive-status")
+
+        if questionable_pat.search(text):
+            boost -= 0.08
+            confidence = max(confidence, 0.60)
+            why_bits.append("negative-tag")
+
+        if doubtful_pat.search(text):
+            boost -= 0.12
+            confidence = max(confidence, 0.65)
+            why_bits.append("doubtful")
+
+        if out_pat.search(text):
+            boost -= 0.18
+            confidence = max(confidence, 0.75)
+            why_bits.append("out-news")
+
+        if minutes_down_pat.search(text):
+            boost -= 0.10
+            confidence = max(confidence, 0.65)
+            why_bits.append("minutes-cap")
+
         if bench_pat.search(text):
-            boost -= 0.04
+            boost -= 0.06
+            confidence = max(confidence, 0.50)
             why_bits.append("bench")
 
-        if boost == 0:
+        if abs(boost) < 1e-9:
             continue
 
-        push(player, boost, conf, f"{'|'.join(why_bits)}: {title or body}")
+        push(player, boost, confidence, f"{'|'.join(why_bits)}: {title or body}")
 
     return boosts
 
@@ -1101,12 +1126,13 @@ def build_news_score_map(news_items):
     out = {}
 
     pos_strong = re.compile(r"\b(will start|expected to start|starting lineup|draws start|named starter)\b", re.I)
-    pos_med = re.compile(r"\b(available|cleared|returns|good to go|active)\b", re.I)
-    pos_min = re.compile(r"\b(minutes restriction lifted|no minutes limit|minutes limit lifted|workload increased)\b", re.I)
+    pos_med = re.compile(r"\b(available|cleared|returns?|good to go|active|probable)\b", re.I)
+    pos_min = re.compile(r"\b(minutes restriction lifted|no minutes limit|minutes limit lifted|workload increased|bigger role)\b", re.I)
 
     neg_status = re.compile(r"\b(questionable|doubtful|game-time decision|gtd)\b", re.I)
     neg_limit = re.compile(r"\b(minutes restriction|minutes monitored|limited to)\b", re.I)
     neg_bench = re.compile(r"\b(coming off the bench|bench role|returning to bench role)\b", re.I)
+    neg_out = re.compile(r"\b(ruled out|will miss|out for|out vs|out tonight|inactive)\b", re.I)
 
     def push(player_name, score, why):
         k = _clean_name(player_name)
@@ -1133,24 +1159,27 @@ def build_news_score_map(news_items):
         why_bits = []
 
         if pos_strong.search(text):
-            score += 1.0
+            score += 1.2
             why_bits.append("start")
         if pos_min.search(text):
-            score += 0.8
+            score += 0.9
             why_bits.append("mins_up")
         if pos_med.search(text):
-            score += 0.4
-            why_bits.append("available")
+            score += 0.5
+            why_bits.append("positive_status")
 
         if neg_status.search(text):
-            score -= 0.8
-            why_bits.append("negative-tag")
-        if neg_limit.search(text):
             score -= 0.9
+            why_bits.append("negative_tag")
+        if neg_limit.search(text):
+            score -= 1.0
             why_bits.append("mins_cap")
         if neg_bench.search(text):
-            score -= 0.4
+            score -= 0.5
             why_bits.append("bench")
+        if neg_out.search(text):
+            score -= 1.4
+            why_bits.append("out")
 
         if score == 0.0:
             continue
@@ -1181,6 +1210,7 @@ def should_bad_role_filter(min_delta: float, rate_delta: float, le_score: float)
     return False
 
 
+# -------------------- ENGINES --------------------
 def build_injury_edges(
     team_short,
     injured_name,
@@ -1283,14 +1313,14 @@ def build_injury_edges(
             l10_min = sum(float(x[3]) for x in long_slice) / max(1, len(long_slice))
             l3_min = sum(float(x[3]) for x in short_slice) / max(1, len(short_slice))
 
-            v10 = l10_avg
-            m10 = l10_min
-
             rate_base = _safe_rate(base_avg, base_min)
             rate_l10 = _safe_rate(l10_avg, l10_min)
             rate_l3 = _safe_rate(l3_avg, l3_min)
-            rate_delta = rate_l3 - rate_l10
+
+            v10 = l10_avg
+            m10 = l10_min
             min_delta = l3_min - l10_min
+            rate_delta = rate_l3 - rate_l10
         else:
             comps = compute_projection_components_points(games, line)
             base_avg = comps["base_avg"]
@@ -1310,7 +1340,6 @@ def build_injury_edges(
 
         if m10 < MIN_L10_MIN:
             continue
-
         if (v10 - line) > LINE_MIN_GAP:
             continue
 
@@ -1336,7 +1365,6 @@ def build_injury_edges(
 
         proj_min = projected_minutes(base_min, l10_min, l3_min, min_delta, injury_boost_min, le_score)
         min_conf = minutes_confidence(proj_min, l10_min, l3_min)
-
         matchup_score, matchup_note = matchup_adjustment(team_short, nm, prop_type)
 
         if prop_type == "threes" and THREES_BETA_BINOM:
@@ -1530,7 +1558,6 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
 
         if m10 < MIN_L10_MIN:
             continue
-
         if should_bad_role_filter(min_delta, rate_delta, le_score):
             continue
 
@@ -1644,6 +1671,206 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
     return ideas
 
 
+def lineup_news_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_boosts, news_scores):
+    """
+    LE-only engine.
+    This is the piece that makes LineupExperts matter beyond injuries.
+    """
+    if not LE_NEWS_ENGINE_ENABLED or deadline_exceeded():
+        return []
+
+    season = _season_year(now_et)
+    pids = list((lines_map_for_prop or {}).keys())
+    if not pids:
+        return []
+
+    stats_all = {}
+    if prop_type == "threes" and THREES_BETA_BINOM:
+        for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
+            if deadline_exceeded():
+                break
+            stats_all.update(bdl_last_n_games_threes(chunk_ids, season, BASELINE_GAMES))
+    else:
+        for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
+            if deadline_exceeded():
+                break
+            stats_all.update(bdl_last_n_games_stats(chunk_ids, season, BASELINE_GAMES, "pts"))
+
+    ideas = []
+    for pid in pids:
+        if deadline_exceeded():
+            break
+
+        name = PLAYER_NAME_CACHE.get(int(pid), f"Player {pid}")
+        nm_key = _clean_name(name)
+        rec = news_boosts.get(nm_key)
+        ns = news_scores.get(nm_key, {"score": 0.0})
+
+        if not rec:
+            continue
+
+        le_eff = float(rec.get("boost", 0.0)) * float(rec.get("confidence", 0.0))
+        le_score = float(ns.get("score", 0.0))
+
+        if le_eff <= 0:
+            continue
+        if le_eff < LE_NEWS_MIN_EFFECT:
+            continue
+        if le_score < LE_NEWS_MIN_SCORE:
+            continue
+
+        games = stats_all.get(int(pid), [])
+        if len(games) < 8:
+            continue
+
+        rows = (lines_map_for_prop or {}).get(int(pid), [])
+        cons, n_cons, n_sharp = consensus_line(rows)
+        if cons is None or n_cons < MIN_VENDORS_FOR_CONSENSUS:
+            continue
+
+        offer = best_offer_near_consensus(rows, cons)
+        if not offer:
+            continue
+
+        line = float(cons)
+
+        if prop_type == "threes":
+            long_slice = _slice_last(games, LOOKBACK_GAMES)
+            short_slice = _slice_last(games, SHORT_GAMES)
+            base = _slice_last(games, BASELINE_GAMES)
+
+            base_avg = sum(float(x[1]) for x in base) / max(1, len(base))
+            l10_avg = sum(float(x[1]) for x in long_slice) / max(1, len(long_slice))
+            l3_avg = sum(float(x[1]) for x in short_slice) / max(1, len(short_slice))
+
+            base_min = sum(float(x[3]) for x in base) / max(1, len(base))
+            l10_min = sum(float(x[3]) for x in long_slice) / max(1, len(long_slice))
+            l3_min = sum(float(x[3]) for x in short_slice) / max(1, len(short_slice))
+
+            rate_base = _safe_rate(base_avg, base_min)
+            rate_l10 = _safe_rate(l10_avg, l10_min)
+            rate_l3 = _safe_rate(l3_avg, l3_min)
+
+            min_delta = l3_min - l10_min
+            rate_delta = rate_l3 - rate_l10
+            m10 = l10_min
+        else:
+            comps = compute_projection_components_points(games, line)
+            base_avg = comps["base_avg"]
+            l10_avg = comps["l10_avg"]
+            l3_avg = comps["l3_avg"]
+            base_min = comps["base_min"]
+            l10_min = comps["l10_min"]
+            l3_min = comps["l3_min"]
+            rate_base = comps["rate_base"]
+            rate_l10 = comps["rate_l10"]
+            rate_l3 = comps["rate_l3"]
+
+            min_delta = l3_min - l10_min
+            rate_delta = rate_l3 - rate_l10
+            m10 = l10_min
+
+        if m10 < MIN_L10_MIN:
+            continue
+        if should_bad_role_filter(min_delta, rate_delta, le_score):
+            continue
+
+        proj_min = projected_minutes(base_min, l10_min, l3_min, min_delta, 0.0, le_score)
+        min_conf = minutes_confidence(proj_min, l10_min, l3_min)
+        matchup_score, matchup_note = matchup_adjustment(PLAYER_TEAM_CACHE.get(int(pid), ""), name, prop_type)
+
+        if prop_type == "threes" and THREES_BETA_BINOM:
+            proj_rate = (0.45 * rate_base) + (0.35 * rate_l10) + (0.20 * rate_l3)
+            proj = proj_min * proj_rate
+            proj, news_eff, news_why = apply_news_to_projection(proj, rec)
+            proj *= (1.0 + matchup_score)
+
+            prob_over = threes_prob_over_beta_binom(games, float(line))
+            if prob_over is None:
+                continue
+            edge = proj - float(line)
+            sigma = None
+        else:
+            proj_rate = (0.45 * rate_base) + (0.35 * rate_l10) + (0.20 * rate_l3)
+            proj = proj_min * proj_rate
+            proj, news_eff, news_why = apply_news_to_projection(proj, rec)
+            proj *= (1.0 + matchup_score)
+
+            sigma = comps["sigma"]
+            edge = proj - line
+            z = (proj - line) / max(sigma, 1e-6)
+            prob_over = _norm_cdf(z)
+
+        # relaxed thresholds for LE-only engine
+        le_min_edge = max(1.5, MIN_EDGE - 1.0)
+        le_min_prob = max(0.56, MIN_PROB - 0.05)
+        le_min_value = max(0.01, VALUE_EDGE_MIN)
+
+        if edge < le_min_edge or prob_over < le_min_prob:
+            continue
+
+        p_over = american_to_prob(float(offer["over_odds"]))
+        p_under = american_to_prob(float(offer["under_odds"]))
+        p_market = p_over / max(p_over + p_under, 1e-9)
+
+        value_edge = prob_over - p_market
+        if value_edge < le_min_value:
+            continue
+
+        ev = ev_per_dollar(prob_over, float(offer["over_odds"]))
+        if ev < EV_MIN:
+            continue
+
+        team_name = PLAYER_TEAM_CACHE.get(int(pid), "")
+        gid = int(offer.get("gid") or offer.get("game_id") or 0)
+        stab_score = stability_score(edge, sigma)
+        vol_pen = volatility_penalty(sigma)
+        final_score = final_play_score(ev, value_edge, edge, min_conf, matchup_score, le_score, stab_score, vol_pen) + 8.0
+
+        why = (
+            f"LineupNews. base(L{BASELINE_GAMES}) {base_avg:.1f}, L10 {l10_avg:.1f}, L3 {l3_avg:.1f} "
+            f"(mins L10 {l10_min:.1f}, proj_min {proj_min:.1f}, rate {proj_rate:.3f}). "
+            f"Role Δmin={min_delta:+.1f}, Δrate={rate_delta:+.2f}. "
+            f"Proj {proj:.1f} vs CONS {line:.1f} (n={n_cons}, sharp={n_sharp}) | "
+            f"offer {offer['vendor']} {offer['line']:.1f} ({int(offer['over_odds']):+d}) | "
+            f"edge +{edge:.1f} | P≈{prob_over*100:.0f}% (mkt≈{p_market*100:.0f}%, val_edge≈{value_edge:+.2f}) | "
+            f"EV≈{ev:+.2f}/$1 | LE_boost≈{news_eff:+.2f} ({news_why}) | match={matchup_note}."
+        )
+
+        ideas.append(
+            {
+                "section": "lineupnews",
+                "prop_type": prop_type,
+                "player_name": name,
+                "player_id": int(pid),
+                "team": team_name,
+                "gid": gid,
+                "cons_line": float(line),
+                "line": float(offer["line"]),
+                "proj": float(proj),
+                "edge": float(edge),
+                "prob_over": float(prob_over),
+                "market_prob": float(p_market),
+                "value_edge": float(value_edge),
+                "ev": float(ev),
+                "vendor": str(offer["vendor"]),
+                "over_odds": float(offer["over_odds"]),
+                "under_odds": float(offer["under_odds"]),
+                "n_cons": int(n_cons),
+                "n_sharp": int(n_sharp),
+                "steam": 0.0,
+                "trigger_strength": 0.0,
+                "trigger": "LineupExperts league news",
+                "why": why,
+                "le_score": float(le_score),
+                "final_score": float(final_score),
+            }
+        )
+
+    ideas.sort(key=lambda x: (x["final_score"], x["ev"], x["value_edge"]), reverse=True)
+    return ideas[:LE_NEWS_TOPN]
+
+
 def plus_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_boosts, news_scores):
     if not PLUS_HUNT_ENABLED or deadline_exceeded():
         return []
@@ -1729,7 +1956,6 @@ def plus_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, n
 
         if m10 < MIN_L10_MIN:
             continue
-
         if should_bad_role_filter(min_delta, rate_delta, le_score):
             continue
 
@@ -1902,7 +2128,8 @@ def run():
         f"ENABLE_STEAM={int(ENABLE_STEAM)} "
         f"MAX_PLAYS_PER_TEAM={MAX_PLAYS_PER_TEAM} MAX_PLAYS_PER_GAME={MAX_PLAYS_PER_GAME} "
         f"THREES_BETA_BINOM={int(THREES_BETA_BINOM)} "
-        f"LINEUPEXPERTS={int(LINEUPEXPERTS)} LINEUPEXPERTS_BASE_URL={LINEUPEXPERTS_BASE_URL}"
+        f"LINEUPEXPERTS={int(LINEUPEXPERTS)} LINEUPEXPERTS_BASE_URL={LINEUPEXPERTS_BASE_URL} "
+        f"LE_NEWS_ENGINE_ENABLED={int(LE_NEWS_ENGINE_ENABLED)}"
     )
 
     if TEST_MODE:
@@ -1927,7 +2154,7 @@ def run():
     boosted_names = sorted(news_boosts.keys())
     print(f"[INFO] LE boosted player names={boosted_names}")
 
-    # Warm up name cache for watchlist
+    # warm up name cache
     season = _season_year(now_et)
     all_prop_pids = []
     for pt in PROP_TYPES:
@@ -2053,6 +2280,24 @@ def run():
                 )
             )
 
+    lineup_news_ideas_all = []
+    if LE_NEWS_ENGINE_ENABLED and (not deadline_exceeded()):
+        for pt in PROP_TYPES:
+            if deadline_exceeded():
+                break
+            lineup_news_ideas_all.extend(
+                lineup_news_edges(
+                    now_et,
+                    pt,
+                    lines_map.get(pt, {}),
+                    state=state,
+                    now_ts=now_ts,
+                    news_boosts=news_boosts,
+                    news_scores=news_scores,
+                )
+            )
+    lineup_news_ideas_all = lineup_news_ideas_all[:LE_NEWS_TOPN]
+
     plus_ideas_all = []
     if ENABLE_SLATE_SCAN and PLUS_HUNT_ENABLED and (not deadline_exceeded()):
         for pt in PROP_TYPES:
@@ -2071,7 +2316,7 @@ def run():
             )
     plus_ideas_all = plus_ideas_all[:PLUS_HUNT_TOPN]
 
-    combined = injury_ideas_all + slate_ideas_all
+    combined = injury_ideas_all + slate_ideas_all + lineup_news_ideas_all
     best = {}
     for i in combined:
         k = (i["prop_type"], int(i["player_id"]))
@@ -2091,11 +2336,13 @@ def run():
     for pt in PROP_TYPES:
         inj = [x for x in combined if x["prop_type"] == pt and x["section"] == "injury"]
         slt = [x for x in combined if x["prop_type"] == pt and x["section"] == "slate"]
+        lne = [x for x in combined if x["prop_type"] == pt and x["section"] == "lineupnews"]
 
         inj.sort(key=lambda x: (x["final_score"], x["trigger_strength"], x["ev"]), reverse=True)
         slt.sort(key=lambda x: (x["final_score"], x["ev"], x["value_edge"]), reverse=True)
+        lne.sort(key=lambda x: (x["final_score"], x["ev"], x["value_edge"]), reverse=True)
 
-        picks = inj + slt
+        picks = inj + lne + slt
         if MIN_PER_MARKET > 0:
             picks = picks[:max(MIN_PER_MARKET, MAX_PER_MARKET)]
         picks = picks[:MAX_PER_MARKET]
@@ -2137,6 +2384,7 @@ def run():
 
     print(f"[INFO] LineupExperts boosted plays in final card={len(le_picks_up)}")
     print(f"[INFO] LineupExperts fade warnings in final card={len(le_picks_down)}")
+    print(f"[INFO] LineupExperts league-news plays={len(lineup_news_ideas_all)}")
 
     if final_out:
         msg = [f"💰 FanDuel Props ({ts_et})", ""]
@@ -2177,7 +2425,22 @@ def run():
             msg.append("")
 
             inj = [x for x in picks if x["section"] == "injury"]
+            lne = [x for x in picks if x["section"] == "lineupnews"]
             slt = [x for x in picks if x["section"] == "slate"]
+
+            if lne:
+                msg.append("📰 LineupExperts League News Plays:")
+                msg.append("")
+                for i in lne:
+                    fire = " 🔥" if i.get("ev", 0) >= 0.25 else ""
+                    team_tag = f"  [{i.get('team', '')}]".rstrip() if i.get("team") else ""
+                    msg.append(
+                        f"• {i['player_name']} OVER {i['cons_line']:.1f}  "
+                        f"(edge +{i['edge']:.1f}, P≈{i['prob_over']*100:.0f}%, EV≈{i['ev']:+.2f}/$1){fire}{team_tag}"
+                    )
+                    msg.append(f"  Trigger: {i['trigger']}")
+                    msg.append(f"  Why: {i['why']}")
+                    msg.append("")
 
             if inj:
                 msg.append("🚑 Injury Picks:")
