@@ -15,7 +15,6 @@ ET = ZoneInfo("America/New_York")
 # -------------------- REQUIRED ENV --------------------
 TWILIO_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
-SPORTRADAR_KEY = os.environ["SPORTRADAR_API_KEY"]
 BALLDONTLIE_API_KEY = os.environ["BALLDONTLIE_API_KEY"].strip()
 
 FROM_WHATSAPP = os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
@@ -126,14 +125,11 @@ NEWS_MIN_CONFIDENCE = float(os.environ.get("NEWS_MIN_CONFIDENCE", "0.25"))
 LE_DEBUG = os.environ.get("LE_DEBUG", "0") == "1"
 LE_NO_TIME_FILTER = os.environ.get("LE_NO_TIME_FILTER", "0") == "1"
 
-# NEW: LE-only league news engine
+# LE-only league news engine
 LE_NEWS_ENGINE_ENABLED = os.environ.get("LE_NEWS_ENGINE_ENABLED", "1") == "1"
 LE_NEWS_MIN_SCORE = float(os.environ.get("LE_NEWS_MIN_SCORE", "0.50"))
 LE_NEWS_MIN_EFFECT = float(os.environ.get("LE_NEWS_MIN_EFFECT", "0.03"))
 LE_NEWS_TOPN = int(os.environ.get("LE_NEWS_TOPN", "5"))
-
-# NEW: LE backup injury engine
-LE_BACKUP_INJURY_ENABLED = os.environ.get("LE_BACKUP_INJURY_ENABLED", "1") == "1"
 
 # Final ranking weights
 FINAL_SCORE_EV_W = float(os.environ.get("FINAL_SCORE_EV_W", "30.0"))
@@ -360,37 +356,6 @@ def final_play_score(ev, value_edge, edge, min_conf, matchup_score, le_score, st
         + (stab_score * FINAL_SCORE_STABILITY_W)
         - (vol_pen * FINAL_SCORE_VOL_PENALTY_W)
     )
-
-
-# -------------------- SPORTRADAR --------------------
-def fetch_sportradar_injuries():
-    url = "https://api.sportradar.com/nba/trial/v8/en/league/injuries.json"
-    r = requests.get(url, params={"api_key": SPORTRADAR_KEY}, timeout=20)
-    if r.status_code != 200:
-        raise RuntimeError(f"Sportradar error {r.status_code}: {r.text[:300]}")
-    ct = (r.headers.get("Content-Type") or "").lower()
-    if "json" not in ct:
-        raise RuntimeError(f"Unexpected content-type: {ct}. Body: {r.text[:300]}")
-    return r.json()
-
-
-def parse_injuries(data):
-    flat_by_player = {}
-    for team in data.get("teams", []):
-        team_name = team.get("name") or team.get("market") or team.get("id", "TEAM")
-        for p in team.get("players", []):
-            injuries = p.get("injuries") or []
-            if not injuries:
-                continue
-            inj = injuries[-1]
-            pid = p.get("id")
-            if not pid:
-                continue
-            name = p.get("full_name") or f"{p.get('first_name','')} {p.get('last_name','')}".strip()
-            status = (inj.get("status") or "Unknown").strip()
-            detail = (inj.get("comment") or inj.get("description") or "").strip()
-            flat_by_player[pid] = {"name": name, "team": team_name, "status": status, "detail": detail}
-    return flat_by_player
 
 
 # -------------------- BALLDONTLIE --------------------
@@ -1031,12 +996,16 @@ def fetch_lineupexperts_news(now_et: datetime):
 
 
 def build_news_boost_map(news_items):
+    """
+    Positive = role / starter / probable / available / no limit / workload up
+    Negative = questionable / doubtful / out / minutes cap / bench role
+    """
     boosts = {}
 
     probable_pat = re.compile(r"\b(probable|available|cleared|active|returns?|good to go)\b", re.I)
     questionable_pat = re.compile(r"\b(questionable|game-time decision|gtd)\b", re.I)
     doubtful_pat = re.compile(r"\b(doubtful)\b", re.I)
-    out_pat = re.compile(r"\b(ruled out|will miss|out for|out vs|out tonight|inactive)\b", re.I)
+    out_pat = re.compile(r"\b(ruled out|will miss|out for|out vs|out tonight|inactive|won't play)\b", re.I)
 
     starter_pat = re.compile(r"\b(will start|expected to start|starting lineup|named starter|draws start)\b", re.I)
     bench_pat = re.compile(r"\b(returning to bench role|coming off the bench|bench role)\b", re.I)
@@ -1131,7 +1100,7 @@ def build_news_score_map(news_items):
     neg_status = re.compile(r"\b(questionable|doubtful|game-time decision|gtd)\b", re.I)
     neg_limit = re.compile(r"\b(minutes restriction|minutes monitored|limited to)\b", re.I)
     neg_bench = re.compile(r"\b(coming off the bench|bench role|returning to bench role)\b", re.I)
-    neg_out = re.compile(r"\b(ruled out|will miss|out for|out vs|out tonight|inactive)\b", re.I)
+    neg_out = re.compile(r"\b(ruled out|will miss|out for|out vs|out tonight|inactive|won't play)\b", re.I)
 
     def push(player_name, score, why):
         k = _clean_name(player_name)
@@ -1200,79 +1169,58 @@ def apply_news_to_projection(proj: float, boost_rec: dict | None, cap: float = 0
     return proj * (1.0 + eff), eff, why
 
 
-# -------------------- LE BACKUP INJURY ENGINE --------------------
-def build_name_to_team_map_from_props(lines_map):
+def infer_le_injuries(news_items, lines_map):
+    """
+    Convert LineupExperts player news into injury-style records
+    that can feed build_injury_edges().
+    """
     out = {}
-    for pt in PROP_TYPES:
-        for pid in lines_map.get(pt, {}).keys():
-            pid = int(pid)
-            name = PLAYER_NAME_CACHE.get(pid)
-            team = PLAYER_TEAM_CACHE.get(pid)
-            if not name or not team:
-                continue
-            out[_clean_name(name)] = team
-    return out
 
-
-def infer_le_backup_injuries(news_items, name_to_team_map):
-    """
-    Converts LineupExperts headlines into a synthetic injuries dict:
-    {
-      "le::<clean_name>": {"name": ..., "team": ..., "status": ..., "detail": ...}
-    }
-    Only emits statuses in IMPACT_STATUSES.
-    """
-    out_pat = re.compile(r"\b(ruled out|will miss|out for|out vs|out tonight|inactive)\b", re.I)
+    out_pat = re.compile(r"\b(ruled out|will miss|out for|out vs|out tonight|inactive|won't play)\b", re.I)
     doubtful_pat = re.compile(r"\b(doubtful)\b", re.I)
     questionable_pat = re.compile(r"\b(questionable|game-time decision|gtd)\b", re.I)
 
-    severity_rank = {"questionable": 1, "doubtful": 2, "out": 3}
-    parsed = {}
+    # Build player -> team from whatever is on the slate / warmed cache
+    name_to_team = {}
+
+    for pt_map in lines_map.values():
+        for pid in pt_map.keys():
+            nm = PLAYER_NAME_CACHE.get(int(pid))
+            tm = PLAYER_TEAM_CACHE.get(int(pid))
+            if nm and tm:
+                name_to_team[_clean_name(nm)] = tm
 
     for it in news_items:
-        if not isinstance(it, dict):
-            continue
-
-        player = str(it.get("player") or it.get("playerName") or it.get("full_name") or "").strip()
-        title = str(it.get("title") or it.get("headline") or "").strip()
-        body = str(it.get("news") or it.get("description") or it.get("content") or it.get("analysis") or "").strip()
-        text = f"{title}\n{body}".strip()
-
-        if not player or not text:
-            continue
+        player = str(it.get("player") or "").strip()
+        title = str(it.get("title") or "").strip()
+        body = str(it.get("news") or it.get("description") or "").strip()
+        text = f"{title}\n{body}"
 
         status = None
         if out_pat.search(text):
-            status = "out"
+            status = "Out"
         elif doubtful_pat.search(text):
-            status = "doubtful"
+            status = "Doubtful"
         elif questionable_pat.search(text):
-            status = "questionable"
+            status = "Questionable"
 
-        if not status:
-            continue
-        if status not in IMPACT_STATUSES:
+        if not player or not status:
             continue
 
-        ck = _clean_name(player)
-        syn_id = f"le::{ck}"
-        team = name_to_team_map.get(ck, "")
+        team = name_to_team.get(_clean_name(player), "")
+        key = f"le::{_clean_name(player)}"
 
-        cur = parsed.get(syn_id)
-        new_rank = severity_rank.get(status, 0)
-        old_rank = severity_rank.get((cur or {}).get("status", "").lower(), 0)
-
-        rec = {
+        out[key] = {
             "name": player,
             "team": team,
             "status": status,
-            "detail": f"LE backup injury engine: {title or body}",
+            "detail": title or body,
         }
 
-        if (cur is None) or (new_rank > old_rank):
-            parsed[syn_id] = rec
+        print(f"[INFO] LE injury parsed: {player} | team={team} | status={status}")
 
-    return parsed
+    print(f"[INFO] LE injuries detected={len(out)}")
+    return out
 
 
 # -------------------- ENGINE HELPERS --------------------
@@ -1304,6 +1252,7 @@ def build_injury_edges(
     season = _season_year(now_et)
     roster = bdl_active_roster(team_short)
     if not roster:
+        print(f"[INFO] build_injury_edges skipped: no roster for team={team_short} injured={injured_name}")
         return []
 
     roster_tuples = []
@@ -1318,6 +1267,7 @@ def build_injury_edges(
 
     injured_pid = bdl_find_player_id_on_team(team_short, injured_name)
     if not injured_pid:
+        print(f"[INFO] build_injury_edges skipped: no injured_pid for {injured_name} on {team_short}")
         return []
 
     if prop_type == "threes":
@@ -1329,6 +1279,7 @@ def build_injury_edges(
         ip10, im10, _ = avg_stat_min_std(_slice_last(inj_games, LOOKBACK_GAMES))
 
     if len(inj_games) < 3:
+        print(f"[INFO] build_injury_edges skipped: too few injury games for {injured_name}")
         return []
 
     status = (injured_status or "").lower()
@@ -1337,6 +1288,10 @@ def build_injury_edges(
     vac_stat = ip10 * status_mult
     vac_min = im10 * status_mult
     if not ((vac_min >= MIN_VAC_MIN) or (vac_stat >= MIN_VAC_STAT)):
+        print(
+            f"[INFO] build_injury_edges skipped: vacancy too low for {injured_name} | "
+            f"vac_stat={vac_stat:.1f} vac_min={vac_min:.1f}"
+        )
         return []
 
     trigger_strength = min(100.0, (vac_min * 1.2 + vac_stat * 1.5))
@@ -1746,6 +1701,10 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
 
 
 def lineup_news_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_boosts, news_scores):
+    """
+    LE-only engine.
+    This is the piece that makes LineupExperts matter beyond injuries.
+    """
     if not LE_NEWS_ENGINE_ENABLED or deadline_exceeded():
         return []
 
@@ -1871,6 +1830,7 @@ def lineup_news_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news
             z = (proj - line) / max(sigma, 1e-6)
             prob_over = _norm_cdf(z)
 
+        # relaxed thresholds for LE-only engine
         le_min_edge = max(1.5, MIN_EDGE - 1.0)
         le_min_prob = max(0.56, MIN_PROB - 0.05)
         le_min_value = max(0.01, VALUE_EDGE_MIN)
@@ -2198,8 +2158,7 @@ def run():
         f"MAX_PLAYS_PER_TEAM={MAX_PLAYS_PER_TEAM} MAX_PLAYS_PER_GAME={MAX_PLAYS_PER_GAME} "
         f"THREES_BETA_BINOM={int(THREES_BETA_BINOM)} "
         f"LINEUPEXPERTS={int(LINEUPEXPERTS)} LINEUPEXPERTS_BASE_URL={LINEUPEXPERTS_BASE_URL} "
-        f"LE_NEWS_ENGINE_ENABLED={int(LE_NEWS_ENGINE_ENABLED)} "
-        f"LE_BACKUP_INJURY_ENABLED={int(LE_BACKUP_INJURY_ENABLED)}"
+        f"LE_NEWS_ENGINE_ENABLED={int(LE_NEWS_ENGINE_ENABLED)}"
     )
 
     if TEST_MODE:
@@ -2277,33 +2236,19 @@ def run():
     le_watchlist.sort(key=lambda x: abs(x["effective"]), reverse=True)
     print(f"[INFO] LE watchlist matches on slate={len(le_watchlist)}")
 
+    # -------------------- MAIN INJURY ENGINE = LINEUPEXPERTS --------------------
     new_players = {}
     triggers = []
     injury_ideas_all = []
 
     if ENABLE_INJURY_TRIGGERS and (not deadline_exceeded()):
-        used_le_backup_injuries = False
+        print("[INFO] Using LineupExperts as main injury engine")
 
-        try:
-            sr = fetch_sportradar_injuries()
-            new_players = parse_injuries(sr)
-        except Exception as e:
-            print(f"[WARN] Sportradar injuries failed: {e}")
-            new_players = {}
+        new_players = infer_le_injuries(news_items, lines_map)
 
-            if LE_BACKUP_INJURY_ENABLED and news_items:
-                print("[WARN] Switching to LineupExperts backup injury engine")
-                name_to_team_map = build_name_to_team_map_from_props(lines_map)
-                new_players = infer_le_backup_injuries(news_items, name_to_team_map)
-                used_le_backup_injuries = True
-                print(f"[INFO] LE backup injuries parsed={len(new_players)}")
-
-        exclude_names_lower = {_clean_name(v.get("name", "")) for v in new_players.values() if v.get("name")}
-
+        # Preserve old change-only logic if desired
+        filtered_players = {}
         for pid, cur in new_players.items():
-            if deadline_exceeded():
-                break
-
             if not status_in_scope(cur.get("status", "")):
                 continue
 
@@ -2314,17 +2259,31 @@ def run():
                 if not (is_new or is_changed):
                     continue
 
+            filtered_players[pid] = cur
+
+        new_players = filtered_players
+
+        exclude_names_lower = {_clean_name(v.get("name", "")) for v in new_players.values() if v.get("name")}
+
+        for pid, cur in new_players.items():
+            if deadline_exceeded():
+                break
+
             team_short = cur.get("team", "")
             injured_name = cur.get("name", "")
             injured_status = (cur.get("status") or "").strip()
 
+            print(f"[INFO] LE injury candidate: {injured_name} | team={team_short} | status={injured_status}")
+
             if not team_short:
+                print(f"[INFO] LE injury skipped: no mapped team for {injured_name}")
                 continue
 
             got_any = False
             for pt in PROP_TYPES:
                 if deadline_exceeded():
                     break
+
                 ideas = build_injury_edges(
                     team_short=team_short,
                     injured_name=injured_name,
@@ -2338,16 +2297,15 @@ def run():
                     news_boosts=news_boosts,
                     news_scores=news_scores,
                 )
+
+                print(f"[INFO] LE injury result: {injured_name} -> ideas={len(ideas)} prop_type={pt}")
+
                 if ideas:
                     got_any = True
                     injury_ideas_all.extend(ideas)
 
             if got_any:
-                src = "LE" if used_le_backup_injuries else None
-                if src:
-                    triggers.append(f"{injured_name} ({team_short}) {injured_status} [LE]")
-                else:
-                    triggers.append(f"{injured_name} ({team_short}) {injured_status}")
+                triggers.append(f"{injured_name} ({team_short}) {injured_status}")
 
     slate_ideas_all = []
     if ENABLE_SLATE_SCAN and (not deadline_exceeded()):
@@ -2468,6 +2426,7 @@ def run():
         elif eff < 0:
             le_picks_down.append(x)
 
+    print(f"[INFO] Injury plays in final card={len([x for x in final_out if x['section'] == 'injury'])}")
     print(f"[INFO] LineupExperts boosted plays in final card={len(le_picks_up)}")
     print(f"[INFO] LineupExperts fade warnings in final card={len(le_picks_down)}")
     print(f"[INFO] LineupExperts league-news plays={len(lineup_news_ideas_all)}")
