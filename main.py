@@ -146,6 +146,22 @@ FINAL_SCORE_VOL_PENALTY_W = float(os.environ.get("FINAL_SCORE_VOL_PENALTY_W", "6
 # -------------------- RUNTIME DEADLINE --------------------
 RUN_START = time.time()
 
+# -------------------- PLAYER TEAM OVERRIDES --------------------
+# This fixes the exact LE issue in your logs where team mapping is blank.
+PLAYER_TEAM_OVERRIDES = {
+    "tidjane salaun": "Hornets",
+    "vit krejci": "Hawks",
+    "daniel gafford": "Mavericks",
+    "isaac okoro": "Cavaliers",
+    "lachlan olbrich": "Bulls",
+    "jaylen brown": "Celtics",
+    "stephen curry": "Warriors",
+    "draymond green": "Warriors",
+    "marcus smart": "Grizzlies",
+    "nick richards": "Suns",
+    "jaden mcdaniels": "Timberwolves",
+}
+
 
 def deadline_exceeded() -> bool:
     return (time.time() - RUN_START) > RUN_MAX_SECONDS
@@ -450,12 +466,10 @@ def extract_team_from_text(text: str) -> str:
     if not text:
         return ""
 
-    # Most LE titles look like: "Hornets' Tidjane Salaun: Won't play Tuesday"
     m = re.match(r"^([A-Za-z0-9 .&'-]+?)'s\s+", text, flags=re.I)
     if m:
         return normalize_team_name(m.group(1))
 
-    # Other fallback shapes
     patterns = [
         r"\b([A-Za-z0-9 .&'-]+?)'s\s+[A-Za-z .'-]+:",
         r"\b([A-Za-z0-9 .&'-]+?)\s+vs\.?\s+",
@@ -468,6 +482,19 @@ def extract_team_from_text(text: str) -> str:
             team = normalize_team_name(m.group(1))
             if team:
                 return team
+
+    return ""
+
+
+def extract_team_from_url(url: str) -> str:
+    u = (url or "").lower()
+    if not u:
+        return ""
+
+    for alias, team in TEAM_ALIAS_TO_FULL.items():
+        slug = alias.replace(" ", "-")
+        if f"/{slug}/" in u or f"/{alias.replace(' ', '')}/" in u or alias in u:
+            return team
 
     return ""
 
@@ -1068,6 +1095,9 @@ def find_team_for_player_from_cache(player_name: str) -> str:
     if not target:
         return ""
 
+    if target in PLAYER_TEAM_OVERRIDES:
+        return PLAYER_TEAM_OVERRIDES[target]
+
     for pid, nm in PLAYER_NAME_CACHE.items():
         if _clean_name(nm) == target:
             team = normalize_team_name(PLAYER_TEAM_CACHE.get(pid, ""))
@@ -1121,7 +1151,10 @@ def fetch_lineupexperts_news(now_et: datetime):
                     if not isinstance(st, dict):
                         continue
                     title = st.get("Title") or st.get("title") or ""
+                    surl = st.get("URL") or st.get("url") or ""
                     team_hint = extract_team_from_text(title)
+                    if not team_hint:
+                        team_hint = extract_team_from_url(surl)
                     if not team_hint and pname:
                         team_hint = find_team_for_player_from_cache(pname)
                     items.append(
@@ -1129,7 +1162,7 @@ def fetch_lineupexperts_news(now_et: datetime):
                             "player": pname,
                             "title": title,
                             "publisher": st.get("Publisher") or st.get("publisher") or "",
-                            "url": st.get("URL") or st.get("url") or "",
+                            "url": surl,
                             "date": st.get("Date") or st.get("date") or "",
                             "raw": st,
                             "team_hint": team_hint,
@@ -1338,11 +1371,14 @@ def parse_le_injuries(news_items):
     for it in news_items:
         player = str(it.get("player") or "").strip()
         title = str(it.get("title") or "").strip()
+        surl = str(it.get("url") or "").strip()
         team_hint = normalize_team_name(str(it.get("team_hint") or "").strip())
 
         if not player or not title:
             continue
 
+        if not team_hint:
+            team_hint = extract_team_from_url(surl)
         if not team_hint:
             team_hint = find_team_for_player_from_cache(player)
 
@@ -1364,6 +1400,7 @@ def parse_le_injuries(news_items):
             "status": status,
             "detail": title,
         }
+
     return injuries
 
 
