@@ -362,37 +362,69 @@ def final_play_score(ev, value_edge, edge, min_conf, matchup_score, le_score, st
 
 # -------------------- TEAM ALIASES --------------------
 TEAM_ALIAS_TO_FULL = {
+    "atlanta hawks": "Hawks",
     "hawks": "Hawks",
+    "boston celtics": "Celtics",
     "celtics": "Celtics",
+    "brooklyn nets": "Nets",
     "nets": "Nets",
+    "charlotte hornets": "Hornets",
     "hornets": "Hornets",
+    "chicago bulls": "Bulls",
     "bulls": "Bulls",
+    "cleveland cavaliers": "Cavaliers",
     "cavaliers": "Cavaliers",
+    "dallas mavericks": "Mavericks",
     "mavericks": "Mavericks",
+    "denver nuggets": "Nuggets",
     "nuggets": "Nuggets",
+    "detroit pistons": "Pistons",
     "pistons": "Pistons",
+    "golden state warriors": "Warriors",
     "warriors": "Warriors",
+    "houston rockets": "Rockets",
     "rockets": "Rockets",
+    "indiana pacers": "Pacers",
     "pacers": "Pacers",
+    "la clippers": "Clippers",
+    "los angeles clippers": "Clippers",
     "clippers": "Clippers",
+    "la lakers": "Lakers",
+    "los angeles lakers": "Lakers",
     "lakers": "Lakers",
+    "memphis grizzlies": "Grizzlies",
     "grizzlies": "Grizzlies",
+    "miami heat": "Heat",
     "heat": "Heat",
+    "milwaukee bucks": "Bucks",
     "bucks": "Bucks",
+    "minnesota timberwolves": "Timberwolves",
     "timberwolves": "Timberwolves",
+    "new orleans pelicans": "Pelicans",
     "pelicans": "Pelicans",
+    "new york knicks": "Knicks",
     "knicks": "Knicks",
+    "oklahoma city thunder": "Thunder",
     "thunder": "Thunder",
+    "orlando magic": "Magic",
     "magic": "Magic",
+    "philadelphia 76ers": "76ers",
     "76ers": "76ers",
     "sixers": "76ers",
+    "phoenix suns": "Suns",
     "suns": "Suns",
-    "blazers": "Blazers",
+    "portland trail blazers": "Blazers",
     "trail blazers": "Blazers",
+    "blazers": "Blazers",
+    "sacramento kings": "Kings",
     "kings": "Kings",
+    "san antonio spurs": "Spurs",
     "spurs": "Spurs",
+    "toronto raptors": "Raptors",
     "raptors": "Raptors",
+    "utah jazz": "Jazz",
     "jazz": "Jazz",
+    "washington wizards": "Wizards",
     "wizards": "Wizards",
 }
 
@@ -402,26 +434,41 @@ def normalize_team_name(raw: str) -> str:
     if not s:
         return ""
     sl = s.lower()
+
     if sl in TEAM_ALIAS_TO_FULL:
         return TEAM_ALIAS_TO_FULL[sl]
+
     for k, v in TEAM_ALIAS_TO_FULL.items():
-        if k in sl:
+        if sl == k or sl.endswith(k) or k in sl:
             return v
+
     return s
 
 
 def extract_team_from_text(text: str) -> str:
+    text = (text or "").strip()
     if not text:
         return ""
+
+    # Most LE titles look like: "Hornets' Tidjane Salaun: Won't play Tuesday"
+    m = re.match(r"^([A-Za-z0-9 .&'-]+?)'s\s+", text, flags=re.I)
+    if m:
+        return normalize_team_name(m.group(1))
+
+    # Other fallback shapes
     patterns = [
-        r"\b([A-Za-z0-9 .'-]+)'s\s+[A-Za-z .'-]+:",
-        r"\b([A-Za-z0-9 .'-]+)'s\s+[A-Za-z .'-]+\b",
-        r"\bagainst\s+the\s+([A-Za-z0-9 .'-]+)\b",
+        r"\b([A-Za-z0-9 .&'-]+?)'s\s+[A-Za-z .'-]+:",
+        r"\b([A-Za-z0-9 .&'-]+?)\s+vs\.?\s+",
+        r"\bagainst\s+the\s+([A-Za-z0-9 .&'-]+)\b",
+        r"\bagainst\s+([A-Za-z0-9 .&'-]+)\b",
     ]
     for pat in patterns:
         m = re.search(pat, text, flags=re.I)
         if m:
-            return normalize_team_name(m.group(1))
+            team = normalize_team_name(m.group(1))
+            if team:
+                return team
+
     return ""
 
 
@@ -443,6 +490,7 @@ def parse_injuries(data):
     flat_by_player = {}
     for team in data.get("teams", []):
         team_name = team.get("name") or team.get("market") or team.get("id", "TEAM")
+        team_name = normalize_team_name(team_name)
         for p in team.get("players", []):
             injuries = p.get("injuries") or []
             if not injuries:
@@ -509,8 +557,8 @@ def bdl_games_today(now_et: datetime):
             gid = int(g["id"])
         except Exception:
             continue
-        home = ((g.get("home_team") or {}).get("name") or "").strip()
-        away = ((g.get("visitor_team") or {}).get("name") or "").strip()
+        home = normalize_team_name(((g.get("home_team") or {}).get("name") or "").strip())
+        away = normalize_team_name(((g.get("visitor_team") or {}).get("name") or "").strip())
         out[gid] = {"home": home, "away": away}
     return out
 
@@ -522,7 +570,7 @@ def bdl_team_name_to_id():
     data = _bdl_get("/v1/teams", params={"per_page": 100})
     m = {}
     for t in data.get("data", []):
-        nm = (t.get("name") or "").strip()
+        nm = normalize_team_name((t.get("name") or "").strip())
         if nm and t.get("id") is not None:
             m[nm] = int(t["id"])
     TEAM_CACHE = m
@@ -530,6 +578,7 @@ def bdl_team_name_to_id():
 
 
 def bdl_active_roster(team_short: str):
+    team_short = normalize_team_name(team_short)
     team_map = bdl_team_name_to_id()
     team_id = team_map.get(team_short)
     if not team_id:
@@ -550,7 +599,7 @@ def bdl_active_roster(team_short: str):
     out = []
     for p in players:
         team = p.get("team") or {}
-        if (team.get("name") or "").strip() == team_short:
+        if normalize_team_name((team.get("name") or "").strip()) == team_short:
             out.append(p)
     return out
 
@@ -605,7 +654,7 @@ def bdl_last_n_games_stats(player_ids, season: int, n: int, stat_key: str):
                 PLAYER_NAME_CACHE[pid] = f"{fn} {ln}".strip()
 
             team = row.get("team") or {}
-            tname = (team.get("name") or "").strip()
+            tname = normalize_team_name((team.get("name") or "").strip())
             if tname:
                 PLAYER_TEAM_CACHE[pid] = tname
 
@@ -661,7 +710,7 @@ def bdl_last_n_games_threes(player_ids, season: int, n: int):
                 PLAYER_NAME_CACHE[pid] = f"{fn} {ln}".strip()
 
             team = row.get("team") or {}
-            tname = (team.get("name") or "").strip()
+            tname = normalize_team_name((team.get("name") or "").strip())
             if tname:
                 PLAYER_TEAM_CACHE[pid] = tname
 
@@ -745,6 +794,8 @@ def build_today_props(now_et: datetime):
 
                 market = pp.get("market") or {}
                 mtype = (market.get("type") or "").lower()
+
+                # hard filter: ignore milestones entirely
                 if mtype != "over_under":
                     continue
 
@@ -1012,6 +1063,19 @@ def _try_parse_dt(s: str):
     return None
 
 
+def find_team_for_player_from_cache(player_name: str) -> str:
+    target = _clean_name(player_name)
+    if not target:
+        return ""
+
+    for pid, nm in PLAYER_NAME_CACHE.items():
+        if _clean_name(nm) == target:
+            team = normalize_team_name(PLAYER_TEAM_CACHE.get(pid, ""))
+            if team:
+                return team
+    return ""
+
+
 def fetch_lineupexperts_news(now_et: datetime):
     if not LINEUPEXPERTS or not LINEUPEXPERTS_KEY:
         return []
@@ -1057,6 +1121,9 @@ def fetch_lineupexperts_news(now_et: datetime):
                     if not isinstance(st, dict):
                         continue
                     title = st.get("Title") or st.get("title") or ""
+                    team_hint = extract_team_from_text(title)
+                    if not team_hint and pname:
+                        team_hint = find_team_for_player_from_cache(pname)
                     items.append(
                         {
                             "player": pname,
@@ -1065,7 +1132,7 @@ def fetch_lineupexperts_news(now_et: datetime):
                             "url": st.get("URL") or st.get("url") or "",
                             "date": st.get("Date") or st.get("date") or "",
                             "raw": st,
-                            "team_hint": extract_team_from_text(title),
+                            "team_hint": team_hint,
                         }
                     )
     else:
@@ -1276,6 +1343,9 @@ def parse_le_injuries(news_items):
         if not player or not title:
             continue
 
+        if not team_hint:
+            team_hint = find_team_for_player_from_cache(player)
+
         status = ""
         if out_pat.search(title):
             status = "Out"
@@ -1323,6 +1393,7 @@ def build_injury_edges(
     if deadline_exceeded():
         return []
 
+    team_short = normalize_team_name(team_short)
     season = _season_year(now_et)
     roster = bdl_active_roster(team_short)
     if not roster:
@@ -2232,20 +2303,7 @@ def run():
 
     lines_map, _games_map = build_today_props(now_et)
 
-    news_items = fetch_lineupexperts_news(now_et) if LINEUPEXPERTS else []
-    news_boosts = build_news_boost_map(news_items) if news_items else {}
-    news_scores = build_news_score_map(news_items) if news_items else {}
-
-    if LINEUPEXPERTS:
-        print(
-            f"[INFO] LineupExperts news_items={len(news_items)} boosts={len(news_boosts)} "
-            f"lookback={NEWS_LOOKBACK_HOURS}h base_url={LINEUPEXPERTS_BASE_URL}"
-        )
-
-    boosted_names = sorted(news_boosts.keys())
-    print(f"[INFO] LE boosted player names={boosted_names}")
-
-    # warm up name cache
+    # warm up name/team cache first so LE injury mapping can use it
     season = _season_year(now_et)
     all_prop_pids = []
     for pt in PROP_TYPES:
@@ -2269,6 +2327,19 @@ def run():
                     bdl_last_n_games_threes(chunk_ids, season, max(LOOKBACK_GAMES, 8))
                 except Exception as e:
                     print(f"[WARN] warmup threes failed: {e}")
+
+    news_items = fetch_lineupexperts_news(now_et) if LINEUPEXPERTS else []
+    news_boosts = build_news_boost_map(news_items) if news_items else {}
+    news_scores = build_news_score_map(news_items) if news_items else {}
+
+    if LINEUPEXPERTS:
+        print(
+            f"[INFO] LineupExperts news_items={len(news_items)} boosts={len(news_boosts)} "
+            f"lookback={NEWS_LOOKBACK_HOURS}h base_url={LINEUPEXPERTS_BASE_URL}"
+        )
+
+    boosted_names = sorted(news_boosts.keys())
+    print(f"[INFO] LE boosted player names={boosted_names}")
 
     le_watchlist = []
     le_watch_seen = set()
@@ -2320,6 +2391,9 @@ def run():
                 team_short = normalize_team_name(cur.get("team", ""))
                 injured_name = cur.get("name", "")
                 injured_status = (cur.get("status") or "").strip()
+
+                if not team_short:
+                    team_short = find_team_for_player_from_cache(injured_name)
 
                 print(f"[INFO] LE injury candidate: {injured_name} | team={team_short} | status={injured_status}")
 
@@ -2380,7 +2454,7 @@ def run():
                     if not (is_new or is_changed):
                         continue
 
-                team_short = cur.get("team", "")
+                team_short = normalize_team_name(cur.get("team", ""))
                 injured_name = cur.get("name", "")
                 injured_status = (cur.get("status") or "").strip()
 
