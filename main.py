@@ -104,7 +104,7 @@ BET_COOLDOWN_MIN = int(os.environ.get("BET_COOLDOWN_MIN", "180"))
 EDGE_JUMP_TO_RESEND = float(os.environ.get("EDGE_JUMP_TO_RESEND", "1.5"))
 
 # Runtime guard
-RUN_MAX_SECONDS = int(os.environ.get("RUN_MAX_SECONDS", "170"))
+RUN_MAX_SECONDS = int(os.environ.get("RUN_MAX_SECONDS", "250"))
 STAT_BATCH_SIZE = int(os.environ.get("STAT_BATCH_SIZE", "90"))
 
 DEBUG_PROP_SAMPLE_TYPES = os.environ.get("DEBUG_PROP_SAMPLE_TYPES", "0").strip().lower()
@@ -1162,10 +1162,10 @@ def parse_injuries(data):
 BDL_HEADERS = {"Authorization": BALLDONTLIE_API_KEY}
 BDL_PREFIXES = ["/nba", ""]
 
-BDL_MAX_RETRIES = int(os.environ.get("BDL_MAX_RETRIES", "5"))
-BDL_RETRY_BASE_SEC = float(os.environ.get("BDL_RETRY_BASE_SEC", "1.5"))
+BDL_MAX_RETRIES = int(os.environ.get("BDL_MAX_RETRIES", "3"))
+BDL_RETRY_BASE_SEC = float(os.environ.get("BDL_RETRY_BASE_SEC", "0.8"))
 BDL_PER_PAGE = int(os.environ.get("BDL_PER_PAGE", "100"))
-BDL_MAX_PAGES = int(os.environ.get("BDL_MAX_PAGES", "10"))
+BDL_MAX_PAGES = int(os.environ.get("BDL_MAX_PAGES", "5"))
 
 TEAM_CACHE = None
 PLAYER_NAME_CACHE = {}
@@ -3410,34 +3410,43 @@ def run():
                 except Exception as e:
                     print(f"[WARN] warmup threes failed: {e}")
 
-        # God Tier: fetch advanced stats for all players with props today
-        print(f"[INFO] Fetching advanced stats for {len(all_prop_pids)} players...")
+        # God Tier: fetch advanced stats -- time-budgeted
         adv_stats_all = {}
+        adv_deadline = time.time() + 40  # max 40s for advanced stats
+        print(f"[INFO] Fetching advanced stats for {len(all_prop_pids)} players...")
         for chunk_ids in _chunk(all_prop_pids, STAT_BATCH_SIZE):
-            if deadline_exceeded():
+            if deadline_exceeded() or time.time() > adv_deadline:
+                print(f"[INFO] Advanced stats time budget reached, stopping early")
                 break
             try:
                 chunk_adv = bdl_fetch_advanced_stats(chunk_ids, season)
                 adv_stats_all.update(chunk_adv)
             except Exception as e:
                 print(f"[WARN] advanced stats warmup failed: {e}")
+                break
         print(f"[INFO] Advanced stats loaded for {len(adv_stats_all)} players | positions cached: {len(PLAYER_POS_CACHE)}")
 
-        # Pre-fetch lineups for today's games
-        print(f"[INFO] Fetching lineups for {len(games_map)} games...")
-        for gid_lineup in list(games_map.keys()):
-            if deadline_exceeded():
-                break
-            try:
-                bdl_fetch_lineups(gid_lineup)
-            except Exception as e:
-                print(f"[WARN] lineup fetch failed gid={gid_lineup}: {e}")
-        starters = sum(1 for e in LINEUP_CACHE.values() for x in e if x.get("starter"))
-        print(f"[INFO] Lineups loaded, confirmed starters: {starters}")
+        # Pre-fetch lineups -- 10s budget, skip if early in day
+        now_hour = now_et.hour
+        if now_hour >= 15:  # only fetch lineups after 3pm ET
+            print(f"[INFO] Fetching lineups for {len(games_map)} games...")
+            lineup_deadline = time.time() + 10
+            for gid_lineup in list(games_map.keys()):
+                if deadline_exceeded() or time.time() > lineup_deadline:
+                    break
+                try:
+                    bdl_fetch_lineups(gid_lineup)
+                except Exception as e:
+                    pass
+            starters = sum(1 for e in LINEUP_CACHE.values() for x in e if x.get("starter"))
+            print(f"[INFO] Lineups loaded, confirmed starters: {starters}")
+        else:
+            print(f"[INFO] Skipping lineup fetch before 3pm ET (lineups not posted yet)")
 
-        # Pre-fetch game odds for all games
+        # Pre-fetch game odds -- 15s budget
+        odds_deadline = time.time() + 15
         for gid_odds in list(games_map.keys()):
-            if deadline_exceeded():
+            if deadline_exceeded() or time.time() > odds_deadline:
                 break
             try:
                 bdl_fetch_game_odds_full(gid_odds)
