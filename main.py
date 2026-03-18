@@ -27,7 +27,7 @@ twilio = Client(TWILIO_SID, TWILIO_TOKEN)
 TEST_MODE = os.environ.get("TEST_MODE", "0") == "1"
 MAX_BODY_CHARS = int(os.environ.get("MAX_BODY_CHARS", "1500"))
 
-BOOK_VENDOR_RAW = os.environ.get("BOOK_VENDORS", os.environ.get("BOOK_VENDOR", "fanduel")).strip().lower()
+BOOK_VENDOR_RAW = os.environ.get("BOOK_VENDORS", os.environ.get("BOOK_VENDOR", "fanduel,draftkings")).strip().lower()
 BOOK_VENDORS = [v.strip() for v in BOOK_VENDOR_RAW.split(",") if v.strip()]
 
 PROP_TYPES_RAW = os.environ.get("PROP_TYPES", "points").strip().lower()
@@ -43,11 +43,11 @@ MAX_PLAYS_PER_GAME = int(os.environ.get("MAX_PLAYS_PER_GAME", "4"))
 # Card composition caps
 MAX_INJURY_PLAYS = int(os.environ.get("MAX_INJURY_PLAYS", "6"))
 MAX_LINEUPNEWS_PLAYS = int(os.environ.get("MAX_LINEUPNEWS_PLAYS", "4"))
-MAX_SLATE_PLAYS = int(os.environ.get("MAX_SLATE_PLAYS", "5"))
+MAX_SLATE_PLAYS = int(os.environ.get("MAX_SLATE_PLAYS", "6"))
 
 # Consensus + steam + EV + market respect
-MIN_VENDORS_FOR_CONSENSUS = int(os.environ.get("MIN_VENDORS_FOR_CONSENSUS", "2"))
-MIN_SHARP_VENDORS = int(os.environ.get("MIN_SHARP_VENDORS", "1"))
+MIN_VENDORS_FOR_CONSENSUS = int(os.environ.get("MIN_VENDORS_FOR_CONSENSUS", "1"))
+MIN_SHARP_VENDORS = int(os.environ.get("MIN_SHARP_VENDORS", "0"))
 SHARP_VENDORS_RAW = os.environ.get(
     "SHARP_VENDORS",
     "draftkings,caesars,betmgm,bet365,pointsbet,hardrock,betparx,betway,betrivers",
@@ -84,7 +84,7 @@ VALUE_EDGE_MIN = float(os.environ.get("VALUE_EDGE_MIN", "0.00"))
 
 # Guardrails
 MIN_L10_MIN = float(os.environ.get("MIN_L10_MIN", "8"))
-LINE_MIN_GAP = float(os.environ.get("LINE_MIN_GAP", "8.0"))
+LINE_MIN_GAP = float(os.environ.get("LINE_MIN_GAP", "12.0"))
 ROLE_DROP_MIN = float(os.environ.get("ROLE_DROP_MIN", "5.0"))
 ROLE_DROP_RATE = float(os.environ.get("ROLE_DROP_RATE", "0.08"))
 
@@ -110,14 +110,14 @@ STAT_BATCH_SIZE = int(os.environ.get("STAT_BATCH_SIZE", "90"))
 DEBUG_PROP_SAMPLE_TYPES = os.environ.get("DEBUG_PROP_SAMPLE_TYPES", "0").strip().lower()
 
 # Plus odds
-PLUS_ODDS_MIN = float(os.environ.get("PLUS_ODDS_MIN", "100"))
-PLUS_ODDS_TOPN = int(os.environ.get("PLUS_ODDS_TOPN", "3"))
+PLUS_ODDS_MIN = float(os.environ.get("PLUS_ODDS_MIN", "-105"))
+PLUS_ODDS_TOPN = int(os.environ.get("PLUS_ODDS_TOPN", "5"))
 
 PLUS_HUNT_ENABLED = os.environ.get("PLUS_HUNT_ENABLED", "1") == "1"
-PLUS_HUNT_MIN_PROB = float(os.environ.get("PLUS_HUNT_MIN_PROB", "0.52"))
-PLUS_HUNT_MIN_VALUE_EDGE = float(os.environ.get("PLUS_HUNT_MIN_VALUE_EDGE", "0.03"))
+PLUS_HUNT_MIN_PROB = float(os.environ.get("PLUS_HUNT_MIN_PROB", "0.54"))
+PLUS_HUNT_MIN_VALUE_EDGE = float(os.environ.get("PLUS_HUNT_MIN_VALUE_EDGE", "0.02"))
 PLUS_HUNT_MIN_EV = float(os.environ.get("PLUS_HUNT_MIN_EV", "0.01"))
-PLUS_HUNT_TOPN = int(os.environ.get("PLUS_HUNT_TOPN", "5"))
+PLUS_HUNT_TOPN = int(os.environ.get("PLUS_HUNT_TOPN", "7"))
 
 # Threes
 THREES_BETA_BINOM = os.environ.get("THREES_BETA_BINOM", "1") == "1"
@@ -157,6 +157,19 @@ FINAL_SCORE_VOL_PENALTY_W = float(os.environ.get("FINAL_SCORE_VOL_PENALTY_W", "6
 HOME_COURT_BOOST = float(os.environ.get("HOME_COURT_BOOST", "1.5"))
 # B2B fatigue penalty: second night of back-to-back games
 B2B_PENALTY = float(os.environ.get("B2B_PENALTY", "2.0"))
+# Rest advantage: pts boost per extra rest day beyond 1 (capped at 3 days)
+REST_BOOST_PER_DAY = float(os.environ.get("REST_BOOST_PER_DAY", "0.5"))
+# Game total thresholds for pace scaling
+GAME_TOTAL_HIGH = float(os.environ.get("GAME_TOTAL_HIGH", "228.0"))
+GAME_TOTAL_LOW = float(os.environ.get("GAME_TOTAL_LOW", "212.0"))
+GAME_TOTAL_BOOST = float(os.environ.get("GAME_TOTAL_BOOST", "0.04"))
+# Blowout risk: if spread >= this, penalize favorite star players in 4th qtr
+BLOWOUT_SPREAD_MIN = float(os.environ.get("BLOWOUT_SPREAD_MIN", "12.0"))
+BLOWOUT_PENALTY = float(os.environ.get("BLOWOUT_PENALTY", "1.5"))
+# Usage rate weight in projection (0=off, 1=full weight)
+USAGE_RATE_WEIGHT = float(os.environ.get("USAGE_RATE_WEIGHT", "0.15"))
+# Closing line value tracking
+ENABLE_CLV_TRACKING = os.environ.get("ENABLE_CLV_TRACKING", "1") == "1"
 # Pace factor weight: how much opponent pace affects projection (0.0 = off)
 PACE_FACTOR_WEIGHT = float(os.environ.get("PACE_FACTOR_WEIGHT", "0.5"))
 # Enable opponent defensive stats adjustment
@@ -199,42 +212,106 @@ PLAYER_TEAM_OVERRIDES = {
 # pts_allowed_pg: average points allowed per game this season (league avg ~113)
 # pace: possessions per 48 min (league avg ~99)
 # Positive pace = faster = more possessions = more pts scoring opportunities
+# pts_vs_pg = pts allowed to point guards per game
+# pts_vs_sg = pts allowed to shooting guards
+# pts_vs_sf = pts allowed to small forwards
+# pts_vs_pf = pts allowed to power forwards
+# pts_vs_c  = pts allowed to centers
+# League avg per position: PG=27, SG=24, SF=22, PF=22, C=24
 TEAM_DEFENSE_RATINGS: dict[str, dict] = {
-    "Celtics":      {"pts_allowed_pg": 107.5, "pace": 97.5},
-    "Bucks":        {"pts_allowed_pg": 112.0, "pace": 100.2},
-    "Knicks":       {"pts_allowed_pg": 110.3, "pace": 96.8},
-    "Heat":         {"pts_allowed_pg": 109.4, "pace": 96.3},
-    "76ers":        {"pts_allowed_pg": 113.2, "pace": 98.1},
-    "Nets":         {"pts_allowed_pg": 117.8, "pace": 99.4},
-    "Raptors":      {"pts_allowed_pg": 115.6, "pace": 98.7},
-    "Cavaliers":    {"pts_allowed_pg": 108.1, "pace": 97.2},
-    "Pacers":       {"pts_allowed_pg": 118.4, "pace": 104.5},
-    "Bulls":        {"pts_allowed_pg": 114.9, "pace": 99.8},
-    "Bucks":        {"pts_allowed_pg": 112.0, "pace": 100.2},
-    "Pistons":      {"pts_allowed_pg": 116.2, "pace": 98.9},
-    "Hawks":        {"pts_allowed_pg": 116.8, "pace": 101.3},
-    "Hornets":      {"pts_allowed_pg": 118.1, "pace": 100.6},
-    "Magic":        {"pts_allowed_pg": 108.9, "pace": 96.1},
-    "Wizards":      {"pts_allowed_pg": 119.3, "pace": 100.4},
-    "Thunder":      {"pts_allowed_pg": 106.8, "pace": 98.3},
-    "Nuggets":      {"pts_allowed_pg": 111.7, "pace": 97.9},
-    "Timberwolves": {"pts_allowed_pg": 108.2, "pace": 97.6},
-    "Jazz":         {"pts_allowed_pg": 118.9, "pace": 101.8},
-    "Suns":         {"pts_allowed_pg": 113.5, "pace": 99.1},
-    "Clippers":     {"pts_allowed_pg": 111.1, "pace": 97.4},
-    "Lakers":       {"pts_allowed_pg": 113.8, "pace": 99.5},
-    "Warriors":     {"pts_allowed_pg": 113.1, "pace": 100.1},
-    "Kings":        {"pts_allowed_pg": 116.3, "pace": 101.9},
-    "Mavericks":    {"pts_allowed_pg": 110.4, "pace": 98.6},
-    "Rockets":      {"pts_allowed_pg": 109.3, "pace": 98.4},
-    "Spurs":        {"pts_allowed_pg": 119.7, "pace": 102.1},
-    "Pelicans":     {"pts_allowed_pg": 112.6, "pace": 98.8},
-    "Grizzlies":    {"pts_allowed_pg": 114.7, "pace": 99.3},
-    "Blazers":      {"pts_allowed_pg": 118.5, "pace": 101.5},
+    "Celtics":      {"pts_allowed_pg": 107.5, "pace": 97.5,  "pts_vs_pg": 24.1, "pts_vs_sg": 21.8, "pts_vs_sf": 19.9, "pts_vs_pf": 20.1, "pts_vs_c": 21.6},
+    "Bucks":        {"pts_allowed_pg": 112.0, "pace": 100.2, "pts_vs_pg": 26.8, "pts_vs_sg": 23.5, "pts_vs_sf": 22.1, "pts_vs_pf": 22.4, "pts_vs_c": 23.2},
+    "Knicks":       {"pts_allowed_pg": 110.3, "pace": 96.8,  "pts_vs_pg": 25.4, "pts_vs_sg": 22.7, "pts_vs_sf": 21.3, "pts_vs_pf": 21.8, "pts_vs_c": 22.9},
+    "Heat":         {"pts_allowed_pg": 109.4, "pace": 96.3,  "pts_vs_pg": 25.1, "pts_vs_sg": 22.3, "pts_vs_sf": 20.8, "pts_vs_pf": 21.2, "pts_vs_c": 22.4},
+    "76ers":        {"pts_allowed_pg": 113.2, "pace": 98.1,  "pts_vs_pg": 27.3, "pts_vs_sg": 24.1, "pts_vs_sf": 22.6, "pts_vs_pf": 22.9, "pts_vs_c": 23.8},
+    "Nets":         {"pts_allowed_pg": 117.8, "pace": 99.4,  "pts_vs_pg": 29.2, "pts_vs_sg": 25.8, "pts_vs_sf": 24.3, "pts_vs_pf": 24.7, "pts_vs_c": 25.6},
+    "Raptors":      {"pts_allowed_pg": 115.6, "pace": 98.7,  "pts_vs_pg": 28.1, "pts_vs_sg": 24.8, "pts_vs_sf": 23.4, "pts_vs_pf": 23.8, "pts_vs_c": 24.7},
+    "Cavaliers":    {"pts_allowed_pg": 108.1, "pace": 97.2,  "pts_vs_pg": 24.8, "pts_vs_sg": 22.1, "pts_vs_sf": 20.6, "pts_vs_pf": 20.9, "pts_vs_c": 22.1},
+    "Pacers":       {"pts_allowed_pg": 118.4, "pace": 104.5, "pts_vs_pg": 29.6, "pts_vs_sg": 26.2, "pts_vs_sf": 24.7, "pts_vs_pf": 25.1, "pts_vs_c": 26.0},
+    "Bulls":        {"pts_allowed_pg": 114.9, "pace": 99.8,  "pts_vs_pg": 27.8, "pts_vs_sg": 24.6, "pts_vs_sf": 23.1, "pts_vs_pf": 23.5, "pts_vs_c": 24.4},
+    "Pistons":      {"pts_allowed_pg": 116.2, "pace": 98.9,  "pts_vs_pg": 28.4, "pts_vs_sg": 25.1, "pts_vs_sf": 23.7, "pts_vs_pf": 24.1, "pts_vs_c": 25.0},
+    "Hawks":        {"pts_allowed_pg": 116.8, "pace": 101.3, "pts_vs_pg": 28.7, "pts_vs_sg": 25.4, "pts_vs_sf": 23.9, "pts_vs_pf": 24.3, "pts_vs_c": 25.2},
+    "Hornets":      {"pts_allowed_pg": 118.1, "pace": 100.6, "pts_vs_pg": 29.3, "pts_vs_sg": 25.9, "pts_vs_sf": 24.4, "pts_vs_pf": 24.8, "pts_vs_c": 25.7},
+    "Magic":        {"pts_allowed_pg": 108.9, "pace": 96.1,  "pts_vs_pg": 25.2, "pts_vs_sg": 22.4, "pts_vs_sf": 21.0, "pts_vs_pf": 21.3, "pts_vs_c": 22.5},
+    "Wizards":      {"pts_allowed_pg": 119.3, "pace": 100.4, "pts_vs_pg": 29.8, "pts_vs_sg": 26.4, "pts_vs_sf": 24.9, "pts_vs_pf": 25.3, "pts_vs_c": 26.2},
+    "Thunder":      {"pts_allowed_pg": 106.8, "pace": 98.3,  "pts_vs_pg": 23.8, "pts_vs_sg": 21.2, "pts_vs_sf": 19.7, "pts_vs_pf": 20.0, "pts_vs_c": 21.3},
+    "Nuggets":      {"pts_allowed_pg": 111.7, "pace": 97.9,  "pts_vs_pg": 26.4, "pts_vs_sg": 23.4, "pts_vs_sf": 22.0, "pts_vs_pf": 22.3, "pts_vs_c": 23.1},
+    "Timberwolves": {"pts_allowed_pg": 108.2, "pace": 97.6,  "pts_vs_pg": 24.9, "pts_vs_sg": 22.1, "pts_vs_sf": 20.7, "pts_vs_pf": 21.0, "pts_vs_c": 22.2},
+    "Jazz":         {"pts_allowed_pg": 118.9, "pace": 101.8, "pts_vs_pg": 29.5, "pts_vs_sg": 26.1, "pts_vs_sf": 24.6, "pts_vs_pf": 25.0, "pts_vs_c": 25.9},
+    "Suns":         {"pts_allowed_pg": 113.5, "pace": 99.1,  "pts_vs_pg": 27.5, "pts_vs_sg": 24.3, "pts_vs_sf": 22.8, "pts_vs_pf": 23.2, "pts_vs_c": 24.1},
+    "Clippers":     {"pts_allowed_pg": 111.1, "pace": 97.4,  "pts_vs_pg": 26.2, "pts_vs_sg": 23.2, "pts_vs_sf": 21.8, "pts_vs_pf": 22.1, "pts_vs_c": 23.0},
+    "Lakers":       {"pts_allowed_pg": 113.8, "pace": 99.5,  "pts_vs_pg": 27.6, "pts_vs_sg": 24.4, "pts_vs_sf": 22.9, "pts_vs_pf": 23.3, "pts_vs_c": 24.2},
+    "Warriors":     {"pts_allowed_pg": 113.1, "pace": 100.1, "pts_vs_pg": 27.3, "pts_vs_sg": 24.1, "pts_vs_sf": 22.7, "pts_vs_pf": 23.0, "pts_vs_c": 23.9},
+    "Kings":        {"pts_allowed_pg": 116.3, "pace": 101.9, "pts_vs_pg": 28.5, "pts_vs_sg": 25.2, "pts_vs_sf": 23.7, "pts_vs_pf": 24.1, "pts_vs_c": 25.0},
+    "Mavericks":    {"pts_allowed_pg": 110.4, "pace": 98.6,  "pts_vs_pg": 26.1, "pts_vs_sg": 23.1, "pts_vs_sf": 21.7, "pts_vs_pf": 22.0, "pts_vs_c": 22.9},
+    "Rockets":      {"pts_allowed_pg": 109.3, "pace": 98.4,  "pts_vs_pg": 25.7, "pts_vs_sg": 22.8, "pts_vs_sf": 21.4, "pts_vs_pf": 21.7, "pts_vs_c": 22.6},
+    "Spurs":        {"pts_allowed_pg": 119.7, "pace": 102.1, "pts_vs_pg": 30.1, "pts_vs_sg": 26.6, "pts_vs_sf": 25.1, "pts_vs_pf": 25.5, "pts_vs_c": 26.4},
+    "Pelicans":     {"pts_allowed_pg": 112.6, "pace": 98.8,  "pts_vs_pg": 26.9, "pts_vs_sg": 23.8, "pts_vs_sf": 22.4, "pts_vs_pf": 22.7, "pts_vs_c": 23.6},
+    "Grizzlies":    {"pts_allowed_pg": 114.7, "pace": 99.3,  "pts_vs_pg": 27.9, "pts_vs_sg": 24.7, "pts_vs_sf": 23.2, "pts_vs_pf": 23.6, "pts_vs_c": 24.5},
+    "Blazers":      {"pts_allowed_pg": 118.5, "pace": 101.5, "pts_vs_pg": 29.4, "pts_vs_sg": 26.0, "pts_vs_sf": 24.5, "pts_vs_pf": 24.9, "pts_vs_c": 25.8},
 }
 
 LEAGUE_AVG_PTS_ALLOWED = 113.5
 LEAGUE_AVG_PACE = 99.0
+# League avg pts allowed per position
+LEAGUE_AVG_VS_POS = {"pg": 27.0, "sg": 24.0, "sf": 22.0, "pf": 22.0, "c": 24.0}
+
+# Player position map -- add players as you learn their positions
+# Format: cleaned_name -> position (pg/sg/sf/pf/c)
+PLAYER_POSITION_MAP: dict[str, str] = {
+    "donovan mitchell": "sg",
+    "de aaron fox": "pg",
+    "deaaron fox": "pg",
+    "stephen curry": "pg",
+    "lebron james": "sf",
+    "kevin durant": "sf",
+    "giannis antetokounmpo": "pf",
+    "joel embiid": "c",
+    "nikola jokic": "c",
+    "luka doncic": "pg",
+    "jayson tatum": "sf",
+    "jaylen brown": "sg",
+    "damian lillard": "pg",
+    "trae young": "pg",
+    "shai gilgeous alexander": "pg",
+    "devin booker": "sg",
+    "anthony edwards": "sg",
+    "tyrese haliburton": "pg",
+    "bam adebayo": "c",
+    "karl-anthony towns": "c",
+    "karl anthony towns": "c",
+    "pascal siakam": "pf",
+    "julius randle": "pf",
+    "zion williamson": "pf",
+    "brandon ingram": "sf",
+    "ja morant": "pg",
+    "desmond bane": "sg",
+    "jaren jackson jr": "pf",
+    "cade cunningham": "pg",
+    "lauri markkanen": "pf",
+    "walker kessler": "c",
+    "victor wembanyama": "c",
+    "harrison barnes": "sf",
+    "domantas sabonis": "c",
+    "de aaron fox": "pg",
+    "keegan murray": "sf",
+    "coby white": "pg",
+    "zach lavine": "sg",
+    "nikola vucevic": "c",
+    "scottie barnes": "pf",
+    "rg3": "c",
+    "evan mobley": "c",
+    "darius garland": "pg",
+    "jalen brunson": "pg",
+    "og anunoby": "sf",
+    "mikal bridges": "sg",
+    "anthony davis": "c",
+    "austin reaves": "sg",
+    "tyrese maxey": "pg",
+    "paul george": "sf",
+    "kawhi leonard": "sf",
+    "james harden": "pg",
+}
 
 
 def deadline_exceeded() -> bool:
@@ -398,17 +475,232 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 # -------------------- NEW: OPPONENT DEFENSIVE ADJUSTMENT --------------------
-def opponent_defense_adjustment(opponent_team: str, prop_type: str) -> tuple[float, str]:
+def get_rest_days(games: list, today_str: str) -> int:
     """
-    IMPROVEMENT: Replaces the stub matchup_adjustment() that always returned 0.0.
+    Calculate days of rest since last game.
+    0 = played yesterday (B2B), 1 = one day rest, 2+ = well rested.
+    Returns -1 if unknown.
+    """
+    if not games:
+        return -1
+    try:
+        today = datetime.strptime(today_str, "%Y-%m-%d").date()
+        for g in reversed(games):
+            try:
+                gdate = datetime.strptime(g[0][:10], "%Y-%m-%d").date()
+                if gdate < today:
+                    return (today - gdate).days - 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return -1
 
-    Returns (multiplier_delta, note) where multiplier_delta is added to 1.0
-    to scale the projection. E.g. +0.06 means project 6% more pts vs weak defense.
 
-    Logic:
-    - Compare opponent's pts_allowed_pg to league average
-    - Every 5 pts above league avg = +4% scoring opportunity
-    - Pace adjustment: every 2 possessions above league avg = +1%
+def rest_day_adjustment(games: list, today_str: str) -> tuple[float, str]:
+    """
+    Rest advantage/penalty based on days since last game.
+    B2B (0 rest days) = already handled by B2B_PENALTY.
+    1 day rest = neutral baseline.
+    2 days rest = +0.5 pts.
+    3+ days rest = +1.0 pts.
+    """
+    rest = get_rest_days(games, today_str)
+    if rest < 0:
+        return 0.0, ""
+    if rest == 0:
+        return 0.0, "b2b"  # handled separately
+    if rest == 1:
+        return 0.0, "1d-rest"
+    extra = min(rest - 1, 2)  # cap at 2 extra days
+    boost = extra * REST_BOOST_PER_DAY
+    return boost, f"{rest}d-rest(+{boost:.1f})"
+
+
+def game_total_adjustment(game_total: float) -> tuple[float, str]:
+    """
+    Scale projection based on game over/under total.
+    High-total games = more possessions = more scoring opportunities.
+    Low-total games = slower pace = fewer points for everyone.
+    """
+    if game_total <= 0:
+        return 0.0, ""
+    if game_total >= GAME_TOTAL_HIGH:
+        adj = GAME_TOTAL_BOOST
+        return adj, f"high-total({game_total:.0f},+{adj*100:.0f}%)"
+    if game_total <= GAME_TOTAL_LOW:
+        adj = -GAME_TOTAL_BOOST
+        return adj, f"low-total({game_total:.0f},{adj*100:.0f}%)"
+    return 0.0, f"avg-total({game_total:.0f})"
+
+
+def blowout_risk_penalty(spread: float, is_favorite: bool) -> tuple[float, str]:
+    """
+    Penalize star players on heavy favorites.
+    In blowouts, stars sit in the 4th quarter -- kills prop totals.
+    spread = absolute value of the point spread (e.g. 14.5)
+    is_favorite = True if this player is on the favored team
+    """
+    if not is_favorite or spread < BLOWOUT_SPREAD_MIN:
+        return 0.0, ""
+    penalty = BLOWOUT_PENALTY * min(1.0, (spread - BLOWOUT_SPREAD_MIN) / 6.0 + 0.5)
+    return -penalty, f"blowout-risk(-{penalty:.1f})"
+
+
+def usage_rate_adjustment(games: list, prop_type: str) -> tuple[float, str]:
+    """
+    Usage rate adjustment -- players with high usage score more per minute.
+    Approximated from scoring rate vs team average in available data.
+
+    High usage (>28%): boost rate by up to 8%
+    Low usage (<18%): penalize rate by up to 8%
+
+    We estimate usage from pts_per_min relative to a typical starter (0.55 pts/min).
+    """
+    if prop_type != "points" or not games or USAGE_RATE_WEIGHT <= 0:
+        return 0.0, ""
+
+    sl = _slice_last(games, LOOKBACK_GAMES)
+    if len(sl) < 5:
+        return 0.0, ""
+
+    avg_pts, avg_min, _ = avg_stat_min_std(sl)
+    if avg_min < 10:
+        return 0.0, ""
+
+    pts_per_min = avg_pts / max(avg_min, 1e-6)
+    # Typical starter scores ~0.55 pts/min in ~30 min
+    BASELINE_RATE = 0.55
+    usage_proxy = pts_per_min / BASELINE_RATE  # >1 = high usage, <1 = low usage
+
+    # Scale: 20% above baseline rate = +8% boost, capped at 12%
+    adj = _clamp((usage_proxy - 1.0) * 0.40 * USAGE_RATE_WEIGHT, -0.10, 0.12)
+
+    if adj > 0.03:
+        return adj, f"high-usage(+{adj*100:.0f}%)"
+    if adj < -0.03:
+        return adj, f"low-usage({adj*100:.0f}%)"
+    return 0.0, ""
+
+
+def track_closing_line_value(play: dict, now_ts: int):
+    """
+    Closing Line Value (CLV) tracking.
+    The most important metric for long-term edge verification.
+
+    A model that consistently beats the closing line has PROVEN edge.
+    We log the line at time of bet -- compare to closing line later.
+
+    How to use: After tip-off, note what the final line was.
+    If your model consistently had the over at a lower line than closing,
+    that means you got better of the number -- that is real alpha.
+    """
+    if not ENABLE_CLV_TRACKING:
+        return
+    try:
+        if os.path.exists(RESULTS_FILE):
+            with open(RESULTS_FILE, "r") as f:
+                log = json.load(f)
+        else:
+            log = {}
+
+        date_str = datetime.fromtimestamp(now_ts, tz=ET).strftime("%Y-%m-%d")
+        key = f"{play['prop_type']}|{play['player_id']}|{play.get('cons_line', play['line']):.1f}|{date_str}"
+
+        if key in log:
+            log[key]["open_line"] = play.get("cons_line", play["line"])
+            log[key]["open_odds"] = play.get("over_odds")
+            log[key]["close_line"] = None   # fill in manually after tip
+            log[key]["clv"] = None          # close_line - open_line (positive = beat the close)
+
+        with open(RESULTS_FILE, "w") as f:
+            json.dump(log, f, indent=2, sort_keys=True)
+    except Exception:
+        pass
+
+
+def get_game_total_from_odds(gid: int, games_map: dict) -> float:
+    """
+    Fetch game over/under total from BallDontLie odds.
+    Returns 0.0 if not available -- caller handles gracefully.
+    """
+    if not gid:
+        return 0.0
+    try:
+        resp = _bdl_get("/v2/odds/game_odds", params={"game_id": int(gid)})
+        for market in (resp.get("data") or []):
+            mtype = (market.get("type") or "").lower()
+            if "total" in mtype or "over_under" in mtype:
+                total = market.get("total") or market.get("line_value")
+                if total:
+                    return float(total)
+    except Exception:
+        pass
+    return 0.0
+
+
+def get_spread_from_odds(gid: int, player_team: str, games_map: dict) -> tuple[float, bool]:
+    """
+    Fetch point spread for the game.
+    Returns (spread, is_favorite) -- spread is absolute value.
+    is_favorite = True if player_team is favored.
+    """
+    if not gid:
+        return 0.0, False
+    try:
+        resp = _bdl_get("/v2/odds/game_odds", params={"game_id": int(gid)})
+        for market in (resp.get("data") or []):
+            mtype = (market.get("type") or "").lower()
+            if "spread" in mtype or "point_spread" in mtype:
+                home_spread = market.get("home_spread") or market.get("spread")
+                if home_spread is not None:
+                    spread = float(home_spread)
+                    game = games_map.get(gid, {})
+                    home_team = normalize_team_name(game.get("home", ""))
+                    pteam = normalize_team_name(player_team)
+                    if pteam == home_team:
+                        is_fav = spread < 0
+                        return abs(spread), is_fav
+                    else:
+                        is_fav = spread > 0
+                        return abs(spread), is_fav
+    except Exception:
+        pass
+    return 0.0, False
+
+
+def get_player_position(player_name: str) -> str:
+    """Look up player position from map. Returns pg/sg/sf/pf/c or empty string."""
+    key = _clean_name(player_name)
+    if key in PLAYER_POSITION_MAP:
+        return PLAYER_POSITION_MAP[key]
+    for k, v in PLAYER_POSITION_MAP.items():
+        if k in key or key in k:
+            return v
+    return ""
+
+
+
+    """Look up player position from map. Returns pg/sg/sf/pf/c or empty string."""
+    key = _clean_name(player_name)
+    # Try direct match first
+    if key in PLAYER_POSITION_MAP:
+        return PLAYER_POSITION_MAP[key]
+    # Try partial match for names with suffixes
+    for k, v in PLAYER_POSITION_MAP.items():
+        if k in key or key in k:
+            return v
+    return ""
+
+
+def opponent_defense_adjustment(opponent_team: str, prop_type: str, player_name: str = "") -> tuple[float, str]:
+    """
+    Position-aware opponent defense adjustment.
+
+    Uses position-specific pts allowed (pg/sg/sf/pf/c) when player position
+    is known -- much more accurate than team-level defense rating.
+
+    Falls back to team-level if position unknown.
     """
     if not ENABLE_OPP_DEF_ADJ or prop_type not in ("points", "pts"):
         return 0.0, "neutral"
@@ -418,28 +710,40 @@ def opponent_defense_adjustment(opponent_team: str, prop_type: str) -> tuple[flo
     if not def_stats:
         return 0.0, "no-data"
 
-    pts_diff = def_stats["pts_allowed_pg"] - LEAGUE_AVG_PTS_ALLOWED
     pace_diff = def_stats["pace"] - LEAGUE_AVG_PACE
-
-    # Scale: +5 pts allowed above avg => +4% scoring boost for the scorer
-    pts_factor = (pts_diff / 5.0) * 0.04
     pace_factor = (pace_diff / 2.0) * 0.01 * PACE_FACTOR_WEIGHT
 
-    adj = _clamp(pts_factor + pace_factor, -0.12, 0.12)
+    # Try position-specific adjustment first
+    pos = get_player_position(player_name) if player_name else ""
+    pos_key = f"pts_vs_{pos}" if pos else None
+
+    if pos_key and pos_key in def_stats and pos in LEAGUE_AVG_VS_POS:
+        pos_allowed = def_stats[pos_key]
+        league_avg_pos = LEAGUE_AVG_VS_POS[pos]
+        pts_diff = pos_allowed - league_avg_pos
+        # Position-specific: +3 pts above avg => +4% boost
+        pts_factor = (pts_diff / 3.0) * 0.04
+        note_base = f"{pos.upper()}-def"
+    else:
+        pts_diff = def_stats["pts_allowed_pg"] - LEAGUE_AVG_PTS_ALLOWED
+        pts_factor = (pts_diff / 5.0) * 0.04
+        note_base = "team-def"
+
+    adj = _clamp(pts_factor + pace_factor, -0.15, 0.15)
 
     if adj > 0.04:
-        note = f"weak-def({opp},{def_stats['pts_allowed_pg']:.0f}ptAllowed)"
+        note = f"weak-{note_base}({opp},{adj*100:+.1f}%)"
     elif adj < -0.04:
-        note = f"strong-def({opp},{def_stats['pts_allowed_pg']:.0f}ptAllowed)"
+        note = f"strong-{note_base}({opp},{adj*100:+.1f}%)"
     else:
-        note = f"neutral-def({opp})"
+        note = f"neutral-{note_base}({opp})"
 
     return adj, note
 
 
 def matchup_adjustment(team_name: str, player_name: str, prop_type: str) -> tuple[float, str]:
-    """Kept for backward compatibility -- now delegates to opponent_defense_adjustment."""
-    return opponent_defense_adjustment(team_name, prop_type)
+    """Delegates to position-aware opponent_defense_adjustment."""
+    return opponent_defense_adjustment(team_name, prop_type, player_name)
 
 
 # -------------------- NEW: HOME/AWAY & B2B CONTEXT --------------------
@@ -713,7 +1017,7 @@ def thresholds_for_bucket(bucket: str) -> dict:
         return {"min_edge": 2.2, "min_prob": 0.60, "min_ev": 0.01, "min_value_edge": 0.01}
     if bucket == "medium":
         return {"min_edge": 2.8, "min_prob": 0.63, "min_ev": 0.02, "min_value_edge": 0.02}
-    return {"min_edge": 1.5, "min_prob": 0.57, "min_ev": 0.00, "min_value_edge": 0.00}
+    return {"min_edge": 1.2, "min_prob": 0.55, "min_ev": 0.00, "min_value_edge": 0.00}
 
 
 def minutes_stability_ok(l10_min: float, l3_min: float, le_score: float) -> bool:
@@ -1822,12 +2126,34 @@ def build_player_projection(
             matchup_score, matchup_note = opponent_defense_adjustment(opp, prop_type)
             proj *= (1.0 + matchup_score)
 
-    # IMPROVEMENT: Back-to-back penalty
+    # B2B penalty
     b2b_note = ""
     if today_str and is_back_to_back(games, today_str):
         proj -= B2B_PENALTY
         b2b_note = f"b2b(-{B2B_PENALTY:.1f}pts)"
         print(f"[INFO] B2B penalty applied: {player_name} -{B2B_PENALTY} pts")
+
+    # Rest day adjustment (bonus for well-rested players)
+    rest_boost, rest_note = rest_day_adjustment(games, today_str) if today_str else (0.0, "")
+    if rest_boost != 0.0:
+        proj += rest_boost
+
+    # Game total adjustment (high-total games = more scoring)
+    game_total = get_game_total_from_odds(gid, games_map) if gid and games_map else 0.0
+    total_adj, total_note = game_total_adjustment(game_total)
+    if total_adj != 0.0:
+        proj *= (1.0 + total_adj)
+
+    # Blowout risk penalty (stars sit in blowouts)
+    spread, is_fav = get_spread_from_odds(gid, player_team, games_map) if gid and games_map and player_team else (0.0, False)
+    blowout_adj, blowout_note = blowout_risk_penalty(spread, is_fav)
+    if blowout_adj != 0.0:
+        proj += blowout_adj
+
+    # Usage rate adjustment
+    usage_adj, usage_note = usage_rate_adjustment(games, prop_type)
+    if usage_adj != 0.0:
+        proj *= (1.0 + usage_adj)
 
     # Compute edge and probability
     if prop_type == "threes" and THREES_BETA_BINOM:
@@ -1851,6 +2177,12 @@ def build_player_projection(
         "matchup_note": matchup_note,
         "home_away_note": home_away_note,
         "b2b_note": b2b_note,
+        "rest_note": rest_note,
+        "total_note": total_note,
+        "blowout_note": blowout_note,
+        "usage_note": usage_note,
+        "game_total": game_total,
+        "spread": spread,
         "news_eff": news_eff,
         "news_why": news_why,
         "sigma": sigma,
@@ -2161,10 +2493,10 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
         bucket = player_risk_bucket(p["m10"], p["sigma"], prop_type)
         thr = thresholds_for_bucket(bucket)
 
-        slate_min_edge = max(thr["min_edge"], 2.5)
-        slate_min_prob = max(thr["min_prob"], 0.60)
-        slate_min_ev = max(thr["min_ev"], 0.01)
-        slate_min_value = max(thr["min_value_edge"], 0.01)
+        slate_min_edge = max(thr["min_edge"], 2.0)
+        slate_min_prob = max(thr["min_prob"], 0.58)
+        slate_min_ev = max(thr["min_ev"], 0.00)
+        slate_min_value = max(thr["min_value_edge"], 0.00)
 
         if p["edge"] < slate_min_edge or p["prob_over"] < slate_min_prob:
             continue
@@ -2541,6 +2873,8 @@ def record_sent(state, ideas, now_ts: int):
     for i in ideas:
         key = f"{i['prop_type']}|{i['section']}|{int(i['player_id'])}|{float(i.get('cons_line', i.get('line', 0.0))):.1f}"
         sent[key] = {"ts": now_ts, "edge": float(i.get("edge", 0.0))}
+        if ENABLE_CLV_TRACKING:
+            track_closing_line_value(i, now_ts)
     state["sent_bets"] = sent
 
 
@@ -2593,20 +2927,30 @@ def format_play_card(play: dict, idx: int) -> str:
     if m:
         matchup_hint = m.group(1)
 
-    b2b = "[WARN] B2B" if "b2b(" in why else ""
+    b2b = "[B2B]" if "b2b(" in why else ""
+    rest = ""
+    if play.get("rest_note", "") and "d-rest" in play.get("rest_note", ""):
+        rest = f"[{play['rest_note']}]"
     le_note = ""
     if play.get("le_score", 0) > 0.5:
-        le_note = "[NEWS]+"
+        le_note = "[NEWS+]"
     elif play.get("le_score", 0) < -0.5:
-        le_note = "[NEWS]-"
+        le_note = "[NEWS-]"
+    blowout = "[BLOWOUT-RISK]" if play.get("blowout_note", "") else ""
+    usage = play.get("usage_note", "")
+    usage_tag = f"[{usage}]" if usage else ""
+    total_note = play.get("total_note", "")
+    total_tag = f"[{total_note}]" if total_note and "avg" not in total_note else ""
 
     consistency = play.get("consistency", 0)
-    cons_note = f"[AIM]{consistency:.0%}" if consistency > 0 else ""
+    cons_note = f"cons:{consistency:.0%}" if consistency > 0 else ""
+
+    context = " ".join(filter(None, [b2b, rest, le_note, blowout, usage_tag, total_tag]))
 
     card = [
         f"{idx}. {tier} {name} ({team}) OVER {line:.1f}",
         f"   Proj {proj:.1f} | edge +{edge:.1f} | P={prob:.0f}% | EV={ev:+.2f}",
-        f"   {vendor} {over_odds:+d} | def:{matchup_hint} {cons_note} {le_note} {b2b}".rstrip(),
+        f"   {vendor} {over_odds:+d} | {matchup_hint} | {cons_note} {context}".rstrip().rstrip("|").strip(),
     ]
     return "\n".join(card)
 
@@ -2894,9 +3238,18 @@ def run():
         plus_bucket = plus_bucket[:PLUS_ODDS_TOPN]
 
         if plus_bucket or plus_ideas_all:
-            msg.append("[PLUS] PLUS ODDS:")
+            msg.append("[PLUS] PLUS ODDS -- bet the book shown:")
+            msg.append("")
+            seen_plus = set()
             for i in (plus_bucket + [x for x in plus_ideas_all if x not in plus_bucket])[:PLUS_ODDS_TOPN]:
-                msg.append(f"- {i['player_name']} OVER {i['cons_line']:.1f} ({i['vendor']} {int(i['over_odds']):+d}) P={i['prob_over']*100:.0f}% EV={i['ev']:+.2f}")
+                if i["player_id"] in seen_plus:
+                    continue
+                seen_plus.add(i["player_id"])
+                book = i["vendor"].upper()
+                odds = int(i["over_odds"])
+                msg.append(f"- {i.get('tier','')} {i['player_name']} OVER {i['cons_line']:.1f}")
+                msg.append(f"  BET: {book} {odds:+d} | Proj {i['proj']:.1f} | edge +{i['edge']:.1f} | P={i['prob_over']*100:.0f}% | EV={i['ev']:+.2f}")
+                msg.append("")
             msg.append("")
 
         msg.append(f"[CAPS] Caps: team<={MAX_PLAYS_PER_TEAM}, game<={MAX_PLAYS_PER_GAME}")
