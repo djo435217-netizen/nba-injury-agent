@@ -40,6 +40,11 @@ ENABLE_SLATE_SCAN = os.environ.get("ENABLE_SLATE_SCAN", "1") == "1"
 MAX_PLAYS_PER_TEAM = int(os.environ.get("MAX_PLAYS_PER_TEAM", "2"))
 MAX_PLAYS_PER_GAME = int(os.environ.get("MAX_PLAYS_PER_GAME", "4"))
 
+# Card composition caps
+MAX_INJURY_PLAYS = int(os.environ.get("MAX_INJURY_PLAYS", "4"))
+MAX_LINEUPNEWS_PLAYS = int(os.environ.get("MAX_LINEUPNEWS_PLAYS", "3"))
+MAX_SLATE_PLAYS = int(os.environ.get("MAX_SLATE_PLAYS", "2"))
+
 # Consensus + steam + EV + market respect
 MIN_VENDORS_FOR_CONSENSUS = int(os.environ.get("MIN_VENDORS_FOR_CONSENSUS", "2"))
 MIN_SHARP_VENDORS = int(os.environ.get("MIN_SHARP_VENDORS", "1"))
@@ -48,6 +53,9 @@ SHARP_VENDORS_RAW = os.environ.get(
     "draftkings,caesars,betmgm,bet365,pointsbet,hardrock,betparx,betway,betrivers",
 ).strip().lower()
 SHARP_VENDORS = {x.strip() for x in SHARP_VENDORS_RAW.split(",") if x.strip()}
+
+# Sharp-only consensus
+CONSENSUS_VENDORS = SHARP_VENDORS.copy()
 
 ENABLE_STEAM = os.environ.get("ENABLE_STEAM", "0") == "1"
 STEAM_MIN_SCORE = float(os.environ.get("STEAM_MIN_SCORE", "1.0"))
@@ -147,7 +155,6 @@ FINAL_SCORE_VOL_PENALTY_W = float(os.environ.get("FINAL_SCORE_VOL_PENALTY_W", "6
 RUN_START = time.time()
 
 # -------------------- PLAYER TEAM OVERRIDES --------------------
-# This fixes the exact LE issue in your logs where team mapping is blank.
 PLAYER_TEAM_OVERRIDES = {
     "tidjane salaun": "Hornets",
     "vit krejci": "Hawks",
@@ -374,6 +381,53 @@ def final_play_score(ev, value_edge, edge, min_conf, matchup_score, le_score, st
         + (stab_score * FINAL_SCORE_STABILITY_W)
         - (vol_pen * FINAL_SCORE_VOL_PENALTY_W)
     )
+
+
+def player_risk_bucket(l10_min: float, sigma: float | None, prop_type: str) -> str:
+    if prop_type == "threes":
+        return "high"
+    if l10_min < 18:
+        return "high"
+    if l10_min < 26:
+        return "medium"
+    if sigma is not None and sigma >= 9.0:
+        return "medium"
+    return "low"
+
+
+def thresholds_for_bucket(bucket: str) -> dict:
+    if bucket == "high":
+        return {"min_edge": 3.5, "min_prob": 0.66, "min_ev": 0.04, "min_value_edge": 0.04}
+    if bucket == "medium":
+        return {"min_edge": 2.8, "min_prob": 0.63, "min_ev": 0.02, "min_value_edge": 0.02}
+    return {"min_edge": 2.0, "min_prob": 0.60, "min_ev": 0.00, "min_value_edge": 0.00}
+
+
+def minutes_stability_ok(l10_min: float, l3_min: float, le_score: float) -> bool:
+    if abs(l3_min - l10_min) <= 3.0:
+        return True
+    if le_score >= 0.8:
+        return True
+    return False
+
+
+def threes_attempt_profile_ok(games) -> bool:
+    l10 = _slice_last(games, LOOKBACK_GAMES)
+    if len(l10) < 5:
+        return False
+
+    att = [float(x[2]) for x in l10 if float(x[2]) > 0]
+    if len(att) < 5:
+        return False
+
+    avg_att = sum(att) / len(att)
+    if avg_att < 4.0:
+        return False
+
+    if max(att) - min(att) > 6.0:
+        return False
+
+    return True
 
 
 # -------------------- TEAM ALIASES --------------------
@@ -822,7 +876,6 @@ def build_today_props(now_et: datetime):
                 market = pp.get("market") or {}
                 mtype = (market.get("type") or "").lower()
 
-                # hard filter: ignore milestones entirely
                 if mtype != "over_under":
                     continue
 
@@ -861,11 +914,10 @@ def consensus_line(rows):
         return None, 0, 0
 
     by_vendor = {}
-    sharp_count = 0
 
     for r in rows:
         v = str(r.get("vendor") or "").strip().lower()
-        if not v:
+        if not v or v not in CONSENSUS_VENDORS:
             continue
         try:
             line = float(r["line"])
@@ -875,14 +927,12 @@ def consensus_line(rows):
         if v not in by_vendor:
             by_vendor[v] = _round_to_half(line)
 
-    for v in by_vendor.keys():
-        if v in SHARP_VENDORS:
-            sharp_count += 1
-
+    sharp_count = len(by_vendor)
     lines = sorted(by_vendor.values())
     n = len(lines)
+
     if n == 0:
-        return None, 0, sharp_count
+        return None, 0, 0
 
     mid = n // 2
     if n % 2 == 1:
@@ -1462,7 +1512,7 @@ def build_injury_edges(
         return []
 
     status = (injured_status or "").lower()
-    status_mult = {"out": 1.0, "doubtful": 0.8, "questionable": 0.55}.get(status, 0.65)
+    status_mult = {"out": 1.0, "doubtful": 0.55, "questionable": 0.25}.get(status, 0.35)
 
     vac_stat = ip10 * status_mult
     vac_min = im10 * status_mult
@@ -1525,6 +1575,7 @@ def build_injury_edges(
             m10 = l10_min
             min_delta = l3_min - l10_min
             rate_delta = rate_l3 - rate_l10
+            sigma = None
         else:
             comps = compute_projection_components_points(games, line)
             base_avg = comps["base_avg"]
@@ -1541,6 +1592,7 @@ def build_injury_edges(
             m10 = l10_min
             min_delta = l3_min - l10_min
             rate_delta = rate_l3 - rate_l10
+            sigma = comps["sigma"]
 
         if m10 < MIN_L10_MIN:
             continue
@@ -1549,6 +1601,12 @@ def build_injury_edges(
 
         le_score = float(news_scores.get(_clean_name(nm), {"score": 0.0}).get("score", 0.0))
         if should_bad_role_filter(min_delta, rate_delta, le_score):
+            continue
+
+        if not minutes_stability_ok(l10_min, l3_min, le_score):
+            continue
+
+        if prop_type == "threes" and not threes_attempt_profile_ok(games):
             continue
 
         absorption = 0.0
@@ -1584,7 +1642,6 @@ def build_injury_edges(
             if prob_over is None:
                 continue
             edge = proj - line
-            sigma = None
         else:
             proj_rate = (0.45 * rate_base) + (0.35 * rate_l10) + (0.20 * rate_l3)
             proj = proj_min * proj_rate
@@ -1594,24 +1651,27 @@ def build_injury_edges(
             proj, news_eff, news_why = apply_news_to_projection(proj, boost_rec)
 
             proj *= (1.0 + matchup_score)
-            sigma = comps["sigma"]
             edge = proj - line
             z = (proj - line) / max(sigma, 1e-6)
             prob_over = _norm_cdf(z)
-
-        if edge < MIN_EDGE or prob_over < MIN_PROB:
-            continue
 
         p_over = american_to_prob(float(offer["over_odds"]))
         p_under = american_to_prob(float(offer["under_odds"]))
         p_market = p_over / max(p_over + p_under, 1e-9)
 
         value_edge = prob_over - p_market
-        if value_edge < VALUE_EDGE_MIN:
+        ev = ev_per_dollar(prob_over, float(offer["over_odds"]))
+
+        bucket = player_risk_bucket(m10, sigma, prop_type)
+        thr = thresholds_for_bucket(bucket)
+
+        if edge < thr["min_edge"] or prob_over < thr["min_prob"]:
             continue
 
-        ev = ev_per_dollar(prob_over, float(offer["over_odds"]))
-        if ev < EV_MIN:
+        if value_edge < thr["min_value_edge"]:
+            continue
+
+        if ev < thr["min_ev"]:
             continue
 
         steam = 0.0
@@ -1640,7 +1700,8 @@ def build_injury_edges(
             f"Proj {proj:.1f} vs CONS {line:.1f} (n={n_cons}, sharp={n_sharp}) | "
             f"offer {offer['vendor']} {offer['line']:.1f} ({int(offer['over_odds']):+d}) | "
             f"edge +{edge:.1f} | P≈{prob_over*100:.0f}% (mkt≈{p_market*100:.0f}%, val_edge≈{value_edge:+.2f}) | "
-            f"EV≈{ev:+.2f}/$1 | stability={stab_score:+.2f} | match={matchup_note} | steam={steam:.1f}{news_note}{news_note2}."
+            f"EV≈{ev:+.2f}/$1 | stability={stab_score:+.2f} | match={matchup_note} | "
+            f"risk={bucket} | steam={steam:.1f}{news_note}{news_note2}."
         )
 
         ideas.append(
@@ -1744,6 +1805,7 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
             min_delta = l3_min - l10_min
             rate_delta = rate_l3 - rate_l10
             m10 = l10_min
+            sigma = None
         else:
             comps = compute_projection_components_points(games, line)
             base_avg = comps["base_avg"]
@@ -1759,10 +1821,17 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
             min_delta = l3_min - l10_min
             rate_delta = rate_l3 - rate_l10
             m10 = l10_min
+            sigma = comps["sigma"]
 
         if m10 < MIN_L10_MIN:
             continue
         if should_bad_role_filter(min_delta, rate_delta, le_score):
+            continue
+
+        if not minutes_stability_ok(l10_min, l3_min, le_score):
+            continue
+
+        if prop_type == "threes" and not threes_attempt_profile_ok(games):
             continue
 
         proj_min = projected_minutes(base_min, l10_min, l3_min, min_delta, 0.0, le_score)
@@ -1781,7 +1850,6 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
             if prob_over is None:
                 continue
             edge = proj - float(line)
-            sigma = None
         else:
             proj_rate = (0.45 * rate_base) + (0.35 * rate_l10) + (0.20 * rate_l3)
             proj = proj_min * proj_rate
@@ -1790,24 +1858,32 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
             proj, news_eff, news_why = apply_news_to_projection(proj, boost_rec)
 
             proj *= (1.0 + matchup_score)
-            sigma = comps["sigma"]
             edge = proj - line
             z = (proj - line) / max(sigma, 1e-6)
             prob_over = _norm_cdf(z)
-
-        if edge < MIN_EDGE or prob_over < MIN_PROB:
-            continue
 
         p_over = american_to_prob(float(offer["over_odds"]))
         p_under = american_to_prob(float(offer["under_odds"]))
         p_market = p_over / max(p_over + p_under, 1e-9)
 
         value_edge = prob_over - p_market
-        if value_edge < VALUE_EDGE_MIN:
+        ev = ev_per_dollar(prob_over, float(offer["over_odds"]))
+
+        bucket = player_risk_bucket(m10, sigma, prop_type)
+        thr = thresholds_for_bucket(bucket)
+
+        slate_min_edge = max(thr["min_edge"], 3.5)
+        slate_min_prob = max(thr["min_prob"], 0.64)
+        slate_min_ev = max(thr["min_ev"], 0.03)
+        slate_min_value = max(thr["min_value_edge"], 0.03)
+
+        if edge < slate_min_edge or prob_over < slate_min_prob:
             continue
 
-        ev = ev_per_dollar(prob_over, float(offer["over_odds"]))
-        if ev < EV_MIN:
+        if value_edge < slate_min_value:
+            continue
+
+        if ev < slate_min_ev:
             continue
 
         steam = 0.0
@@ -1834,7 +1910,8 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
             f"Proj {proj:.1f} vs CONS {line:.1f} (n={n_cons}, sharp={n_sharp}) | "
             f"offer {offer['vendor']} {offer['line']:.1f} ({int(offer['over_odds']):+d}) | "
             f"edge +{edge:.1f} | P≈{prob_over*100:.0f}% (mkt≈{p_market*100:.0f}%, val_edge≈{value_edge:+.2f}) | "
-            f"EV≈{ev:+.2f}/$1 | stability={stab_score:+.2f} | match={matchup_note} | steam={steam:.1f}{news_note}{news_note2}."
+            f"EV≈{ev:+.2f}/$1 | stability={stab_score:+.2f} | match={matchup_note} | "
+            f"risk={bucket} | steam={steam:.1f}{news_note}{news_note2}."
         )
 
         ideas.append(
@@ -1954,6 +2031,7 @@ def lineup_news_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news
             min_delta = l3_min - l10_min
             rate_delta = rate_l3 - rate_l10
             m10 = l10_min
+            sigma = None
         else:
             comps = compute_projection_components_points(games, line)
             base_avg = comps["base_avg"]
@@ -1969,10 +2047,17 @@ def lineup_news_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news
             min_delta = l3_min - l10_min
             rate_delta = rate_l3 - rate_l10
             m10 = l10_min
+            sigma = comps["sigma"]
 
         if m10 < MIN_L10_MIN:
             continue
         if should_bad_role_filter(min_delta, rate_delta, le_score):
+            continue
+
+        if not minutes_stability_ok(l10_min, l3_min, le_score):
+            continue
+
+        if prop_type == "threes" and not threes_attempt_profile_ok(games):
             continue
 
         proj_min = projected_minutes(base_min, l10_min, l3_min, min_delta, 0.0, le_score)
@@ -1989,35 +2074,38 @@ def lineup_news_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news
             if prob_over is None:
                 continue
             edge = proj - float(line)
-            sigma = None
         else:
             proj_rate = (0.45 * rate_base) + (0.35 * rate_l10) + (0.20 * rate_l3)
             proj = proj_min * proj_rate
             proj, news_eff, news_why = apply_news_to_projection(proj, rec)
             proj *= (1.0 + matchup_score)
 
-            sigma = comps["sigma"]
             edge = proj - line
             z = (proj - line) / max(sigma, 1e-6)
             prob_over = _norm_cdf(z)
-
-        le_min_edge = max(1.5, MIN_EDGE - 1.0)
-        le_min_prob = max(0.56, MIN_PROB - 0.05)
-        le_min_value = max(0.01, VALUE_EDGE_MIN)
-
-        if edge < le_min_edge or prob_over < le_min_prob:
-            continue
 
         p_over = american_to_prob(float(offer["over_odds"]))
         p_under = american_to_prob(float(offer["under_odds"]))
         p_market = p_over / max(p_over + p_under, 1e-9)
 
         value_edge = prob_over - p_market
+        ev = ev_per_dollar(prob_over, float(offer["over_odds"]))
+
+        bucket = player_risk_bucket(m10, sigma, prop_type)
+        thr = thresholds_for_bucket(bucket)
+
+        le_min_edge = max(1.8, thr["min_edge"] - 0.5)
+        le_min_prob = max(0.58, thr["min_prob"] - 0.03)
+        le_min_value = max(0.01, thr["min_value_edge"])
+        le_min_ev = max(0.00, thr["min_ev"] - 0.01)
+
+        if edge < le_min_edge or prob_over < le_min_prob:
+            continue
+
         if value_edge < le_min_value:
             continue
 
-        ev = ev_per_dollar(prob_over, float(offer["over_odds"]))
-        if ev < EV_MIN:
+        if ev < le_min_ev:
             continue
 
         team_name = PLAYER_TEAM_CACHE.get(int(pid), "")
@@ -2033,7 +2121,7 @@ def lineup_news_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news
             f"Proj {proj:.1f} vs CONS {line:.1f} (n={n_cons}, sharp={n_sharp}) | "
             f"offer {offer['vendor']} {offer['line']:.1f} ({int(offer['over_odds']):+d}) | "
             f"edge +{edge:.1f} | P≈{prob_over*100:.0f}% (mkt≈{p_market*100:.0f}%, val_edge≈{value_edge:+.2f}) | "
-            f"EV≈{ev:+.2f}/$1 | LE_boost≈{news_eff:+.2f} ({news_why}) | match={matchup_note}."
+            f"EV≈{ev:+.2f}/$1 | LE_boost≈{news_eff:+.2f} ({news_why}) | match={matchup_note} | risk={bucket}."
         )
 
         ideas.append(
@@ -2138,6 +2226,7 @@ def plus_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, n
             min_delta = l3_min - l10_min
             rate_delta = rate_l3 - rate_l10
             m10 = l10_min
+            sigma = None
         else:
             comps = compute_projection_components_points(games, line)
             base_avg = comps["base_avg"]
@@ -2152,10 +2241,17 @@ def plus_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, n
             min_delta = l3_min - l10_min
             rate_delta = rate_l3 - rate_l10
             m10 = l10_min
+            sigma = comps["sigma"]
 
         if m10 < MIN_L10_MIN:
             continue
         if should_bad_role_filter(min_delta, rate_delta, le_score):
+            continue
+
+        if not minutes_stability_ok(l10_min, l3_min, le_score):
+            continue
+
+        if prop_type == "threes" and not threes_attempt_profile_ok(games):
             continue
 
         role_bonus = 0.0
@@ -2187,7 +2283,6 @@ def plus_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, n
             proj, news_eff, news_why = apply_news_to_projection(proj, boost_rec)
 
             proj *= (1.0 + matchup_score)
-            sigma = comps["sigma"]
             edge = proj - line
             z = (proj - line) / max(sigma, 1e-6)
             prob_over = _norm_cdf(z)
@@ -2326,6 +2421,7 @@ def run():
         f"MIN_VENDORS_FOR_CONSENSUS={MIN_VENDORS_FOR_CONSENSUS} MIN_SHARP_VENDORS={MIN_SHARP_VENDORS} "
         f"ENABLE_STEAM={int(ENABLE_STEAM)} "
         f"MAX_PLAYS_PER_TEAM={MAX_PLAYS_PER_TEAM} MAX_PLAYS_PER_GAME={MAX_PLAYS_PER_GAME} "
+        f"MAX_INJURY_PLAYS={MAX_INJURY_PLAYS} MAX_LINEUPNEWS_PLAYS={MAX_LINEUPNEWS_PLAYS} MAX_SLATE_PLAYS={MAX_SLATE_PLAYS} "
         f"THREES_BETA_BINOM={int(THREES_BETA_BINOM)} "
         f"LINEUPEXPERTS={int(LINEUPEXPERTS)} LINEUPEXPERTS_BASE_URL={LINEUPEXPERTS_BASE_URL} "
         f"LE_NEWS_ENGINE_ENABLED={int(LE_NEWS_ENGINE_ENABLED)} USE_LE_MAIN_INJURY_ENGINE={int(USE_LE_MAIN_INJURY_ENGINE)}"
@@ -2340,7 +2436,6 @@ def run():
 
     lines_map, _games_map = build_today_props(now_et)
 
-    # warm up name/team cache first so LE injury mapping can use it
     season = _season_year(now_et)
     all_prop_pids = []
     for pt in PROP_TYPES:
@@ -2600,7 +2695,7 @@ def run():
         slt.sort(key=lambda x: (x["final_score"], x["ev"], x["value_edge"]), reverse=True)
         lne.sort(key=lambda x: (x["final_score"], x["ev"], x["value_edge"]), reverse=True)
 
-        picks = inj + lne + slt
+        picks = inj[:MAX_INJURY_PLAYS] + lne[:MAX_LINEUPNEWS_PLAYS] + slt[:MAX_SLATE_PLAYS]
         if MIN_PER_MARKET > 0:
             picks = picks[:max(MIN_PER_MARKET, MAX_PER_MARKET)]
         picks = picks[:MAX_PER_MARKET]
