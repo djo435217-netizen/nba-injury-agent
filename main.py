@@ -1171,6 +1171,10 @@ TEAM_CACHE = None
 PLAYER_NAME_CACHE = {}
 PLAYER_TEAM_CACHE = {}
 PROPS_CACHE = {}
+ADV_STATS_CACHE = {}       # pid -> list of advanced stat dicts
+LINEUP_CACHE = {}          # gid -> list of lineup entries
+PLAYER_POS_CACHE = {}      # pid -> position string (from API)
+GAME_ODDS_CACHE = {}       # gid -> {"total": float, "spread": float, "fav_team": str}
 
 
 def _bdl_get(path: str, params=None, timeout: int = 20) -> dict:
@@ -1410,6 +1414,283 @@ def bdl_fetch_props_for_game(game_id: int, vendor: str | None, prop_type: str):
 
     PROPS_CACHE[key] = props
     return props
+
+
+# -------------------- BDL GOD TIER: ADVANCED STATS --------------------
+
+def bdl_fetch_advanced_stats(player_ids: list, season: int) -> dict:
+    """
+    Fetch advanced stats for players using BDL v2 endpoint.
+    Returns dict: pid -> list of per-game advanced stat dicts.
+
+    Key fields used:
+      - usage_percentage: % of team plays used by player while on floor
+      - offensive_rating: points per 100 possessions
+      - defensive_rating: points allowed per 100 possessions
+      - net_rating: off_rating - def_rating
+      - pie: player impact estimate (composite efficiency)
+      - pace: game pace (possessions per 48 min)
+      - effective_field_goal_percentage: FG quality
+    """
+    out = {int(pid): [] for pid in player_ids}
+    if not player_ids:
+        return out
+
+    # Check cache first
+    uncached = [pid for pid in player_ids if int(pid) not in ADV_STATS_CACHE]
+    if not uncached:
+        return {int(pid): ADV_STATS_CACHE.get(int(pid), []) for pid in player_ids}
+
+    cursor = None
+    pages = 0
+    while pages < BDL_MAX_PAGES and not deadline_exceeded():
+        params = {
+            "per_page": 100,
+            "seasons[]": [season],
+            "player_ids[]": uncached,
+        }
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            resp = _bdl_get("/nba/v2/stats/advanced", params=params)
+        except Exception as e:
+            print(f"[WARN] advanced stats fetch failed: {e}")
+            break
+
+        rows = resp.get("data") or []
+        for row in rows:
+            p = row.get("player") or {}
+            pid = p.get("id")
+            if pid is None:
+                continue
+            pid = int(pid)
+            if pid not in out:
+                continue
+
+            # Cache player position from API response
+            pos = (p.get("position") or "").strip().lower()
+            if pos and pid not in PLAYER_POS_CACHE:
+                # Normalize position (G->pg/sg, F->sf/pf, C->c)
+                if pos in ("g", "pg", "sg", "point guard", "shooting guard"):
+                    PLAYER_POS_CACHE[pid] = "pg" if "point" in pos else "sg"
+                elif pos in ("f", "sf", "pf", "small forward", "power forward"):
+                    PLAYER_POS_CACHE[pid] = "sf" if "small" in pos else "pf"
+                elif pos in ("c", "center"):
+                    PLAYER_POS_CACHE[pid] = "c"
+                elif pos == "g":
+                    PLAYER_POS_CACHE[pid] = "pg"
+                elif pos == "f":
+                    PLAYER_POS_CACHE[pid] = "sf"
+                else:
+                    PLAYER_POS_CACHE[pid] = pos[:2]
+
+            game = row.get("game") or {}
+            date = game.get("date")
+            if not date:
+                continue
+
+            out[pid].append({
+                "date": date,
+                "usage_pct": float(row.get("usage_percentage") or row.get("usg_pct") or 0),
+                "off_rtg": float(row.get("offensive_rating") or row.get("off_rating") or 0),
+                "def_rtg": float(row.get("defensive_rating") or row.get("def_rating") or 0),
+                "net_rtg": float(row.get("net_rating") or 0),
+                "pie": float(row.get("pie") or 0),
+                "pace": float(row.get("pace") or 0),
+                "efg_pct": float(row.get("effective_field_goal_percentage") or row.get("efg_pct") or 0),
+                "ast_pct": float(row.get("assist_percentage") or 0),
+            })
+
+        cursor = (resp.get("meta") or {}).get("next_cursor")
+        pages += 1
+        if not cursor:
+            break
+
+    # Sort and cache
+    for pid in list(out.keys()):
+        out[pid].sort(key=lambda x: x["date"])
+        ADV_STATS_CACHE[pid] = out[pid]
+
+    # Fill in cached results for any already-cached pids
+    for pid in player_ids:
+        pid = int(pid)
+        if pid not in out:
+            out[pid] = ADV_STATS_CACHE.get(pid, [])
+
+    return out
+
+
+def bdl_fetch_lineups(gid: int) -> list:
+    """
+    Fetch confirmed lineups for a game from BDL.
+    Returns list of lineup entries with player id, position, starter status.
+    Uses this to:
+    1. Confirm a player is actually starting tonight
+    2. Get their listed position for tonight specifically
+    """
+    if gid in LINEUP_CACHE:
+        return LINEUP_CACHE[gid]
+    try:
+        resp = _bdl_get("/nba/v1/lineups", params={"game_ids[]": [gid]})
+        entries = resp.get("data") or []
+        LINEUP_CACHE[gid] = entries
+        # Cache positions while we have them
+        for e in entries:
+            p = e.get("player") or {}
+            pid = p.get("id")
+            pos = (e.get("position") or p.get("position") or "").strip().lower()
+            if pid and pos and int(pid) not in PLAYER_POS_CACHE:
+                PLAYER_POS_CACHE[int(pid)] = pos[:2]
+        return entries
+    except Exception as e:
+        print(f"[WARN] lineup fetch failed gid={gid}: {e}")
+        LINEUP_CACHE[gid] = []
+        return []
+
+
+def is_player_confirmed_starter(pid: int, gid: int) -> tuple[bool, bool]:
+    """
+    Check if player is confirmed in lineup and whether they are starting.
+    Returns (is_in_lineup, is_starter).
+    If lineup not yet posted, returns (False, False) -- don't filter on this.
+    """
+    entries = bdl_fetch_lineups(gid)
+    if not entries:
+        return False, False
+    for e in entries:
+        p = e.get("player") or {}
+        if p.get("id") and int(p["id"]) == int(pid):
+            return True, bool(e.get("starter", False))
+    return False, False
+
+
+def bdl_fetch_game_odds_full(gid: int) -> dict:
+    """
+    Fetch full game odds including total and spread from BDL.
+    Caches result. Returns {"total": float, "spread": float, "fav_team": str}
+    """
+    if gid in GAME_ODDS_CACHE:
+        return GAME_ODDS_CACHE[gid]
+
+    result = {"total": 0.0, "spread": 0.0, "fav_team": ""}
+    try:
+        resp = _bdl_get("/nba/v2/odds/game_odds", params={"game_id": int(gid)})
+        markets = resp.get("data") or []
+        for m in markets:
+            mtype = (m.get("type") or "").lower()
+            # Game total
+            if ("total" in mtype or "over_under" in mtype) and result["total"] == 0.0:
+                val = m.get("total") or m.get("line_value") or m.get("over_line")
+                if val:
+                    result["total"] = float(val)
+            # Spread
+            if "spread" in mtype and result["spread"] == 0.0:
+                home_spread = m.get("home_spread") or m.get("spread")
+                if home_spread is not None:
+                    result["spread"] = abs(float(home_spread))
+                    result["fav_team"] = m.get("favorite_team") or ""
+    except Exception as e:
+        print(f"[WARN] game odds fetch failed gid={gid}: {e}")
+
+    GAME_ODDS_CACHE[gid] = result
+    return result
+
+
+def get_player_usage_stats(adv_games: list, n: int = 10) -> dict:
+    """
+    Compute usage metrics from recent advanced stat games.
+    Returns dict with avg_usage_pct, avg_off_rtg, avg_pie, usage_trend.
+    """
+    if not adv_games:
+        return {"avg_usage_pct": 0.0, "avg_off_rtg": 0.0, "avg_pie": 0.0, "usage_trend": 0.0}
+
+    recent = adv_games[-min(len(adv_games), n):]
+    usages = [g["usage_pct"] for g in recent if g["usage_pct"] > 0]
+    off_rtgs = [g["off_rtg"] for g in recent if g["off_rtg"] > 0]
+    pies = [g["pie"] for g in recent if g["pie"] != 0]
+
+    avg_usage = sum(usages) / len(usages) if usages else 0.0
+    avg_off_rtg = sum(off_rtgs) / len(off_rtgs) if off_rtgs else 0.0
+    avg_pie = sum(pies) / len(pies) if pies else 0.0
+
+    # Usage trend: last 3 vs last 10
+    l3_usage = [g["usage_pct"] for g in adv_games[-3:] if g["usage_pct"] > 0]
+    avg_l3_usage = sum(l3_usage) / len(l3_usage) if l3_usage else avg_usage
+    usage_trend = avg_l3_usage - avg_usage  # positive = usage increasing
+
+    return {
+        "avg_usage_pct": avg_usage,
+        "avg_off_rtg": avg_off_rtg,
+        "avg_pie": avg_pie,
+        "usage_trend": usage_trend,
+        "avg_l3_usage": avg_l3_usage,
+    }
+
+
+def advanced_usage_adjustment(usage_stats: dict, prop_type: str) -> tuple[float, str]:
+    """
+    Real usage rate adjustment using actual BDL advanced stats.
+    Replaces the approximation in usage_rate_adjustment().
+
+    Usage% thresholds:
+      >32% = primary option = +10% projection boost
+      28-32% = high usage = +5%
+      22-28% = normal = 0%
+      18-22% = role player = -5%
+      <18% = low usage = -10%
+
+    Also factors in usage trend (increasing/decreasing role).
+    """
+    if prop_type != "points":
+        return 0.0, ""
+
+    usage = usage_stats.get("avg_usage_pct", 0.0)
+    trend = usage_stats.get("usage_trend", 0.0)
+    pie = usage_stats.get("avg_pie", 0.0)
+
+    if usage <= 0:
+        return 0.0, ""
+
+    # Base adjustment from usage %
+    if usage >= 32:
+        base = 0.10
+    elif usage >= 28:
+        base = 0.05
+    elif usage >= 22:
+        base = 0.0
+    elif usage >= 18:
+        base = -0.05
+    else:
+        base = -0.10
+
+    # Trend bonus: if usage increasing over last 3 games, add up to +3%
+    trend_bonus = _clamp(trend / 5.0 * 0.03, -0.03, 0.03)
+
+    # PIE bonus: high impact players (PIE > 0.15) get small boost
+    pie_bonus = 0.02 if pie > 0.15 else 0.0
+
+    adj = _clamp(base + trend_bonus + pie_bonus, -0.12, 0.14)
+
+    if adj > 0.03:
+        label = f"usage={usage:.0f}%"
+        if trend > 2:
+            label += f"(+trending)"
+        return adj, f"high-usage({label},+{adj*100:.0f}%)"
+    elif adj < -0.03:
+        return adj, f"low-usage({usage:.0f}%,{adj*100:.0f}%)"
+    return 0.0, f"avg-usage({usage:.0f}%)"
+
+
+def get_api_player_position(pid: int, player_name: str) -> str:
+    """
+    Get player position -- tries API cache first, then hardcoded map.
+    This replaces the hardcoded PLAYER_POSITION_MAP lookup.
+    """
+    # API cache (populated from advanced stats or lineup fetch)
+    if int(pid) in PLAYER_POS_CACHE:
+        return PLAYER_POS_CACHE[int(pid)]
+    # Fall back to hardcoded map
+    return get_player_position(player_name)
 
 
 # -------------------- PROPS --------------------
@@ -2040,6 +2321,8 @@ def build_player_projection(
     games_map: dict = None,
     gid: int = 0,
     today_str: str = "",
+    adv_games: list = None,
+    player_id: int = 0,
 ) -> dict:
     """
     IMPROVEMENT: Unified projection engine replaces duplicated logic across
@@ -2150,10 +2433,51 @@ def build_player_projection(
     if blowout_adj != 0.0:
         proj += blowout_adj
 
-    # Usage rate adjustment
-    usage_adj, usage_note = usage_rate_adjustment(games, prop_type)
+    # Usage rate adjustment -- use real advanced stats if available
+    if adv_games:
+        usage_stats = get_player_usage_stats(adv_games)
+        usage_adj, usage_note = advanced_usage_adjustment(usage_stats, prop_type)
+    else:
+        usage_stats = {}
+        usage_adj, usage_note = usage_rate_adjustment(games, prop_type)
     if usage_adj != 0.0:
         proj *= (1.0 + usage_adj)
+
+    # Starter confirmation from BDL lineups
+    starter_note = ""
+    if gid and player_id:
+        in_lineup, is_starter = is_player_confirmed_starter(player_id, gid)
+        if in_lineup:
+            if is_starter:
+                starter_note = "confirmed-starter"
+            else:
+                # Bench player -- penalize projection slightly
+                proj *= 0.92
+                starter_note = "confirmed-bench(-8%)"
+
+    # Get real game odds (total + spread) from BDL
+    if gid and not game_total:
+        odds_data = bdl_fetch_game_odds_full(gid)
+        if odds_data["total"] > 0:
+            game_total = odds_data["total"]
+            total_adj2, total_note2 = game_total_adjustment(game_total)
+            if total_adj2 != 0.0 and total_note == "":
+                proj *= (1.0 + total_adj2)
+                total_note = total_note2
+        if odds_data["spread"] > 0 and spread == 0.0:
+            spread = odds_data["spread"]
+            fav = normalize_team_name(odds_data.get("fav_team", ""))
+            is_fav = (fav == normalize_team_name(player_team)) if fav else False
+            blowout_adj2, blowout_note2 = blowout_risk_penalty(spread, is_fav)
+            if blowout_adj2 != 0.0 and blowout_note == "":
+                proj += blowout_adj2
+                blowout_note = blowout_note2
+
+    # Position from API (more accurate than hardcoded map)
+    if player_id and int(player_id) in PLAYER_POS_CACHE:
+        api_pos = PLAYER_POS_CACHE[int(player_id)]
+        if api_pos and not opponent_team:
+            pass  # position cached for future use
 
     # Compute edge and probability
     if prop_type == "threes" and THREES_BETA_BINOM:
@@ -2199,6 +2523,9 @@ def build_player_projection(
         "min_delta": min_delta,
         "rate_delta": rate_delta,
         "m10": m10,
+        "starter_note": starter_note if "starter_note" in dir() else "",
+        "adv_usage_pct": usage_stats.get("avg_usage_pct", 0.0) if "usage_stats" in dir() else 0.0,
+        "adv_pie": usage_stats.get("avg_pie", 0.0) if "usage_stats" in dir() else 0.0,
     }
 
 
@@ -2206,7 +2533,7 @@ def build_player_projection(
 def build_injury_edges(
     team_short, injured_name, injured_status, exclude_names_lower,
     now_et, prop_type, lines_map_for_prop, state, now_ts,
-    news_boosts, news_scores, games_map=None,
+    news_boosts, news_scores, games_map=None, adv_stats=None,
 ):
     if deadline_exceeded():
         return []
@@ -2416,7 +2743,7 @@ def build_injury_edges(
     return ideas
 
 
-def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_boosts, news_scores, games_map=None):
+def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_boosts, news_scores, games_map=None, adv_stats=None):
     if not ENABLE_SLATE_SCAN or deadline_exceeded():
         return []
 
@@ -2472,6 +2799,9 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
             games_map=games_map,
             gid=int(offer.get("gid") or offer.get("game_id") or 0),
             today_str=today_str,
+        
+            adv_games=(adv_stats or {}).get(int(pid), []),
+            player_id=int(pid),
         )
 
         if p["m10"] < MIN_L10_MIN:
@@ -2568,7 +2898,7 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
     return ideas
 
 
-def lineup_news_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_boosts, news_scores, games_map=None):
+def lineup_news_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_boosts, news_scores, games_map=None, adv_stats=None):
     if not LE_NEWS_ENGINE_ENABLED or deadline_exceeded():
         return []
 
@@ -2636,7 +2966,10 @@ def lineup_news_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news
             games_map=games_map,
             gid=int(offer.get("gid") or offer.get("game_id") or 0),
             today_str=today_str,
-        )
+        
+                    adv_games=(adv_stats or {}).get(int(pid), []),
+                    player_id=int(pid),
+                )
 
         if p["m10"] < MIN_L10_MIN:
             continue
@@ -2717,7 +3050,7 @@ def lineup_news_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news
     return ideas[:LE_NEWS_TOPN]
 
 
-def plus_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_boosts, news_scores, games_map=None):
+def plus_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_boosts, news_scores, games_map=None, adv_stats=None):
     if not PLUS_HUNT_ENABLED or deadline_exceeded():
         return []
 
@@ -2779,7 +3112,10 @@ def plus_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, n
             games_map=games_map,
             gid=int(offer.get("gid") or offer.get("game_id") or 0),
             today_str=today_str,
-        )
+        
+      adv_games=(adv_stats or {}).get(int(pid), []),
+      player_id=int(pid),
+  )
 
         if p["m10"] < MIN_L10_MIN:
             continue
@@ -2945,12 +3281,31 @@ def format_play_card(play: dict, idx: int) -> str:
     consistency = play.get("consistency", 0)
     cons_note = f"cons:{consistency:.0%}" if consistency > 0 else ""
 
-    context = " ".join(filter(None, [b2b, rest, le_note, blowout, usage_tag, total_tag]))
+    # Starter/bench status from confirmed lineups
+    starter_tag = ""
+    s_note = play.get("starter_note", "")
+    if s_note == "confirmed-starter":
+        starter_tag = "[STARTING]"
+    elif "bench" in s_note:
+        starter_tag = "[BENCH-8%]"
+
+    # Real usage % from advanced stats
+    usage_pct = play.get("adv_usage_pct", 0.0)
+    usage_display = f"usg:{usage_pct:.0f}%" if usage_pct > 0 else ""
+
+    context = " ".join(filter(None, [b2b, rest, le_note, blowout, usage_tag, total_tag, starter_tag]))
+
+    # Alternate line detector -- flag when line is suspiciously far below projection
+    # Real main lines are usually within 4pts of projection
+    # Anything more = likely an alternate line at better odds
+    alt_line_flag = ""
+    if edge > 6.0 and prob > 0.88:
+        alt_line_flag = "[ALT-LINE? verify on app]"
 
     card = [
-        f"{idx}. {tier} {name} ({team}) OVER {line:.1f}",
+        f"{idx}. {tier} {name} ({team}) OVER {line:.1f}{(' ' + alt_line_flag) if alt_line_flag else ''}",
         f"   Proj {proj:.1f} | edge +{edge:.1f} | P={prob:.0f}% | EV={ev:+.2f}",
-        f"   {vendor} {over_odds:+d} | {matchup_hint} | {cons_note} {context}".rstrip().rstrip("|").strip(),
+        f"   {vendor} {over_odds:+d} | {matchup_hint} | {cons_note} {usage_display} {context}".rstrip().rstrip("|").strip(),
     ]
     return "\n".join(card)
 
@@ -3001,6 +3356,42 @@ def run():
                     bdl_last_n_games_threes(chunk_ids, season, max(LOOKBACK_GAMES, 8))
                 except Exception as e:
                     print(f"[WARN] warmup threes failed: {e}")
+
+        # God Tier: fetch advanced stats for all players with props today
+        print(f"[INFO] Fetching advanced stats for {len(all_prop_pids)} players...")
+        adv_stats_all = {}
+        for chunk_ids in _chunk(all_prop_pids, STAT_BATCH_SIZE):
+            if deadline_exceeded():
+                break
+            try:
+                chunk_adv = bdl_fetch_advanced_stats(chunk_ids, season)
+                adv_stats_all.update(chunk_adv)
+            except Exception as e:
+                print(f"[WARN] advanced stats warmup failed: {e}")
+        print(f"[INFO] Advanced stats loaded for {len(adv_stats_all)} players | positions cached: {len(PLAYER_POS_CACHE)}")
+
+        # Pre-fetch lineups for today's games
+        print(f"[INFO] Fetching lineups for {len(games_map)} games...")
+        for gid_lineup in list(games_map.keys()):
+            if deadline_exceeded():
+                break
+            try:
+                bdl_fetch_lineups(gid_lineup)
+            except Exception as e:
+                print(f"[WARN] lineup fetch failed gid={gid_lineup}: {e}")
+        starters = sum(1 for e in LINEUP_CACHE.values() for x in e if x.get("starter"))
+        print(f"[INFO] Lineups loaded, confirmed starters: {starters}")
+
+        # Pre-fetch game odds for all games
+        for gid_odds in list(games_map.keys()):
+            if deadline_exceeded():
+                break
+            try:
+                bdl_fetch_game_odds_full(gid_odds)
+            except Exception as e:
+                pass
+    else:
+        adv_stats_all = {}
 
     news_items = fetch_lineupexperts_news(now_et) if LINEUPEXPERTS else []
     news_boosts = build_news_boost_map(news_items) if news_items else {}
@@ -3122,7 +3513,7 @@ def run():
                 break
             slate_ideas_all.extend(
                 slate_scan_edges(now_et, pt, lines_map.get(pt, {}), state=state, now_ts=now_ts,
-                                 news_boosts=news_boosts, news_scores=news_scores, games_map=games_map)
+                                 news_boosts=news_boosts, news_scores=news_scores, games_map=games_map, adv_stats=adv_stats_all)
             )
 
     # ---- Lineup news edges ----
@@ -3133,7 +3524,7 @@ def run():
                 break
             lineup_news_ideas_all.extend(
                 lineup_news_edges(now_et, pt, lines_map.get(pt, {}), state=state, now_ts=now_ts,
-                                  news_boosts=news_boosts, news_scores=news_scores, games_map=games_map)
+                                  news_boosts=news_boosts, news_scores=news_scores, games_map=games_map, adv_stats=adv_stats_all)
             )
     lineup_news_ideas_all = lineup_news_ideas_all[:LE_NEWS_TOPN]
 
@@ -3145,7 +3536,7 @@ def run():
                 break
             plus_ideas_all.extend(
                 plus_odds_hunt_edges(now_et, pt, lines_map.get(pt, {}), state=state, now_ts=now_ts,
-                                     news_boosts=news_boosts, news_scores=news_scores, games_map=games_map)
+                                     news_boosts=news_boosts, news_scores=news_scores, games_map=games_map, adv_stats=adv_stats_all)
             )
     plus_ideas_all = plus_ideas_all[:PLUS_HUNT_TOPN]
 
