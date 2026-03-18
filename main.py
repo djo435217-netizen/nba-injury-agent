@@ -66,8 +66,8 @@ MAX_PER_MARKET = int(os.environ.get("MAX_PER_MARKET", "10"))
 MAX_TOTAL_PLAYS = int(os.environ.get("MAX_TOTAL_PLAYS", "10"))
 
 # Windows
-BASELINE_GAMES = int(os.environ.get("BASELINE_GAMES", "30"))
-LOOKBACK_GAMES = int(os.environ.get("LOOKBACK_GAMES", "10"))
+BASELINE_GAMES = int(os.environ.get("BASELINE_GAMES", "20"))
+LOOKBACK_GAMES = int(os.environ.get("LOOKBACK_GAMES", "8"))
 SHORT_GAMES = int(os.environ.get("SHORT_GAMES", "3"))
 
 # Model thresholds
@@ -1177,7 +1177,7 @@ PLAYER_POS_CACHE = {}      # pid -> position string (from API)
 GAME_ODDS_CACHE = {}       # gid -> {"total": float, "spread": float, "fav_team": str}
 
 
-def _bdl_get(path: str, params=None, timeout: int = 20) -> dict:
+def _bdl_get(path: str, params=None, timeout: int = 8) -> dict:
     last_err = None
     for pref in BDL_PREFIXES:
         url = f"https://api.balldontlie.io{pref}{path}"
@@ -3393,22 +3393,28 @@ def run():
     all_prop_pids = list({int(x) for x in all_prop_pids})
 
     if all_prop_pids:
+        stats_deadline = time.time() + 50  # hard 50s budget for stats warmup
         for chunk_ids in _chunk(all_prop_pids, STAT_BATCH_SIZE):
-            if deadline_exceeded():
+            if deadline_exceeded() or time.time() > stats_deadline:
+                print("[INFO] Stats warmup time budget reached")
                 break
             try:
                 bdl_last_n_games_stats(chunk_ids, season, max(LOOKBACK_GAMES, 8), "pts")
             except Exception as e:
                 print(f"[WARN] warmup stats failed: {e}")
+                break
 
         if "threes" in PROP_TYPES and THREES_BETA_BINOM:
+            threes_deadline = time.time() + 30  # hard 30s budget
             for chunk_ids in _chunk(all_prop_pids, STAT_BATCH_SIZE):
-                if deadline_exceeded():
+                if deadline_exceeded() or time.time() > threes_deadline:
+                    print("[INFO] Threes warmup time budget reached")
                     break
                 try:
                     bdl_last_n_games_threes(chunk_ids, season, max(LOOKBACK_GAMES, 8))
                 except Exception as e:
                     print(f"[WARN] warmup threes failed: {e}")
+                    break
 
         # God Tier: fetch advanced stats -- time-budgeted
         adv_stats_all = {}
@@ -3711,21 +3717,7 @@ def run():
         record_sent(state, final_out, now_ts)
     else:
         print("[INFO] No plays cleared thresholds this run.")
-    # Debug: show what the slate scan is seeing
-    for pt in PROP_TYPES:
-        pids = list((lines_map.get(pt) or {}).keys())
-        print(f"[DEBUG] {pt}: {len(pids)} players with lines")
-        # Sample first 3 players
-        season_dbg = _season_year(now_et)
-        for pid in pids[:3]:
-            rows = lines_map[pt][pid]
-            cons, n_cons, n_sharp = consensus_line(rows)
-            vendors = list({r.get("vendor","?") for r in rows})
-            print(f"  pid={pid} line={cons} n_cons={n_cons} n_sharp={n_sharp} vendors={vendors[:4]}")
-            # Check stats
-            from_cache = PLAYER_NAME_CACHE.get(int(pid), f"pid{pid}")
-            adv = adv_stats_all.get(int(pid), [])
-            print(f"    name={from_cache} adv_games={len(adv)}")
+
 
     state["players"] = new_players
     save_state(state)
