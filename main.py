@@ -3711,6 +3711,21 @@ def run():
         record_sent(state, final_out, now_ts)
     else:
         print("[INFO] No plays cleared thresholds this run.")
+    # Debug: show what the slate scan is seeing
+    for pt in PROP_TYPES:
+        pids = list((lines_map.get(pt) or {}).keys())
+        print(f"[DEBUG] {pt}: {len(pids)} players with lines")
+        # Sample first 3 players
+        season_dbg = _season_year(now_et)
+        for pid in pids[:3]:
+            rows = lines_map[pt][pid]
+            cons, n_cons, n_sharp = consensus_line(rows)
+            vendors = list({r.get("vendor","?") for r in rows})
+            print(f"  pid={pid} line={cons} n_cons={n_cons} n_sharp={n_sharp} vendors={vendors[:4]}")
+            # Check stats
+            from_cache = PLAYER_NAME_CACHE.get(int(pid), f"pid{pid}")
+            adv = adv_stats_all.get(int(pid), [])
+            print(f"    name={from_cache} adv_games={len(adv)}")
 
     state["players"] = new_players
     save_state(state)
