@@ -626,7 +626,7 @@ log = json.load(f)
     recent_rate = recent_hits / len(recent) if recent else 0
 
     return (
-        f"📊 Model accuracy: {hits}/{total} ({rate*100:.0f}%) overall | "
+        f"[STATS] Model accuracy: {hits}/{total} ({rate*100:.0f}%) overall | "
         f"L20: {recent_hits}/{len(recent)} ({recent_rate*100:.0f}%)"
     )
 except Exception:
@@ -641,9 +641,9 @@ IMPROVEMENT: Assign a human-readable confidence tier to each pick.
 Makes WhatsApp output scannable at a glance for fast bet decisions.
 
 ```
-🔒 Lock   = elite signal, bet with confidence
-✅ Strong = solid edge, good play
-👀 Lean   = marginal edge, smaller if anything
+[LOCK] Lock   = elite signal, bet with confidence
+[STRONG] Strong = solid edge, good play
+[LEAN] Lean   = marginal edge, smaller if anything
 """
 score = 0
 if edge >= 5.0:
@@ -671,11 +671,11 @@ elif value_edge >= 0.04:
     score += 1
 
 if score >= 8:
-    return "🔒 Lock"
+    return "[LOCK] Lock"
 elif score >= 5:
-    return "✅ Strong"
+    return "[STRONG] Strong"
 else:
-    return "👀 Lean"
+    return "[LEAN] Lean"
 ```
 
 def projected_minutes(base_min, l10_min, l3_min, min_delta, injury_boost_min=0.0, le_score=0.0):
@@ -2620,15 +2620,15 @@ m = re.search(r"matchup=([^\s|]+)", why)
 if m:
     matchup_hint = m.group(1)
 
-b2b = "⚠️ B2B" if "b2b(" in why else ""
+b2b = "[WARN] B2B" if "b2b(" in why else ""
 le_note = ""
 if play.get("le_score", 0) > 0.5:
-    le_note = "📰+"
+    le_note = "[NEWS]+"
 elif play.get("le_score", 0) < -0.5:
-    le_note = "📰-"
+    le_note = "[NEWS]-"
 
 consistency = play.get("consistency", 0)
-cons_note = f"🎯{consistency:.0%}" if consistency > 0 else ""
+cons_note = f"[AIM]{consistency:.0%}" if consistency > 0 else ""
 
 card = [
     f"{idx}. {tier} {name} ({team}) OVER {line:.1f}",
@@ -2655,7 +2655,7 @@ print(
 )
 
 if TEST_MODE:
-    send_one(f"✅ NBA betting agent v2 test OK ({ts_et})")
+    send_one(f"[STRONG] NBA betting agent v2 test OK ({ts_et})")
     return
 
 state = load_state()
@@ -2881,10 +2881,10 @@ if final_out:
     hit_rate_str = get_hit_rate_summary()
 
     # IMPROVEMENT: Clean summary card at top for fast scanning
-    msg.append(f"🏀 NBA PROPS -- {ts_et}")
+    msg.append(f"[NBA] NBA PROPS -- {ts_et}")
     if hit_rate_str:
         msg.append(hit_rate_str)
-    msg.append(f"🔒=Lock  ✅=Strong  👀=Lean")
+    msg.append(f"[LOCK]=Lock  [STRONG]=Strong  [LEAN]=Lean")
     msg.append("-" * 30)
     msg.append("")
 
@@ -2897,13 +2897,13 @@ if final_out:
     # Injury context
     if triggers:
         msg.append("")
-        msg.append("🚑 Injury triggers:")
+        msg.append("\u1f691 Injury triggers:")
         for t in triggers[:6]:
             msg.append(f"  - {t}")
         msg.append("")
 
     # Detail section for each play
-    msg.append("📋 DETAIL:")
+    msg.append("[LIST] DETAIL:")
     msg.append("")
     for pt in PROP_TYPES:
         picks = out_by_market.get(pt, [])
@@ -2923,12 +2923,12 @@ if final_out:
     plus_bucket = plus_bucket[:PLUS_ODDS_TOPN]
 
     if plus_bucket or plus_ideas_all:
-        msg.append("💎 PLUS ODDS:")
+        msg.append("[PLUS] PLUS ODDS:")
         for i in (plus_bucket + [x for x in plus_ideas_all if x not in plus_bucket])[:PLUS_ODDS_TOPN]:
             msg.append(f"- {i['player_name']} OVER {i['cons_line']:.1f} ({i['vendor']} {int(i['over_odds']):+d}) P={i['prob_over']*100:.0f}% EV={i['ev']:+.2f}")
         msg.append("")
 
-    msg.append(f"🧢 Caps: team<={MAX_PLAYS_PER_TEAM}, game<={MAX_PLAYS_PER_GAME}")
+    msg.append(f"[CAPS] Caps: team<={MAX_PLAYS_PER_TEAM}, game<={MAX_PLAYS_PER_GAME}")
     send_chunked("\n".join(msg).strip())
 
     record_sent(state, final_out, now_ts)
