@@ -627,7 +627,7 @@ def get_game_total_from_odds(gid: int, games_map: dict) -> float:
     if not gid:
         return 0.0
     try:
-        resp = _bdl_get("/v2/odds/game_odds", params={"game_ids[]": [int(gid)]})
+        resp = _bdl_get("/nba/v1/odds", params={"game_ids[]": [int(gid)]})
         for market in (resp.get("data") or []):
             mtype = (market.get("type") or "").lower()
             if "total" in mtype or "over_under" in mtype:
@@ -648,7 +648,7 @@ def get_spread_from_odds(gid: int, player_team: str, games_map: dict) -> tuple[f
     if not gid:
         return 0.0, False
     try:
-        resp = _bdl_get("/v2/odds/game_odds", params={"game_ids[]": [int(gid)]})
+        resp = _bdl_get("/nba/v1/odds", params={"game_ids[]": [int(gid)]})
         for market in (resp.get("data") or []):
             mtype = (market.get("type") or "").lower()
             if "spread" in mtype or "point_spread" in mtype:
