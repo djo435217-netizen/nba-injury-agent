@@ -27,7 +27,7 @@ twilio = Client(TWILIO_SID, TWILIO_TOKEN)
 TEST_MODE = os.environ.get("TEST_MODE", "0") == "1"
 MAX_BODY_CHARS = int(os.environ.get("MAX_BODY_CHARS", "1500"))
 
-BOOK_VENDOR_RAW = os.environ.get("BOOK_VENDORS", os.environ.get("BOOK_VENDOR", "fanduel,draftkings")).strip().lower()
+BOOK_VENDOR_RAW = os.environ.get("BOOK_VENDORS", os.environ.get("BOOK_VENDOR", "fanduel,draftkings,fanatics,caesars")).strip().lower()
 BOOK_VENDORS = [v.strip() for v in BOOK_VENDOR_RAW.split(",") if v.strip()]
 
 PROP_TYPES_RAW = os.environ.get("PROP_TYPES", "points").strip().lower()
@@ -50,7 +50,7 @@ MIN_VENDORS_FOR_CONSENSUS = int(os.environ.get("MIN_VENDORS_FOR_CONSENSUS", "1")
 MIN_SHARP_VENDORS = int(os.environ.get("MIN_SHARP_VENDORS", "0"))
 SHARP_VENDORS_RAW = os.environ.get(
     "SHARP_VENDORS",
-    "draftkings,caesars,betmgm,bet365,pointsbet,hardrock,betparx,betway,betrivers",
+    "draftkings,caesars,fanatics,betmgm,bet365,pointsbet,hardrock,betparx,betway,betrivers",
 ).strip().lower()
 SHARP_VENDORS = {x.strip() for x in SHARP_VENDORS_RAW.split(",") if x.strip()}
 
@@ -627,7 +627,7 @@ def get_game_total_from_odds(gid: int, games_map: dict) -> float:
     if not gid:
         return 0.0
     try:
-        resp = _bdl_get("/v2/odds/game_odds", params={"game_id": int(gid)})
+        resp = _bdl_get("/v2/odds/game_odds", params={"game_ids[]": [int(gid)]})
         for market in (resp.get("data") or []):
             mtype = (market.get("type") or "").lower()
             if "total" in mtype or "over_under" in mtype:
@@ -648,7 +648,7 @@ def get_spread_from_odds(gid: int, player_team: str, games_map: dict) -> tuple[f
     if not gid:
         return 0.0, False
     try:
-        resp = _bdl_get("/v2/odds/game_odds", params={"game_id": int(gid)})
+        resp = _bdl_get("/v2/odds/game_odds", params={"game_ids[]": [int(gid)]})
         for market in (resp.get("data") or []):
             mtype = (market.get("type") or "").lower()
             if "spread" in mtype or "point_spread" in mtype:
@@ -1523,29 +1523,40 @@ def bdl_fetch_advanced_stats(player_ids: list, season: int) -> dict:
 def bdl_fetch_lineups(gid: int) -> list:
     """
     Fetch confirmed lineups for a game from BDL.
-    Returns list of lineup entries with player id, position, starter status.
-    Uses this to:
-    1. Confirm a player is actually starting tonight
-    2. Get their listed position for tonight specifically
+    Tries multiple endpoint paths since lineup availability varies by tier.
+    Lineups are typically posted 1-2 hours before tip-off.
     """
     if gid in LINEUP_CACHE:
         return LINEUP_CACHE[gid]
-    try:
-        resp = _bdl_get("/nba/v1/lineups", params={"game_ids[]": [gid]})
-        entries = resp.get("data") or []
-        LINEUP_CACHE[gid] = entries
-        # Cache positions while we have them
-        for e in entries:
-            p = e.get("player") or {}
-            pid = p.get("id")
-            pos = (e.get("position") or p.get("position") or "").strip().lower()
-            if pid and pos and int(pid) not in PLAYER_POS_CACHE:
-                PLAYER_POS_CACHE[int(pid)] = pos[:2]
-        return entries
-    except Exception as e:
-        print(f"[WARN] lineup fetch failed gid={gid}: {e}")
-        LINEUP_CACHE[gid] = []
-        return []
+
+    entries = []
+    # Try multiple possible paths
+    paths = [
+        ("/nba/v1/lineups", {"game_ids[]": [gid]}),
+        ("/nba/v1/lineups", {"game_id": gid}),
+        ("/v1/lineups", {"game_ids[]": [gid]}),
+    ]
+    for path, params in paths:
+        try:
+            resp = _bdl_get(path, params=params)
+            entries = resp.get("data") or []
+            if entries:
+                print(f"[INFO] Lineup data found via {path} for gid={gid}: {len(entries)} entries")
+                break
+        except Exception:
+            continue
+
+    LINEUP_CACHE[gid] = entries
+
+    # Cache positions from lineup data
+    for e in entries:
+        p = e.get("player") or {}
+        pid = p.get("id")
+        pos = (e.get("position") or p.get("position") or "").strip().lower()
+        if pid and pos and int(pid) not in PLAYER_POS_CACHE:
+            PLAYER_POS_CACHE[int(pid)] = pos[:2]
+
+    return entries
 
 
 def is_player_confirmed_starter(pid: int, gid: int) -> tuple[bool, bool]:
@@ -1567,28 +1578,44 @@ def is_player_confirmed_starter(pid: int, gid: int) -> tuple[bool, bool]:
 def bdl_fetch_game_odds_full(gid: int) -> dict:
     """
     Fetch full game odds including total and spread from BDL.
-    Caches result. Returns {"total": float, "spread": float, "fav_team": str}
+    Uses /nba/v1/odds with game_ids[] -- correct God Tier endpoint.
+    Returns {"total": float, "spread": float, "fav_team": str}
+
+    Response schema per row:
+      spread_home_value, spread_home_odds, spread_away_value, spread_away_odds
+      moneyline_home_odds, moneyline_away_odds
+      total_value, total_over_odds, total_under_odds
     """
     if gid in GAME_ODDS_CACHE:
         return GAME_ODDS_CACHE[gid]
 
     result = {"total": 0.0, "spread": 0.0, "fav_team": ""}
     try:
-        resp = _bdl_get("/nba/v2/odds/game_odds", params={"game_id": int(gid)})
-        markets = resp.get("data") or []
-        for m in markets:
-            mtype = (m.get("type") or "").lower()
+        resp = _bdl_get("/nba/v1/odds", params={"game_ids[]": [int(gid)]})
+        rows = resp.get("data") or []
+        for row in rows:
             # Game total
-            if ("total" in mtype or "over_under" in mtype) and result["total"] == 0.0:
-                val = m.get("total") or m.get("line_value") or m.get("over_line")
-                if val:
-                    result["total"] = float(val)
-            # Spread
-            if "spread" in mtype and result["spread"] == 0.0:
-                home_spread = m.get("home_spread") or m.get("spread")
-                if home_spread is not None:
-                    result["spread"] = abs(float(home_spread))
-                    result["fav_team"] = m.get("favorite_team") or ""
+            if result["total"] == 0.0:
+                tv = row.get("total_value")
+                if tv:
+                    try:
+                        result["total"] = float(tv)
+                    except Exception:
+                        pass
+            # Spread -- use first vendor available
+            if result["spread"] == 0.0:
+                sv = row.get("spread_home_value")
+                if sv:
+                    try:
+                        spread_val = float(sv)
+                        result["spread"] = abs(spread_val)
+                        # Negative home spread = home team is favorite
+                        result["fav_team"] = "home" if spread_val < 0 else "away"
+                    except Exception:
+                        pass
+            # Stop once we have both
+            if result["total"] > 0 and result["spread"] > 0:
+                break
     except Exception as e:
         print(f"[WARN] game odds fetch failed gid={gid}: {e}")
 
