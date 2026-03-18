@@ -50,7 +50,7 @@ MIN_VENDORS_FOR_CONSENSUS = int(os.environ.get("MIN_VENDORS_FOR_CONSENSUS", "1")
 MIN_SHARP_VENDORS = int(os.environ.get("MIN_SHARP_VENDORS", "0"))
 SHARP_VENDORS_RAW = os.environ.get(
     "SHARP_VENDORS",
-    "draftkings,caesars,fanatics,betmgm,bet365,pointsbet,hardrock,betparx,betway,betrivers",
+    "draftkings,caesars,fanatics,fanduel,betmgm,bet365,pointsbet,hardrock,betparx,betway,betrivers,rebet",
 ).strip().lower()
 SHARP_VENDORS = {x.strip() for x in SHARP_VENDORS_RAW.split(",") if x.strip()}
 
@@ -1771,10 +1771,17 @@ def build_today_props(now_et: datetime):
                 if not isinstance(over_odds, (int, float)) or not isinstance(under_odds, (int, float)):
                     continue
 
+                # Always use vendor name from the row itself, not the fetch param
+                row_vendor = str(pp.get("vendor") or "").strip().lower()
+                if not row_vendor and v:
+                    row_vendor = str(v).strip().lower()
+                if not row_vendor:
+                    row_vendor = "unknown"
+
                 row = {
                     "pid": pid,
                     "gid": int(pp.get("game_id")) if pp.get("game_id") is not None else int(gid),
-                    "vendor": str((pp.get("vendor") or (v or "no_vendor"))).strip().lower(),
+                    "vendor": row_vendor,
                     "prop_type": (pp.get("prop_type") or pt),
                     "line": float(line),
                     "over_odds": float(over_odds),
@@ -1792,24 +1799,40 @@ def _round_to_half(x: float) -> float:
 
 
 def consensus_line(rows):
+    """
+    Compute consensus line from available books.
+    Uses sharp books when available, falls back to any book.
+    Returns (median_line, n_vendors, n_sharp_vendors).
+
+    Note: different books use different player_ids in the BDL API,
+    so a player may only have rows from 1-2 books. We accept 1 book
+    as valid consensus (MIN_VENDORS_FOR_CONSENSUS=1) and just need
+    the line to be reasonable.
+    """
     if not rows:
         return None, 0, 0
 
-    by_vendor = {}
+    by_vendor_sharp = {}
+    by_vendor_any = {}
 
     for r in rows:
         v = str(r.get("vendor") or "").strip().lower()
-        if not v or v not in CONSENSUS_VENDORS:
+        if not v:
             continue
         try:
             line = float(r["line"])
         except Exception:
             continue
 
-        if v not in by_vendor:
-            by_vendor[v] = _round_to_half(line)
+        if v not in by_vendor_any:
+            by_vendor_any[v] = _round_to_half(line)
+        if v in CONSENSUS_VENDORS and v not in by_vendor_sharp:
+            by_vendor_sharp[v] = _round_to_half(line)
 
-    sharp_count = len(by_vendor)
+    # Prefer sharp vendors, fall back to any vendor
+    by_vendor = by_vendor_sharp if by_vendor_sharp else by_vendor_any
+    sharp_count = len(by_vendor_sharp)
+
     lines = sorted(by_vendor.values())
     n = len(lines)
 
