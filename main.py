@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 import os
 import json
 import re
@@ -82,7 +84,7 @@ SHORT_GAMES = int(os.environ.get(“SHORT_GAMES”, “3”))
 MIN_EDGE = float(os.environ.get(“MIN_EDGE”, “2.5”))
 MIN_PROB = float(os.environ.get(“MIN_PROB”, “0.62”))
 
-# IMPROVEMENT: Lowered STD_FLOOR from 5.0 → 3.5
+# IMPROVEMENT: Lowered STD_FLOOR from 5.0 -> 3.5
 
 # Old floor of 5.0 was over-penalizing consistent scorers by pushing prob
 
@@ -193,11 +195,11 @@ ENABLE_OPP_DEF_ADJ = os.environ.get(“ENABLE_OPP_DEF_ADJ”, “1”) == “1�
 
 # –––––––––– NEW: RECENCY WEIGHTS ––––––––––
 
-# IMPROVEMENT: Increased L3 recency weight from 0.20 → 0.30, reduced base from 0.45 → 0.35
+# IMPROVEMENT: Increased L3 recency weight from 0.20 -> 0.30, reduced base from 0.45 -> 0.35
 
 # L3 form is the strongest short-term signal for player points props.
 
-# Hot/cold streaks are real — the market often under-adjusts for them.
+# Hot/cold streaks are real – the market often under-adjusts for them.
 
 PROJ_WEIGHT_BASE = float(os.environ.get(“PROJ_WEIGHT_BASE”, “0.35”))
 PROJ_WEIGHT_L10 = float(os.environ.get(“PROJ_WEIGHT_L10”, “0.35”))
@@ -463,7 +465,7 @@ return adj, note
 ```
 
 def matchup_adjustment(team_name: str, player_name: str, prop_type: str) -> tuple[float, str]:
-“”“Kept for backward compatibility — now delegates to opponent_defense_adjustment.”””
+“”“Kept for backward compatibility – now delegates to opponent_defense_adjustment.”””
 return opponent_defense_adjustment(team_name, prop_type)
 
 # –––––––––– NEW: HOME/AWAY & B2B CONTEXT ––––––––––
@@ -529,11 +531,11 @@ return False
 def consistency_score(games, n=LOOKBACK_GAMES) -> float:
 “””
 IMPROVEMENT: Measures how consistently a player hits their average.
-Returns 0.0–1.0. High consistency = more reliable projection.
+Returns 0.0-1.0. High consistency = more reliable projection.
 
 ```
-Method: % of L10 games where player scored within ±20% of their L10 avg.
-This reduces the STD_FLOOR problem — consistent players get tighter confidence.
+Method: % of L10 games where player scored within +/-20% of their L10 avg.
+This reduces the STD_FLOOR problem -- consistent players get tighter confidence.
 """
 sl = _slice_last(games, n)
 if len(sl) < 5:
@@ -549,7 +551,7 @@ return _clamp(hits / len(sl), 0.0, 1.0)
 def adaptive_sigma(games, base_sigma: float, cons_score: float) -> float:
 “””
 IMPROVEMENT: Scale sigma down for consistent players.
-A player with 80% consistency within ±20% of avg gets sigma reduced by up to 25%.
+A player with 80% consistency within +/-20% of avg gets sigma reduced by up to 25%.
 This lets us have more confidence on consistent over-achievers vs the line.
 “””
 reduction = (cons_score - 0.5) * 0.5  # 0.0 at 50% cons, 0.25 at 100% cons
@@ -2062,7 +2064,7 @@ for pid, nm in roster_tuples:
         f"{injured_name} {injured_status.upper()} vacates ~{vac_stat:.1f}pts / {vac_min:.1f}min. "
         f"base {p['base_avg']:.1f} | L10 {p['l10_avg']:.1f} | L3 {p['l3_avg']:.1f} "
         f"(minL10 {p['l10_min']:.1f}, projMin {p['proj_min']:.1f}, rate {p['proj_rate']:.3f}, cons {p['consistency']:.2f}). "
-        f"Δmin={p['min_delta']:+.1f} Δrate={p['rate_delta']:+.2f}. "
+        f"Deltamin={p['min_delta']:+.1f} Deltarate={p['rate_delta']:+.2f}. "
         f"Proj {p['proj']:.1f} vs line {line:.1f} | "
         f"{offer['vendor']} ({int(offer['over_odds']):+d}) | "
         f"edge +{p['edge']:.1f} | P={p['prob_over']*100:.0f}% (mkt={p_market*100:.0f}%, val={value_edge:+.2f}) | "
@@ -2216,7 +2218,7 @@ for pid in pids:
     why = (
         f"[{tier}] Slate. base {p['base_avg']:.1f} | L10 {p['l10_avg']:.1f} | L3 {p['l3_avg']:.1f} "
         f"(minL10 {p['l10_min']:.1f}, projMin {p['proj_min']:.1f}, rate {p['proj_rate']:.3f}, cons {p['consistency']:.2f}). "
-        f"Δmin={p['min_delta']:+.1f} Δrate={p['rate_delta']:+.2f}. "
+        f"Deltamin={p['min_delta']:+.1f} Deltarate={p['rate_delta']:+.2f}. "
         f"Proj {p['proj']:.1f} vs line {line:.1f} | "
         f"{offer['vendor']} ({int(offer['over_odds']):+d}) | "
         f"edge +{p['edge']:.1f} | P={p['prob_over']*100:.0f}% (mkt={p_market*100:.0f}%, val={value_edge:+.2f}) | "
@@ -2599,8 +2601,8 @@ IMPROVEMENT: Clean, scannable WhatsApp card format.
 ```
 Each card is designed to be read in 3 seconds:
 Line 1: Player, over line, tier label
-Line 2: Key numbers — projection, edge, probability, EV
-Line 3: Context — matchup, home/away, news signal
+Line 2: Key numbers -- projection, edge, probability, EV
+Line 3: Context -- matchup, home/away, news signal
 """
 tier = play.get("tier", "")
 name = play["player_name"]
@@ -2613,7 +2615,7 @@ over_odds = int(play["over_odds"])
 vendor = play["vendor"]
 team = play.get("team", "")
 
-# Extract key context from why string — keep it short
+# Extract key context from why string -- keep it short
 matchup_hint = ""
 why = play.get("why", "")
 m = re.search(r"matchup=([^\s|]+)", why)
@@ -2881,25 +2883,25 @@ if final_out:
     hit_rate_str = get_hit_rate_summary()
 
     # IMPROVEMENT: Clean summary card at top for fast scanning
-    msg.append(f"🏀 NBA PROPS — {ts_et}")
+    msg.append(f"🏀 NBA PROPS -- {ts_et}")
     if hit_rate_str:
         msg.append(hit_rate_str)
     msg.append(f"🔒=Lock  ✅=Strong  👀=Lean")
-    msg.append("─" * 30)
+    msg.append("-" * 30)
     msg.append("")
 
     # Quick-scan card for each play
     for idx, play in enumerate(final_out, 1):
         msg.append(format_play_card(play, idx))
     msg.append("")
-    msg.append("─" * 30)
+    msg.append("-" * 30)
 
     # Injury context
     if triggers:
         msg.append("")
         msg.append("🚑 Injury triggers:")
         for t in triggers[:6]:
-            msg.append(f"  • {t}")
+            msg.append(f"  - {t}")
         msg.append("")
 
     # Detail section for each play
@@ -2913,7 +2915,7 @@ if final_out:
         msg.append(f"[ {label} ]")
 
         for i in picks:
-            msg.append(f"• {i['player_name']} OVER {i['cons_line']:.1f}")
+            msg.append(f"- {i['player_name']} OVER {i['cons_line']:.1f}")
             msg.append(f"  {i['why']}")
             msg.append("")
 
@@ -2925,10 +2927,10 @@ if final_out:
     if plus_bucket or plus_ideas_all:
         msg.append("💎 PLUS ODDS:")
         for i in (plus_bucket + [x for x in plus_ideas_all if x not in plus_bucket])[:PLUS_ODDS_TOPN]:
-            msg.append(f"• {i['player_name']} OVER {i['cons_line']:.1f} ({i['vendor']} {int(i['over_odds']):+d}) P={i['prob_over']*100:.0f}% EV={i['ev']:+.2f}")
+            msg.append(f"- {i['player_name']} OVER {i['cons_line']:.1f} ({i['vendor']} {int(i['over_odds']):+d}) P={i['prob_over']*100:.0f}% EV={i['ev']:+.2f}")
         msg.append("")
 
-    msg.append(f"🧢 Caps: team≤{MAX_PLAYS_PER_TEAM}, game≤{MAX_PLAYS_PER_GAME}")
+    msg.append(f"🧢 Caps: team<={MAX_PLAYS_PER_TEAM}, game<={MAX_PLAYS_PER_GAME}")
     send_chunked("\n".join(msg).strip())
 
     record_sent(state, final_out, now_ts)
