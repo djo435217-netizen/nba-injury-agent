@@ -3371,7 +3371,7 @@ def run():
     today_str = now_et.strftime("%Y-%m-%d")
 
     print(
-        f"[BOOT] ts={ts_et} TEST_MODE={int(TEST_MODE)} "
+        f"[BOOT] v3.0 ts={ts_et} TEST_MODE={int(TEST_MODE)} "
         f"PROP_TYPES={','.join(PROP_TYPES)} STD_FLOOR={STD_FLOOR} "
         f"PROJ_WEIGHTS=base{PROJ_WEIGHT_BASE}/l10{PROJ_WEIGHT_L10}/l3{PROJ_WEIGHT_L3} "
         f"HOME_BOOST={HOME_COURT_BOOST} B2B_PENALTY={B2B_PENALTY} OPP_DEF={int(ENABLE_OPP_DEF_ADJ)}"
