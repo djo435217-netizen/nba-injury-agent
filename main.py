@@ -41,9 +41,9 @@ MAX_PLAYS_PER_TEAM = int(os.environ.get("MAX_PLAYS_PER_TEAM", "2"))
 MAX_PLAYS_PER_GAME = int(os.environ.get("MAX_PLAYS_PER_GAME", "4"))
 
 # Card composition caps
-MAX_INJURY_PLAYS = int(os.environ.get("MAX_INJURY_PLAYS", "4"))
-MAX_LINEUPNEWS_PLAYS = int(os.environ.get("MAX_LINEUPNEWS_PLAYS", "3"))
-MAX_SLATE_PLAYS = int(os.environ.get("MAX_SLATE_PLAYS", "2"))
+MAX_INJURY_PLAYS = int(os.environ.get("MAX_INJURY_PLAYS", "6"))
+MAX_LINEUPNEWS_PLAYS = int(os.environ.get("MAX_LINEUPNEWS_PLAYS", "4"))
+MAX_SLATE_PLAYS = int(os.environ.get("MAX_SLATE_PLAYS", "5"))
 
 # Consensus + steam + EV + market respect
 MIN_VENDORS_FOR_CONSENSUS = int(os.environ.get("MIN_VENDORS_FOR_CONSENSUS", "2"))
@@ -62,7 +62,7 @@ STEAM_MAX_AGE_MIN = int(os.environ.get("STEAM_MAX_AGE_MIN", "240"))
 
 # Output sizing
 MIN_PER_MARKET = int(os.environ.get("MIN_PER_MARKET", "0"))
-MAX_PER_MARKET = int(os.environ.get("MAX_PER_MARKET", "6"))
+MAX_PER_MARKET = int(os.environ.get("MAX_PER_MARKET", "10"))
 MAX_TOTAL_PLAYS = int(os.environ.get("MAX_TOTAL_PLAYS", "10"))
 
 # Windows
@@ -83,7 +83,7 @@ EV_MIN = float(os.environ.get("EV_MIN", "0.00"))
 VALUE_EDGE_MIN = float(os.environ.get("VALUE_EDGE_MIN", "0.00"))
 
 # Guardrails
-MIN_L10_MIN = float(os.environ.get("MIN_L10_MIN", "10"))
+MIN_L10_MIN = float(os.environ.get("MIN_L10_MIN", "8"))
 LINE_MIN_GAP = float(os.environ.get("LINE_MIN_GAP", "8.0"))
 ROLE_DROP_MIN = float(os.environ.get("ROLE_DROP_MIN", "5.0"))
 ROLE_DROP_RATE = float(os.environ.get("ROLE_DROP_RATE", "0.08"))
@@ -710,10 +710,10 @@ def player_risk_bucket(l10_min: float, sigma: float | None, prop_type: str) -> s
 
 def thresholds_for_bucket(bucket: str) -> dict:
     if bucket == "high":
-        return {"min_edge": 3.5, "min_prob": 0.66, "min_ev": 0.04, "min_value_edge": 0.04}
+        return {"min_edge": 2.2, "min_prob": 0.60, "min_ev": 0.01, "min_value_edge": 0.01}
     if bucket == "medium":
         return {"min_edge": 2.8, "min_prob": 0.63, "min_ev": 0.02, "min_value_edge": 0.02}
-    return {"min_edge": 2.0, "min_prob": 0.60, "min_ev": 0.00, "min_value_edge": 0.00}
+    return {"min_edge": 1.5, "min_prob": 0.57, "min_ev": 0.00, "min_value_edge": 0.00}
 
 
 def minutes_stability_ok(l10_min: float, l3_min: float, le_score: float) -> bool:
@@ -2161,10 +2161,10 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
         bucket = player_risk_bucket(p["m10"], p["sigma"], prop_type)
         thr = thresholds_for_bucket(bucket)
 
-        slate_min_edge = max(thr["min_edge"], 3.5)
-        slate_min_prob = max(thr["min_prob"], 0.64)
-        slate_min_ev = max(thr["min_ev"], 0.03)
-        slate_min_value = max(thr["min_value_edge"], 0.03)
+        slate_min_edge = max(thr["min_edge"], 2.5)
+        slate_min_prob = max(thr["min_prob"], 0.60)
+        slate_min_ev = max(thr["min_ev"], 0.01)
+        slate_min_value = max(thr["min_value_edge"], 0.01)
 
         if p["edge"] < slate_min_edge or p["prob_over"] < slate_min_prob:
             continue
