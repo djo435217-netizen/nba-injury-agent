@@ -627,7 +627,7 @@ def get_game_total_from_odds(gid: int, games_map: dict) -> float:
     if not gid:
         return 0.0
     try:
-        resp = _bdl_get("/nba/v1/odds", params={"game_ids[]": [int(gid)]})
+        resp = _bdl_get("/nba/v2/odds", params={"game_ids[]": [int(gid)]})
         for market in (resp.get("data") or []):
             mtype = (market.get("type") or "").lower()
             if "total" in mtype or "over_under" in mtype:
@@ -648,7 +648,7 @@ def get_spread_from_odds(gid: int, player_team: str, games_map: dict) -> tuple[f
     if not gid:
         return 0.0, False
     try:
-        resp = _bdl_get("/nba/v1/odds", params={"game_ids[]": [int(gid)]})
+        resp = _bdl_get("/nba/v2/odds", params={"game_ids[]": [int(gid)]})
         for market in (resp.get("data") or []):
             mtype = (market.get("type") or "").lower()
             if "spread" in mtype or "point_spread" in mtype:
@@ -1577,24 +1577,29 @@ def is_player_confirmed_starter(pid: int, gid: int) -> tuple[bool, bool]:
 
 def bdl_fetch_game_odds_full(gid: int) -> dict:
     """
-    Fetch full game odds including total and spread from BDL.
-    Uses /nba/v1/odds with game_ids[] -- correct God Tier endpoint.
-    Returns {"total": float, "spread": float, "fav_team": str}
+    Fetch game odds (total + spread) from BDL God Tier.
+    Correct endpoint: /nba/v2/odds with game_ids[] param.
 
-    Response schema per row:
+    Response fields per row:
+      game_id, vendor
       spread_home_value, spread_home_odds, spread_away_value, spread_away_odds
       moneyline_home_odds, moneyline_away_odds
       total_value, total_over_odds, total_under_odds
+
+    Returns {"total": float, "spread": float, "fav_team": str}
+    fav_team is "home" or "away" based on negative spread side.
     """
     if gid in GAME_ODDS_CACHE:
         return GAME_ODDS_CACHE[gid]
 
     result = {"total": 0.0, "spread": 0.0, "fav_team": ""}
     try:
-        resp = _bdl_get("/nba/v1/odds", params={"game_ids[]": [int(gid)]})
+        resp = _bdl_get("/nba/v2/odds", params={"game_ids[]": [int(gid)]})
         rows = resp.get("data") or []
         for row in rows:
-            # Game total
+            if int(row.get("game_id", 0)) != int(gid):
+                continue
+            # Total
             if result["total"] == 0.0:
                 tv = row.get("total_value")
                 if tv:
@@ -1602,18 +1607,16 @@ def bdl_fetch_game_odds_full(gid: int) -> dict:
                         result["total"] = float(tv)
                     except Exception:
                         pass
-            # Spread -- use first vendor available
+            # Spread
             if result["spread"] == 0.0:
                 sv = row.get("spread_home_value")
                 if sv:
                     try:
                         spread_val = float(sv)
                         result["spread"] = abs(spread_val)
-                        # Negative home spread = home team is favorite
                         result["fav_team"] = "home" if spread_val < 0 else "away"
                     except Exception:
                         pass
-            # Stop once we have both
             if result["total"] > 0 and result["spread"] > 0:
                 break
     except Exception as e:
