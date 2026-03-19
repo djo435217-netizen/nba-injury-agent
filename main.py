@@ -148,7 +148,7 @@ FINAL_SCORE_VALUE_W = float(os.environ.get("FINAL_SCORE_VALUE_W", "100.0"))
 FINAL_SCORE_EDGE_W = float(os.environ.get("FINAL_SCORE_EDGE_W", "2.0"))
 FINAL_SCORE_MINCONF_W = float(os.environ.get("FINAL_SCORE_MINCONF_W", "8.0"))
 FINAL_SCORE_MATCHUP_W = float(os.environ.get("FINAL_SCORE_MATCHUP_W", "10.0"))
-FINAL_SCORE_LE_W = float(os.environ.get("FINAL_SCORE_LE_W", "8.0"))
+# FINAL_SCORE_LE_W moved to SGP config section above
 FINAL_SCORE_STABILITY_W = float(os.environ.get("FINAL_SCORE_STABILITY_W", "8.0"))
 FINAL_SCORE_VOL_PENALTY_W = float(os.environ.get("FINAL_SCORE_VOL_PENALTY_W", "6.0"))
 
@@ -182,13 +182,21 @@ ENABLE_BET_SIZING = os.environ.get("ENABLE_BET_SIZING", "1") == "1"
 
 # ---- ODDS FILTER ----
 # Only show plays at this price or better (-105 = accept up to -105, reject -110+)
-MAX_JUICE = float(os.environ.get("MAX_JUICE", "-105"))
+MAX_JUICE = float(os.environ.get("MAX_JUICE", "-110"))
 
 # ---- SAME GAME PARLAY ----
 ENABLE_SGP = os.environ.get("ENABLE_SGP", "1") == "1"
 SGP_MIN_PLAYS = int(os.environ.get("SGP_MIN_PLAYS", "2"))
 SGP_MAX_PLAYS = int(os.environ.get("SGP_MAX_PLAYS", "3"))
 SGP_MIN_COMBINED_EV = float(os.environ.get("SGP_MIN_COMBINED_EV", "0.15"))
+
+# Star player injury threshold -- injuries to these avg pts trigger bigger boosts
+STAR_PLAYER_MIN_AVG = float(os.environ.get("STAR_PLAYER_MIN_AVG", "20.0"))
+STAR_VACANCY_MULT = float(os.environ.get("STAR_VACANCY_MULT", "1.8"))
+
+# LE news weight in final score -- increase to surface news-driven plays more
+# Was 8.0, now 20.0 -- lineup news is one of the strongest edges we have
+FINAL_SCORE_LE_W = float(os.environ.get("FINAL_SCORE_LE_W", "20.0"))
 # Pace factor weight: how much opponent pace affects projection (0.0 = off)
 PACE_FACTOR_WEIGHT = float(os.environ.get("PACE_FACTOR_WEIGHT", "0.5"))
 # Enable opponent defensive stats adjustment
@@ -2468,12 +2476,14 @@ def build_news_score_map(news_items):
     out = {}
 
     pos_strong = re.compile(r"\b(will start|expected to start|starting lineup|draws start|named starter)\b", re.I)
-    pos_med = re.compile(r"\b(available|cleared|returns?|good to go|active|probable)\b", re.I)
-    pos_min = re.compile(r"\b(minutes restriction lifted|no minutes limit|minutes limit lifted|workload increased|bigger role)\b", re.I)
+    pos_med = re.compile(r"\b(available|cleared|returns?|good to go|active|probable|no injury designation)\b", re.I)
+    pos_min = re.compile(r"\b(minutes restriction lifted|no minutes limit|minutes limit lifted|workload increased|bigger role|increased role|expanded role)\b", re.I)
+    pos_hot = re.compile(r"\b(career high|career-high|season high|season-high|hot streak|upgraded to available)\b", re.I)
     neg_status = re.compile(r"\b(questionable|doubtful|game-time decision|gtd)\b", re.I)
-    neg_limit = re.compile(r"\b(minutes restriction|minutes monitored|limited to)\b", re.I)
-    neg_bench = re.compile(r"\b(coming off the bench|bench role|returning to bench role)\b", re.I)
-    neg_out = re.compile(r"\b(ruled out|will miss|out for|out vs|out tonight|inactive|won't play)\b", re.I)
+    neg_limit = re.compile(r"\b(minutes restriction|minutes monitored|limited to|on a minutes limit)\b", re.I)
+    neg_bench = re.compile(r"\b(coming off the bench|bench role|returning to bench role|moved to bench)\b", re.I)
+    neg_out = re.compile(r"\b(ruled out|will miss|out for|out vs|out tonight|inactive|won't play|will not play)\b", re.I)
+    neg_load = re.compile(r"\b(load management|sitting out|load manage)\b", re.I)
 
     def push(player_name, score, why):
         k = _clean_name(player_name)
@@ -2504,6 +2514,9 @@ def build_news_score_map(news_items):
         if pos_med.search(text):
             score += 0.5
             why_bits.append("positive_status")
+        if pos_hot.search(text):
+            score += 0.7
+            why_bits.append("hot_streak")
         if neg_status.search(text):
             score -= 0.9
             why_bits.append("negative_tag")
@@ -2516,6 +2529,9 @@ def build_news_score_map(news_items):
         if neg_out.search(text):
             score -= 1.4
             why_bits.append("out")
+        if neg_load.search(text):
+            score -= 1.6
+            why_bits.append("load_mgmt")
 
         if score == 0.0:
             continue
@@ -2851,10 +2867,21 @@ def build_injury_edges(
 
     vac_stat = ip10 * status_mult
     vac_min = im10 * status_mult
+
+    # Star player multiplier -- losing a 25+ ppg player is worth much more
+    # than losing a 12 ppg role player. Books are slow to adjust backup lines.
+    is_star = ip10 >= STAR_PLAYER_MIN_AVG
+    if is_star:
+        vac_stat *= STAR_VACANCY_MULT
+        vac_min *= 1.4
+        print(f"[INFO] STAR OUT: {injured_name} avg={ip10:.1f}pts -- boosting vacancy by {STAR_VACANCY_MULT}x")
+
     if not ((vac_min >= MIN_VAC_MIN) or (vac_stat >= MIN_VAC_STAT)):
         return []
 
     trigger_strength = min(100.0, (vac_min * 1.2 + vac_stat * 1.5))
+    if is_star:
+        trigger_strength = min(100.0, trigger_strength * 1.5)
     cand_ids = [pid for pid, _ in roster_tuples]
 
     stats_all = {}
@@ -3519,12 +3546,8 @@ def apply_exposure_caps(ideas):
 # -------------------- WHATSAPP CARD FORMATTER --------------------
 def format_play_card(play: dict, idx: int) -> str:
     """
-    IMPROVEMENT: Clean, scannable WhatsApp card format.
-
-    Each card is designed to be read in 3 seconds:
-    Line 1: Player, over line, tier label
-    Line 2: Key numbers -- projection, edge, probability, EV
-    Line 3: Context -- matchup, home/away, news signal
+    Clean actionable WhatsApp card.
+    Designed to be read in under 3 seconds and acted on immediately.
     """
     tier = play.get("tier", "")
     name = play["player_name"]
@@ -3534,7 +3557,7 @@ def format_play_card(play: dict, idx: int) -> str:
     prob = play["prob_over"] * 100
     ev = play["ev"]
     over_odds = int(play["over_odds"])
-    vendor = play["vendor"]
+    vendor = play["vendor"].upper()
     team = play.get("team", "")
 
     # Extract key context from why string -- keep it short
@@ -3583,11 +3606,25 @@ def format_play_card(play: dict, idx: int) -> str:
     if edge > 6.0 and prob > 0.88:
         alt_line_flag = "[ALT-LINE? verify on app]"
 
+    # Bet size
+    kelly = play.get("kelly_bet", 0)
+    bet_str = f"  BET ${kelly:.0f}" if ENABLE_BET_SIZING and kelly > 0 else ""
+
+    # News signal
+    le = play.get("le_score", 0)
+    news_flag = " [NEWS+]" if le > 0.8 else " [NEWS-]" if le < -0.5 else ""
+
+    # Load management warning
+    load_warn = " [LOAD-MGMT]" if "load_mgmt" in play.get("why", "") else ""
+
+    # Alt line warning
+    alt = " [ALT-LINE-verify]" if alt_line_flag else ""
+
     card = [
-        f"{idx}. {tier} {name} ({team}) OVER {line:.1f}{(' ' + alt_line_flag) if alt_line_flag else ''}",
-        f"   Proj {proj:.1f} | edge +{edge:.1f} | P={prob:.0f}% | EV={ev:+.2f}" +
-        (f" | BET ${play.get('kelly_bet',0):.0f}" if ENABLE_BET_SIZING and play.get('kelly_bet',0) > 0 else ""),
-        f"   {vendor} {over_odds:+d} | {matchup_hint} | {cons_note} {usage_display} {context}".rstrip().rstrip("|").strip(),
+        f"{idx}. {tier} -- {name} ({team})",
+        f"   OVER {line:.1f} @ {vendor} {over_odds:+d}{bet_str}",
+        f"   Proj {proj:.1f} | P={prob:.0f}% | EV={ev:+.2f} | edge +{edge:.1f}",
+        f"   {matchup_hint} {cons_note}{news_flag}{load_warn}{alt}".strip(),
     ]
     return "\n".join(card)
 
@@ -3886,11 +3923,11 @@ def run():
         hit_rate_str = get_hit_rate_summary()
 
         # IMPROVEMENT: Clean summary card at top for fast scanning
-        msg.append(f"[NBA] NBA PROPS -- {ts_et}")
+        msg.append(f"NBA PROPS {ts_et}")
+        msg.append(f"LOCK=high confidence  STRONG=solid  LEAN=small")
         if hit_rate_str:
             msg.append(hit_rate_str)
-        msg.append(f"[LOCK]=Lock  [STRONG]=Strong  [LEAN]=Lean")
-        msg.append("-" * 30)
+        msg.append("-" * 28)
         msg.append("")
 
         # Quick-scan card for each play
@@ -3902,9 +3939,13 @@ def run():
         # Injury context
         if triggers:
             msg.append("")
-            msg.append("\u1f691 Injury triggers:")
+            msg.append("INJURIES DRIVING PLAYS:")
             for t in triggers[:6]:
-                msg.append(f"  - {t}")
+                star_flag = " -- STAR OUT" if any(
+                    n in t.lower() for n in ["luka","embiid","giannis","curry",
+                    "lebron","durant","tatum","jokic","gilgeous","mitchell"]
+                ) else ""
+                msg.append(f"  {t}{star_flag}")
             msg.append("")
 
         # Detail section for each play
@@ -3957,7 +3998,12 @@ def run():
                         msg.append(f"  Suggested bet: ${sgp['sgp_kelly']:.0f}")
                     msg.append("")
 
-        msg.append(f"[CAPS] Caps: team<={MAX_PLAYS_PER_TEAM}, game<={MAX_PLAYS_PER_GAME}")
+        # Expected value summary
+        total_kelly = sum(p.get("kelly_bet", 0) for p in final_out)
+        total_ev = sum(p.get("ev", 0) * p.get("kelly_bet", 0) for p in final_out)
+        if total_kelly > 0:
+            msg.append(f"TOTAL ACTION: ${total_kelly:.0f} | EXPECTED: +${total_ev:.0f}")
+        msg.append(f"Caps: team<={MAX_PLAYS_PER_TEAM} game<={MAX_PLAYS_PER_GAME}")
         send_chunked("\n".join(msg).strip())
 
         record_sent(state, final_out, now_ts)
