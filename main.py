@@ -170,6 +170,25 @@ BLOWOUT_PENALTY = float(os.environ.get("BLOWOUT_PENALTY", "1.5"))
 USAGE_RATE_WEIGHT = float(os.environ.get("USAGE_RATE_WEIGHT", "0.15"))
 # Closing line value tracking
 ENABLE_CLV_TRACKING = os.environ.get("ENABLE_CLV_TRACKING", "1") == "1"
+
+# ---- KELLY CRITERION BET SIZING ----
+# Set your bankroll in Render environment as BANKROLL=2000
+# Quarter Kelly is standard -- aggressive enough to grow, safe enough to survive
+BANKROLL = float(os.environ.get("BANKROLL", "2000"))
+KELLY_FRACTION = float(os.environ.get("KELLY_FRACTION", "0.25"))  # 1/4 Kelly
+MIN_BET = float(os.environ.get("MIN_BET", "50"))
+MAX_BET = float(os.environ.get("MAX_BET", "300"))
+ENABLE_BET_SIZING = os.environ.get("ENABLE_BET_SIZING", "1") == "1"
+
+# ---- ODDS FILTER ----
+# Only show plays at this price or better (-105 = accept up to -105, reject -110+)
+MAX_JUICE = float(os.environ.get("MAX_JUICE", "-105"))
+
+# ---- SAME GAME PARLAY ----
+ENABLE_SGP = os.environ.get("ENABLE_SGP", "1") == "1"
+SGP_MIN_PLAYS = int(os.environ.get("SGP_MIN_PLAYS", "2"))
+SGP_MAX_PLAYS = int(os.environ.get("SGP_MAX_PLAYS", "3"))
+SGP_MIN_COMBINED_EV = float(os.environ.get("SGP_MIN_COMBINED_EV", "0.15"))
 # Pace factor weight: how much opponent pace affects projection (0.0 = off)
 PACE_FACTOR_WEIGHT = float(os.environ.get("PACE_FACTOR_WEIGHT", "0.5"))
 # Enable opponent defensive stats adjustment
@@ -475,6 +494,210 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 # -------------------- NEW: OPPONENT DEFENSIVE ADJUSTMENT --------------------
+def kelly_bet_size(prob_over: float, over_odds: float) -> float:
+    """
+    Quarter Kelly criterion bet sizing.
+
+    Kelly formula: f = (bp - q) / b
+      b = decimal odds payout (e.g. +100 = 1.0, -110 = 0.909)
+      p = your estimated probability of winning
+      q = 1 - p
+
+    Quarter Kelly = full Kelly x 0.25 for safety.
+    Capped between MIN_BET and MAX_BET.
+
+    Examples at $2000 bankroll:
+      +100 odds, 73% prob -> Kelly = (1.0*0.73 - 0.27)/1.0 = 0.46 -> 1/4 = 11.5% -> $230
+      -105 odds, 65% prob -> Kelly = (0.952*0.65 - 0.35)/0.952 = 0.28 -> 1/4 = 7% -> $140
+      -115 odds, 60% prob -> Kelly = (0.87*0.60 - 0.40)/0.87 = 0.14 -> 1/4 = 3.5% -> $70
+    """
+    if not ENABLE_BET_SIZING:
+        return 0.0
+    try:
+        b = american_to_payout(over_odds)
+        p = float(prob_over)
+        q = 1.0 - p
+        if b <= 0 or p <= 0:
+            return MIN_BET
+        kelly_full = (b * p - q) / b
+        if kelly_full <= 0:
+            return 0.0  # negative Kelly = do not bet
+        kelly_quarter = kelly_full * KELLY_FRACTION
+        raw_bet = kelly_quarter * BANKROLL
+        return _clamp(round(raw_bet / 5) * 5, MIN_BET, MAX_BET)  # round to $5
+    except Exception:
+        return MIN_BET
+
+
+def passes_juice_filter(over_odds: float) -> bool:
+    """
+    Filter out plays where the juice is too high.
+    MAX_JUICE=-105 means we only accept -105 or better (less juice).
+    Accepts: +200, +100, -100, -103, -105
+    Rejects: -108, -110, -115, -120
+    """
+    try:
+        odds = float(over_odds)
+        # Plus odds always pass
+        if odds >= 0:
+            return True
+        # Negative odds: accept if less negative than MAX_JUICE
+        # e.g. -103 > -105 (less negative) = passes
+        return odds >= float(MAX_JUICE)
+    except Exception:
+        return True
+
+
+def find_sgp_opportunities(plays: list, games_map: dict) -> list:
+    """
+    Same-Game Parlay detector.
+
+    Finds 2-3 player overs from the SAME game that are positively correlated:
+    - Players on the same team in a high-total game (both benefit from pace)
+    - Or both teams' leading scorers in a shootout game
+
+    Correlation logic:
+    - Two players on the same team = positive correlation (+15% combined prob boost)
+    - High game total (228+) = additional boost to both overs
+    - Avoid: players on opposite teams (negatively correlated -- one team wins = other loses)
+
+    SGP payout estimated as: (p1 * p2 * correlation_factor)
+    True SGP odds vary by book but we estimate based on individual odds.
+    """
+    if not ENABLE_SGP or len(plays) < SGP_MIN_PLAYS:
+        return []
+
+    # Group plays by game
+    by_game = {}
+    for p in plays:
+        gid = p.get("gid", 0)
+        if gid:
+            by_game.setdefault(gid, []).append(p)
+
+    sgps = []
+    for gid, game_plays in by_game.items():
+        if len(game_plays) < 2:
+            continue
+
+        game = games_map.get(int(gid), {})
+        home_team = normalize_team_name(game.get("home", ""))
+        away_team = normalize_team_name(game.get("away", ""))
+
+        # Get game total from odds cache
+        odds_data = GAME_ODDS_CACHE.get(int(gid), {})
+        game_total = odds_data.get("total", 0.0)
+
+        # Group by team
+        home_plays = [p for p in game_plays if normalize_team_name(p.get("team", "")) == home_team]
+        away_plays = [p for p in game_plays if normalize_team_name(p.get("team", "")) == away_team]
+
+        for team_plays in [home_plays, away_plays]:
+            if len(team_plays) < 2:
+                continue
+
+            team_name_sgp = team_plays[0].get("team", "")
+
+            # IMPROVEMENT: Require high game total for same-team SGP
+            # Two players on the same team both going over requires the whole
+            # team to score big -- that needs a high-total game (lots of possessions)
+            # Low total = slow pace = harder for both players to hit their numbers
+            if game_total > 0:
+                if game_total < 220.0:
+                    # Low total game -- skip SGP entirely, pace too slow
+                    continue
+                elif game_total < 228.0:
+                    # Medium total -- only do 2-leg SGPs with strong individual EVs
+                    max_legs = 2
+                    min_individual_ev = 0.25
+                else:
+                    # High total (228+) -- green light for 2-3 leg SGPs
+                    max_legs = SGP_MAX_PLAYS
+                    min_individual_ev = 0.15
+            else:
+                # No total data -- be conservative
+                max_legs = 2
+                min_individual_ev = 0.20
+
+            # Filter to players with sufficient individual EV
+            eligible = [p for p in team_plays if p.get("ev", 0) >= min_individual_ev]
+            if len(eligible) < 2:
+                continue
+
+            # Take top plays by final_score
+            team_plays_sorted = sorted(eligible, key=lambda x: x.get("final_score", 0), reverse=True)
+
+            for n in range(2, min(max_legs + 1, len(team_plays_sorted) + 1)):
+                combo = team_plays_sorted[:n]
+
+                # Correlation factor based on game total
+                # Higher total = stronger positive correlation between teammates
+                if game_total >= 232:
+                    corr_factor = 1.12  # very high total = strong correlation boost
+                elif game_total >= 228:
+                    corr_factor = 1.08  # high total = moderate boost
+                elif game_total >= 222:
+                    corr_factor = 1.04  # medium total = small boost
+                else:
+                    corr_factor = 1.00  # low total = no boost
+
+                combined_prob = 1.0
+                for p in combo:
+                    combined_prob *= min(0.95, p["prob_over"] * corr_factor)
+
+                combined_ev = sum(p["ev"] for p in combo)
+
+                if combined_ev < SGP_MIN_COMBINED_EV:
+                    continue
+
+                # Parlay odds estimate
+                # Higher correlation = less SGP tax (books take less on correlated legs)
+                sgp_tax = 0.80 if corr_factor >= 1.08 else 0.85
+                parlay_decimal = 1.0
+                for p in combo:
+                    parlay_decimal *= (1.0 + american_to_payout(p["over_odds"]))
+                parlay_decimal *= sgp_tax
+
+                if parlay_decimal >= 2.0:
+                    sgp_american = int((parlay_decimal - 1.0) * 100)
+                else:
+                    sgp_american = int(-100 / max(parlay_decimal - 1.0, 0.01))
+
+                sgp_kelly = kelly_bet_size(combined_prob, sgp_american)
+
+                # Build total context note
+                if game_total >= 228:
+                    total_context = f"HIGH-TOTAL({game_total:.0f}) -- pace favors both overs"
+                elif game_total >= 220:
+                    total_context = f"MED-TOTAL({game_total:.0f})"
+                elif game_total > 0:
+                    total_context = f"LOW-TOTAL({game_total:.0f}) -- caution"
+                else:
+                    total_context = "total unknown"
+
+                sgps.append({
+                    "plays": combo,
+                    "gid": gid,
+                    "team": team_name_sgp,
+                    "combined_prob": combined_prob,
+                    "combined_ev": combined_ev,
+                    "sgp_odds": sgp_american,
+                    "sgp_kelly": sgp_kelly,
+                    "game_total": game_total,
+                    "label": " + ".join(
+                        f"{p['player_name']} O{p['cons_line']:.1f}"
+                        for p in combo
+                    ),
+                    "note": (
+                        f"SGP {team_name_sgp} | {total_context} | "
+                        f"P={combined_prob*100:.0f}% | EV={combined_ev:+.2f} | "
+                        f"est.odds={sgp_american:+d} | corr={corr_factor:.2f}"
+                    ),
+                })
+
+    sgps.sort(key=lambda x: x["combined_ev"], reverse=True)
+    return sgps[:3]
+
+
 def get_rest_days(games: list, today_str: str) -> int:
     """
     Calculate days of rest since last game.
@@ -2888,6 +3111,10 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
         if ev < slate_min_ev:
             continue
 
+        # Juice filter -- skip plays with too much vig
+        if not passes_juice_filter(float(offer["over_odds"])):
+            continue
+
         steam = 0.0
         if ENABLE_STEAM:
             prev = get_prev_market(state, prop_type, pid, now_ts)
@@ -2913,6 +3140,7 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
             f"EV={ev:+.2f} | matchup={p['matchup_note']}{(' | ' + context_notes) if context_notes else ''}"
         )
 
+        kelly = kelly_bet_size(p["prob_over"], float(offer["over_odds"]))
         ideas.append({
             "section": "slate",
             "prop_type": prop_type,
@@ -3357,7 +3585,8 @@ def format_play_card(play: dict, idx: int) -> str:
 
     card = [
         f"{idx}. {tier} {name} ({team}) OVER {line:.1f}{(' ' + alt_line_flag) if alt_line_flag else ''}",
-        f"   Proj {proj:.1f} | edge +{edge:.1f} | P={prob:.0f}% | EV={ev:+.2f}",
+        f"   Proj {proj:.1f} | edge +{edge:.1f} | P={prob:.0f}% | EV={ev:+.2f}" +
+        (f" | BET ${play.get('kelly_bet',0):.0f}" if ENABLE_BET_SIZING and play.get('kelly_bet',0) > 0 else ""),
         f"   {vendor} {over_odds:+d} | {matchup_hint} | {cons_note} {usage_display} {context}".rstrip().rstrip("|").strip(),
     ]
     return "\n".join(card)
@@ -3384,48 +3613,6 @@ def run():
     state = load_state()
     old_players = state.get("players", {})
 
-    # ---- SELF-TEST: verify BDL is working ----
-    print("[TEST] Running BDL self-test...")
-    test_results = []
-    try:
-        # Test 1: games today
-        games_test = bdl_games_today(now_et)
-        test_results.append(f"Games today: {len(games_test)}")
-    except Exception as e:
-        test_results.append(f"Games FAIL: {e}")
-
-    try:
-        # Test 2: player stats -- Stephen Curry pid=115
-        stats_test = bdl_last_n_games_stats([115], _season_year(now_et), 5, "pts")
-        curry_games = stats_test.get(115, [])
-        test_results.append(f"Curry stats: {len(curry_games)} games, last={curry_games[-1] if curry_games else 'none'}")
-    except Exception as e:
-        test_results.append(f"Stats FAIL: {e}")
-
-    try:
-        # Test 3: props -- check first game
-        games_test2 = bdl_games_today(now_et)
-        if games_test2:
-            gid = list(games_test2.keys())[0]
-            props_test = bdl_fetch_props_for_game(gid, "fanduel", "points")
-            test_results.append(f"Props gid={gid}: {len(props_test)} rows from fanduel")
-        else:
-            test_results.append("Props: no games today")
-    except Exception as e:
-        test_results.append(f"Props FAIL: {e}")
-
-    try:
-        # Test 4: advanced stats
-        adv_test = bdl_fetch_advanced_stats([115], _season_year(now_et))
-        adv_games = adv_test.get(115, [])
-        test_results.append(f"Adv stats Curry: {len(adv_games)} games")
-    except Exception as e:
-        test_results.append(f"Adv stats FAIL: {e}")
-
-    diag = "BDL DIAGNOSTIC\n" + "\n".join(test_results)
-    print(f"[TEST] {diag}")
-    send_one(diag)
-    # ---- END SELF-TEST ----
 
     lines_map, games_map = build_today_props(now_et)
 
@@ -3511,7 +3698,6 @@ def run():
     if LINEUPEXPERTS:
         print(f"[INFO] LineupExperts news_items={len(news_items)} boosts={len(news_boosts)}")
 
-    print(f"[STEP] Starting injury engine. ENABLE_INJURY_TRIGGERS={ENABLE_INJURY_TRIGGERS} USE_LE={USE_LE_MAIN_INJURY_ENGINE} LINEUPEXPERTS={LINEUPEXPERTS}")
 
     # ---- Injury engine ----
     new_players = {}
@@ -3618,12 +3804,9 @@ def run():
 
             new_players = parsed
 
-    print(f"[STEP] Injury engine done. injury_ideas={len(injury_ideas_all)} triggers={len(triggers)}")
-
     # ---- Slate scan ----
     slate_ideas_all = []
     if ENABLE_SLATE_SCAN and (not deadline_exceeded()):
-        print(f"[STEP] Starting slate scan. ENABLE_SLATE_SCAN={ENABLE_SLATE_SCAN} deadline={deadline_exceeded()}")
         for pt in PROP_TYPES:
             if deadline_exceeded():
                 break
@@ -3631,8 +3814,6 @@ def run():
                 slate_scan_edges(now_et, pt, lines_map.get(pt, {}), state=state, now_ts=now_ts,
                                  news_boosts=news_boosts, news_scores=news_scores, games_map=games_map, adv_stats=adv_stats_all)
             )
-
-    print(f"[STEP] Slate scan done. slate_ideas={len(slate_ideas_all)}")
 
     # ---- Lineup news edges ----
     lineup_news_ideas_all = []
@@ -3669,7 +3850,6 @@ def run():
 
     combined = [v[1] for v in best.values()]
     combined = apply_cooldown(state, combined, now_ts)
-    print(f"[STEP] After merge+cooldown: {len(combined)} plays. deadline={deadline_exceeded()}")
 
     out_by_market = {}
     for pt in PROP_TYPES:
@@ -3761,6 +3941,21 @@ def run():
                 msg.append(f"  BET: {book} {odds:+d} | Proj {i['proj']:.1f} | edge +{i['edge']:.1f} | P={i['prob_over']*100:.0f}% | EV={i['ev']:+.2f}")
                 msg.append("")
             msg.append("")
+
+        # Same-game parlay suggestions
+        if ENABLE_SGP:
+            sgp_opps = find_sgp_opportunities(final_out, games_map)
+            if sgp_opps:
+                msg.append("")
+                msg.append("[SGP] SAME-GAME PARLAYS:")
+                msg.append("Estimated only -- verify odds on app")
+                msg.append("")
+                for sgp in sgp_opps:
+                    msg.append(f"- {sgp['label']}")
+                    msg.append(f"  {sgp['note']}")
+                    if sgp['sgp_kelly'] > 0:
+                        msg.append(f"  Suggested bet: ${sgp['sgp_kelly']:.0f}")
+                    msg.append("")
 
         msg.append(f"[CAPS] Caps: team<={MAX_PLAYS_PER_TEAM}, game<={MAX_PLAYS_PER_GAME}")
         send_chunked("\n".join(msg).strip())
