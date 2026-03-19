@@ -3468,6 +3468,8 @@ def run():
     if LINEUPEXPERTS:
         print(f"[INFO] LineupExperts news_items={len(news_items)} boosts={len(news_boosts)}")
 
+    print(f"[STEP] Starting injury engine. ENABLE_INJURY_TRIGGERS={ENABLE_INJURY_TRIGGERS} USE_LE={USE_LE_MAIN_INJURY_ENGINE} LINEUPEXPERTS={LINEUPEXPERTS}")
+
     # ---- Injury engine ----
     new_players = {}
     triggers = []
@@ -3573,9 +3575,12 @@ def run():
 
             new_players = parsed
 
+    print(f"[STEP] Injury engine done. injury_ideas={len(injury_ideas_all)} triggers={len(triggers)}")
+
     # ---- Slate scan ----
     slate_ideas_all = []
     if ENABLE_SLATE_SCAN and (not deadline_exceeded()):
+        print(f"[STEP] Starting slate scan. ENABLE_SLATE_SCAN={ENABLE_SLATE_SCAN} deadline={deadline_exceeded()}")
         for pt in PROP_TYPES:
             if deadline_exceeded():
                 break
@@ -3583,6 +3588,8 @@ def run():
                 slate_scan_edges(now_et, pt, lines_map.get(pt, {}), state=state, now_ts=now_ts,
                                  news_boosts=news_boosts, news_scores=news_scores, games_map=games_map, adv_stats=adv_stats_all)
             )
+
+    print(f"[STEP] Slate scan done. slate_ideas={len(slate_ideas_all)}")
 
     # ---- Lineup news edges ----
     lineup_news_ideas_all = []
@@ -3619,6 +3626,7 @@ def run():
 
     combined = [v[1] for v in best.values()]
     combined = apply_cooldown(state, combined, now_ts)
+    print(f"[STEP] After merge+cooldown: {len(combined)} plays. deadline={deadline_exceeded()}")
 
     out_by_market = {}
     for pt in PROP_TYPES:
