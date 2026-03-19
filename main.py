@@ -3657,10 +3657,26 @@ def run():
         send_one(f"[STRONG] NBA betting agent v2 test OK ({ts_et})")
         return
 
+
+
+    state = load_state()
+    old_players = state.get("players", {})
+
+    # ---- RUN WINDOW CHECK ----
+    hour = now_et.hour
+    # After 10pm ET -- games over
+    if hour >= 22:
+        print(f"[INFO] After 10pm ET -- games over, skipping full run")
+        save_state(state)
+        return
+    # Before 7am ET -- no lines posted
+    if hour < 7:
+        print(f"[INFO] Before 7am ET -- no lines yet, skipping")
+        save_state(state)
+        return
+
     # ---- MORNING RESULTS REMINDER ----
-    # Between 9am-10am ET, send a reminder to log last night's results
-    # Only fires once per day (checks state to avoid duplicate sends)
-    if 9 <= now_et.hour < 10:
+    if 9 <= hour < 10:
         today_key = f"results_reminder_{now_et.strftime('%Y-%m-%d')}"
         reminder_state = state.get("reminders", {})
         if today_key not in reminder_state:
@@ -3672,10 +3688,6 @@ def run():
                     save_state(state)
             except Exception as e:
                 print(f"[WARN] results reminder failed: {e}")
-
-    state = load_state()
-    old_players = state.get("players", {})
-
 
     lines_map, games_map = build_today_props(now_et)
 
