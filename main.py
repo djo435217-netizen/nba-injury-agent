@@ -38,7 +38,7 @@ ENABLE_SLATE_SCAN = os.environ.get("ENABLE_SLATE_SCAN", "1") == "1"
 
 # Exposure caps
 MAX_PLAYS_PER_TEAM = int(os.environ.get("MAX_PLAYS_PER_TEAM", "2"))
-MAX_PLAYS_PER_GAME = int(os.environ.get("MAX_PLAYS_PER_GAME", "4"))
+MAX_PLAYS_PER_GAME = int(os.environ.get("MAX_PLAYS_PER_GAME", "6"))
 
 # Card composition caps
 MAX_INJURY_PLAYS = int(os.environ.get("MAX_INJURY_PLAYS", "6"))
@@ -63,7 +63,7 @@ STEAM_MAX_AGE_MIN = int(os.environ.get("STEAM_MAX_AGE_MIN", "240"))
 # Output sizing
 MIN_PER_MARKET = int(os.environ.get("MIN_PER_MARKET", "0"))
 MAX_PER_MARKET = int(os.environ.get("MAX_PER_MARKET", "10"))
-MAX_TOTAL_PLAYS = int(os.environ.get("MAX_TOTAL_PLAYS", "10"))
+MAX_TOTAL_PLAYS = int(os.environ.get("MAX_TOTAL_PLAYS", "12"))
 
 # Windows
 BASELINE_GAMES = int(os.environ.get("BASELINE_GAMES", "20"))
@@ -188,7 +188,7 @@ MAX_JUICE = float(os.environ.get("MAX_JUICE", "-110"))
 ENABLE_SGP = os.environ.get("ENABLE_SGP", "1") == "1"
 SGP_MIN_PLAYS = int(os.environ.get("SGP_MIN_PLAYS", "2"))
 SGP_MAX_PLAYS = int(os.environ.get("SGP_MAX_PLAYS", "3"))
-SGP_MIN_COMBINED_EV = float(os.environ.get("SGP_MIN_COMBINED_EV", "0.15"))
+SGP_MIN_COMBINED_EV = float(os.environ.get("SGP_MIN_COMBINED_EV", "0.08"))
 
 # Star player injury threshold -- injuries to these avg pts trigger bigger boosts
 STAR_PLAYER_MIN_AVG = float(os.environ.get("STAR_PLAYER_MIN_AVG", "20.0"))
@@ -573,6 +573,7 @@ def find_sgp_opportunities(plays: list, games_map: dict) -> list:
     True SGP odds vary by book but we estimate based on individual odds.
     """
     if not ENABLE_SGP or len(plays) < SGP_MIN_PLAYS:
+        print(f"[SGP] Skipped: ENABLE_SGP={ENABLE_SGP} plays={len(plays)}")
         return []
 
     # Group plays by game
@@ -581,6 +582,10 @@ def find_sgp_opportunities(plays: list, games_map: dict) -> list:
         gid = p.get("gid", 0)
         if gid:
             by_game.setdefault(gid, []).append(p)
+
+    print(f"[SGP] Checking {len(by_game)} games for same-game opportunities")
+    for gid, gplays in by_game.items():
+        print(f"[SGP]   gid={gid}: {len(gplays)} plays -- {[p['player_name'] for p in gplays]}")
 
     sgps = []
     for gid, game_plays in by_game.items():
@@ -610,10 +615,10 @@ def find_sgp_opportunities(plays: list, games_map: dict) -> list:
             # team to score big -- that needs a high-total game (lots of possessions)
             # Low total = slow pace = harder for both players to hit their numbers
             if game_total > 0:
-                if game_total < 220.0:
-                    # Low total game -- skip SGP entirely, pace too slow
+                if game_total < 215.0:
+                    # Very low total game -- skip SGP
                     continue
-                elif game_total < 228.0:
+                elif game_total < 225.0:
                     # Medium total -- only do 2-leg SGPs with strong individual EVs
                     max_legs = 2
                     min_individual_ev = 0.25
@@ -1989,7 +1994,12 @@ def build_today_props(now_et: datetime):
                 market = pp.get("market") or {}
                 mtype = (market.get("type") or "").lower()
 
+                # Filter: only accept over_under markets, skip milestones
                 if mtype != "over_under":
+                    continue
+
+                # Extra safety: milestone odds are extreme (-1000+), skip those too
+                if isinstance(over_odds, (int, float)) and abs(float(over_odds)) > 500:
                     continue
 
                 try:
@@ -3646,6 +3656,22 @@ def run():
     if TEST_MODE:
         send_one(f"[STRONG] NBA betting agent v2 test OK ({ts_et})")
         return
+
+    # ---- MORNING RESULTS REMINDER ----
+    # Between 9am-10am ET, send a reminder to log last night's results
+    # Only fires once per day (checks state to avoid duplicate sends)
+    if 9 <= now_et.hour < 10:
+        today_key = f"results_reminder_{now_et.strftime('%Y-%m-%d')}"
+        reminder_state = state.get("reminders", {})
+        if today_key not in reminder_state:
+            try:
+                pending = get_pending_plays_for_reminder()
+                if pending:
+                    reminder_state[today_key] = int(now_et.timestamp())
+                    state["reminders"] = reminder_state
+                    save_state(state)
+            except Exception as e:
+                print(f"[WARN] results reminder failed: {e}")
 
     state = load_state()
     old_players = state.get("players", {})
