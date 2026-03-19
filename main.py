@@ -30,7 +30,7 @@ MAX_BODY_CHARS = int(os.environ.get("MAX_BODY_CHARS", "1500"))
 BOOK_VENDOR_RAW = os.environ.get("BOOK_VENDORS", os.environ.get("BOOK_VENDOR", "fanduel,draftkings,fanatics,caesars")).strip().lower()
 BOOK_VENDORS = [v.strip() for v in BOOK_VENDOR_RAW.split(",") if v.strip()]
 
-PROP_TYPES_RAW = os.environ.get("PROP_TYPES", "points").strip().lower()
+PROP_TYPES_RAW = os.environ.get("PROP_TYPES", "points,threes").strip().lower()
 PROP_TYPES = [p.strip() for p in PROP_TYPES_RAW.split(",") if p.strip()]
 
 ENABLE_INJURY_TRIGGERS = os.environ.get("ENABLE_INJURY_TRIGGERS", "1") == "1"
@@ -118,6 +118,20 @@ PLUS_HUNT_MIN_PROB = float(os.environ.get("PLUS_HUNT_MIN_PROB", "0.54"))
 PLUS_HUNT_MIN_VALUE_EDGE = float(os.environ.get("PLUS_HUNT_MIN_VALUE_EDGE", "0.02"))
 PLUS_HUNT_MIN_EV = float(os.environ.get("PLUS_HUNT_MIN_EV", "0.01"))
 PLUS_HUNT_TOPN = int(os.environ.get("PLUS_HUNT_TOPN", "7"))
+
+# ---- HIGH ODDS HUNTER (+250 and above) ----
+# Specifically hunts FanDuel alternate lines at +250 or better
+# These are the best value plays -- high payout, model says high probability
+HIGH_ODDS_HUNT_ENABLED = os.environ.get("HIGH_ODDS_HUNT_ENABLED", "1") == "1"
+HIGH_ODDS_MIN = float(os.environ.get("HIGH_ODDS_MIN", "250"))
+HIGH_ODDS_MIN_PROB = float(os.environ.get("HIGH_ODDS_MIN_PROB", "0.45"))
+HIGH_ODDS_MIN_EV = float(os.environ.get("HIGH_ODDS_MIN_EV", "0.05"))
+HIGH_ODDS_TOPN = int(os.environ.get("HIGH_ODDS_TOPN", "5"))
+HIGH_ODDS_VENDOR = os.environ.get("HIGH_ODDS_VENDOR", "fanduel").strip().lower()
+
+# Injury boost for high odds -- when star is out, backup player alternate lines
+# are often posted late and at inflated plus odds
+INJURY_HIGH_ODDS_BOOST = float(os.environ.get("INJURY_HIGH_ODDS_BOOST", "0.12"))
 
 # Threes
 THREES_BETA_BINOM = os.environ.get("THREES_BETA_BINOM", "1") == "1"
@@ -2563,9 +2577,10 @@ def apply_news_to_projection(proj: float, boost_rec: dict | None, cap: float = 0
 
 
 def parse_le_injuries(news_items):
-    out_pat = re.compile(r"\b(ruled out|will miss|out for|out vs|out tonight|inactive|won't play)\b", re.I)
+    out_pat = re.compile(r"\b(ruled out|will miss|out for|out vs|out tonight|inactive|won't play|will not play|dnp)\b", re.I)
     doubtful_pat = re.compile(r"\b(doubtful)\b", re.I)
-    questionable_pat = re.compile(r"\b(questionable|game-time decision|gtd)\b", re.I)
+    questionable_pat = re.compile(r"\b(questionable|game-time decision|gtd|listed as questionable)\b", re.I)
+    load_pat = re.compile(r"\b(load management|rest|sitting out)\b", re.I)
 
     injuries = {}
     for it in news_items:
@@ -2585,6 +2600,8 @@ def parse_le_injuries(news_items):
         status = ""
         if out_pat.search(title):
             status = "Out"
+        elif load_pat.search(title):
+            status = "Out"  # treat load management same as out for prop purposes
         elif doubtful_pat.search(title):
             status = "Doubtful"
         elif questionable_pat.search(title):
@@ -2594,7 +2611,23 @@ def parse_le_injuries(news_items):
             continue
 
         k = _clean_name(player)
-        injuries[k] = {"name": player, "team": team_hint, "status": status, "detail": title}
+
+        # Estimate avg pts from cache if available
+        avg_pts = 0.0
+        for pid, nm in PLAYER_NAME_CACHE.items():
+            if _clean_name(nm) == k:
+                # Rough estimate from recent games
+                avg_pts = 15.0  # default, gets refined in build_injury_edges
+                break
+
+        injuries[k] = {
+            "name": player,
+            "team": team_hint,
+            "status": status,
+            "detail": title,
+            "avg_pts": avg_pts,
+            "is_star": avg_pts >= 20.0,
+        }
 
     return injuries
 
@@ -3501,6 +3534,203 @@ def plus_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, n
     return ideas
 
 
+# -------------------- HIGH ODDS HUNTER (+250) --------------------
+
+def high_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts,
+                          news_boosts, news_scores, games_map=None, adv_stats=None,
+                          injury_vacancies=None):
+    """
+    Dedicated +250 and above odds hunter on FanDuel.
+
+    Strategy: beat the books at high odds by finding plays where:
+    1. Injury news has boosted a player (star teammate is out)
+    2. Player is on a hot streak (L3 avg well above season avg)
+    3. FanDuel is offering +250 or better on an alternate line
+    4. Model probability says the line is beatable
+
+    Why this works: When a star goes out, books post conservative alternate
+    lines for the backup player at high odds because they don't have good
+    data on how the backup performs as a primary option. We do.
+
+    Examples:
+    - Luka out -> Kyrie gets +300 for OVER 28.5 pts (he averages 24 but now primary)
+    - Embiid out -> Maxey gets +275 for OVER 32.5 pts (huge usage spike incoming)
+    """
+    if not HIGH_ODDS_HUNT_ENABLED or deadline_exceeded():
+        return []
+
+    season = _season_year(now_et)
+    today_str = now_et.strftime("%Y-%m-%d")
+    pids = list((lines_map_for_prop or {}).keys())
+    if not pids:
+        return []
+
+    stats_all = {}
+    if prop_type == "threes" and THREES_BETA_BINOM:
+        for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
+            if deadline_exceeded():
+                break
+            stats_all.update(bdl_last_n_games_threes(chunk_ids, season, BASELINE_GAMES))
+    else:
+        for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
+            if deadline_exceeded():
+                break
+            stats_all.update(bdl_last_n_games_stats(chunk_ids, season, BASELINE_GAMES, "pts"))
+
+    ideas = []
+    for pid in pids:
+        if deadline_exceeded():
+            break
+
+        games = stats_all.get(int(pid), [])
+        if len(games) < 5:
+            continue
+
+        # Only look at rows from the target high-odds vendor
+        all_rows = (lines_map_for_prop or {}).get(int(pid), [])
+        high_rows = [r for r in all_rows
+                     if str(r.get("vendor", "")).lower() == HIGH_ODDS_VENDOR
+                     and isinstance(r.get("over_odds"), (int, float))
+                     and float(r["over_odds"]) >= HIGH_ODDS_MIN]
+
+        if not high_rows:
+            continue
+
+        # Take the best odds (highest payout) row
+        high_rows.sort(key=lambda r: float(r["over_odds"]), reverse=True)
+        offer = high_rows[0]
+        line = float(offer["line"])
+        over_odds = float(offer["over_odds"])
+
+        name = PLAYER_NAME_CACHE.get(int(pid), f"Player {pid}")
+        le_score = float(news_scores.get(_clean_name(name), {"score": 0.0}).get("score", 0.0))
+        player_team = PLAYER_TEAM_CACHE.get(int(pid), "")
+
+        # Check if this player has injury news boost (teammate is out)
+        boost_rec = (news_boosts or {}).get(_clean_name(name))
+        has_injury_boost = boost_rec is not None and float(boost_rec.get("boost", 0)) > 0
+
+        # Check if player is in injury_vacancies (they are the BENEFICIARY)
+        is_beneficiary = False
+        if injury_vacancies:
+            for vac in injury_vacancies:
+                if _clean_name(name) in [_clean_name(n) for n in vac.get("beneficiaries", [])]:
+                    is_beneficiary = True
+                    break
+
+        # Build projection
+        p = build_player_projection(
+            games=games,
+            line=line,
+            prop_type=prop_type,
+            le_score=le_score,
+            news_boosts=news_boosts,
+            player_name=name,
+            player_team=player_team,
+            games_map=games_map,
+            gid=int(offer.get("gid") or offer.get("game_id") or 0),
+            today_str=today_str,
+            adv_games=(adv_stats or {}).get(int(pid), []),
+            player_id=int(pid),
+        )
+
+        # Apply injury boost to projection if applicable
+        if has_injury_boost or is_beneficiary:
+            p_proj = p["proj"] * (1.0 + INJURY_HIGH_ODDS_BOOST)
+            p_edge = p_proj - line
+            # Recalculate prob with boosted projection
+            if p["sigma"] and p["sigma"] > 0:
+                z = p_edge / max(p["sigma"], 1e-6)
+                p_prob = _norm_cdf(z)
+            else:
+                p_prob = p["prob_over"]
+            injury_tag = "INJURY-BOOST"
+        else:
+            p_proj = p["proj"]
+            p_edge = p["edge"]
+            p_prob = p["prob_over"]
+            injury_tag = ""
+
+        # Minimum probability check
+        if p_prob < HIGH_ODDS_MIN_PROB:
+            continue
+
+        # EV check
+        ev = ev_per_dollar(p_prob, over_odds)
+        if ev < HIGH_ODDS_MIN_EV:
+            continue
+
+        # Market prob
+        p_over_mkt = american_to_prob(over_odds)
+        value_edge = p_prob - p_over_mkt
+
+        # Hot streak detection
+        l3_avg = p.get("l3_avg", 0)
+        base_avg = p.get("base_avg", 0)
+        is_hot = l3_avg > base_avg * 1.15 if base_avg > 0 else False
+        hot_tag = "HOT-STREAK" if is_hot else ""
+
+        # Kelly size -- high odds = smaller Kelly
+        kelly = kelly_bet_size(p_prob, over_odds)
+
+        tags = " | ".join(filter(None, [injury_tag, hot_tag,
+                                         f"le={le_score:+.1f}" if le_score != 0 else ""]))
+
+        why = (
+            f"HIGH-ODDS HUNT {HIGH_ODDS_VENDOR.upper()} {int(over_odds):+d} | "
+            f"Proj {p_proj:.1f} vs line {line:.1f} | "
+            f"P={p_prob*100:.0f}% | EV={ev:+.2f} | edge +{p_edge:.1f} | "
+            f"L3={l3_avg:.1f} base={base_avg:.1f} | {tags}"
+        )
+
+        gid = int(offer.get("gid") or offer.get("game_id") or 0)
+        final_score = (ev * 50.0) + (value_edge * 80.0) + (p_edge * 1.5)
+        if has_injury_boost or is_beneficiary:
+            final_score += 20.0
+        if is_hot:
+            final_score += 10.0
+
+        ideas.append({
+            "section": "high_odds",
+            "prop_type": prop_type,
+            "player_name": name,
+            "player_id": int(pid),
+            "team": player_team,
+            "gid": gid,
+            "cons_line": float(line),
+            "line": float(line),
+            "proj": float(p_proj),
+            "edge": float(p_edge),
+            "prob_over": float(p_prob),
+            "market_prob": float(p_over_mkt),
+            "value_edge": float(value_edge),
+            "ev": float(ev),
+            "vendor": str(offer["vendor"]),
+            "over_odds": float(over_odds),
+            "under_odds": float(offer.get("under_odds", -999)),
+            "n_cons": 1,
+            "n_sharp": 1,
+            "steam": 0.0,
+            "trigger_strength": 20.0 if (has_injury_boost or is_beneficiary) else 0.0,
+            "trigger": f"High-odds hunt {HIGH_ODDS_VENDOR} {int(over_odds):+d}",
+            "why": why,
+            "le_score": float(le_score),
+            "min_conf": float(p.get("min_conf", 0.5)),
+            "stability_score": 0.0,
+            "final_score": float(final_score),
+            "tier": confidence_tier(p_edge, p_prob, ev, value_edge),
+            "consistency": float(p.get("consistency", 0.5)),
+            "kelly_bet": float(kelly),
+            "is_high_odds": True,
+            "injury_boost": has_injury_boost or is_beneficiary,
+        })
+
+        remember_market(state, prop_type, int(pid), offer, line, 1, now_ts)
+
+    ideas.sort(key=lambda x: (x["final_score"], x["ev"]), reverse=True)
+    return ideas[:HIGH_ODDS_TOPN]
+
+
 # -------------------- COOLDOWN / EXPOSURE --------------------
 def apply_cooldown(state, ideas, now_ts: int):
     sent = state.get("sent_bets", {}) or {}
@@ -3919,6 +4149,20 @@ def run():
             )
     plus_ideas_all = plus_ideas_all[:PLUS_HUNT_TOPN]
 
+    # ---- High odds hunt (+250 and above on FanDuel) ----
+    high_odds_all = []
+    if HIGH_ODDS_HUNT_ENABLED and (not deadline_exceeded()):
+        for pt in PROP_TYPES:
+            if deadline_exceeded():
+                break
+            high_odds_all.extend(
+                high_odds_hunt_edges(now_et, pt, lines_map.get(pt, {}), state=state, now_ts=now_ts,
+                                     news_boosts=news_boosts, news_scores=news_scores,
+                                     games_map=games_map, adv_stats=adv_stats_all)
+            )
+        high_odds_all = sorted(high_odds_all, key=lambda x: x["final_score"], reverse=True)[:HIGH_ODDS_TOPN]
+        print(f"[INFO] High-odds hunt: {len(high_odds_all)} plays at +{HIGH_ODDS_MIN:.0f} or better")
+
     # ---- Merge and deduplicate ----
     combined = injury_ideas_all + slate_ideas_all + lineup_news_ideas_all
     best = {}
@@ -4026,6 +4270,22 @@ def run():
                 msg.append("")
             msg.append("")
 
+        # High odds section (+250 and above)
+        if high_odds_all:
+            msg.append("FANDUEL +250 ATTACK:")
+            msg.append("These are alt lines at big plus odds -- smaller bets, big upside")
+            msg.append("")
+            for i in high_odds_all:
+                odds = int(i["over_odds"])
+                inj_flag = " [INJ-BOOST]" if i.get("injury_boost") else ""
+                kelly = i.get("kelly_bet", 0)
+                bet_str = f" BET ${kelly:.0f}" if kelly > 0 else ""
+                msg.append(f"- {i['player_name']} ({i['team']}) OVER {i['cons_line']:.1f}")
+                msg.append(f"  FANDUEL {odds:+d}{inj_flag}{bet_str}")
+                msg.append(f"  Proj {i['proj']:.1f} | P={i['prob_over']*100:.0f}% | EV={i['ev']:+.2f} | edge +{i['edge']:.1f}")
+                msg.append("")
+            msg.append("")
+
         # Same-game parlay suggestions
         if ENABLE_SGP:
             sgp_opps = find_sgp_opportunities(final_out, games_map)
@@ -4051,7 +4311,19 @@ def run():
 
         record_sent(state, final_out, now_ts)
     else:
-        print("[INFO] No plays cleared thresholds this run.")
+        # Still show high odds even if no main plays
+        if high_odds_all:
+            msg = [f"NBA PROPS {ts_et}", "No main plays -- but found high odds:",""]
+            for i in high_odds_all:
+                odds = int(i["over_odds"])
+                inj_flag = " [INJ]" if i.get("injury_boost") else ""
+                msg.append(f"- {i['player_name']} OVER {i['cons_line']:.1f} FANDUEL {odds:+d}{inj_flag}")
+                msg.append(f"  P={i['prob_over']*100:.0f}% EV={i['ev']:+.2f} Proj {i['proj']:.1f}")
+                msg.append("")
+            send_chunked("\n".join(msg).strip())
+            record_sent(state, high_odds_all, now_ts)
+        else:
+            print("[INFO] No plays cleared thresholds this run.")
 
 
     state["players"] = new_players
