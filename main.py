@@ -3384,6 +3384,49 @@ def run():
     state = load_state()
     old_players = state.get("players", {})
 
+    # ---- SELF-TEST: verify BDL is working ----
+    print("[TEST] Running BDL self-test...")
+    test_results = []
+    try:
+        # Test 1: games today
+        games_test = bdl_games_today(now_et)
+        test_results.append(f"Games today: {len(games_test)}")
+    except Exception as e:
+        test_results.append(f"Games FAIL: {e}")
+
+    try:
+        # Test 2: player stats -- Stephen Curry pid=115
+        stats_test = bdl_last_n_games_stats([115], _season_year(now_et), 5, "pts")
+        curry_games = stats_test.get(115, [])
+        test_results.append(f"Curry stats: {len(curry_games)} games, last={curry_games[-1] if curry_games else 'none'}")
+    except Exception as e:
+        test_results.append(f"Stats FAIL: {e}")
+
+    try:
+        # Test 3: props -- check first game
+        games_test2 = bdl_games_today(now_et)
+        if games_test2:
+            gid = list(games_test2.keys())[0]
+            props_test = bdl_fetch_props_for_game(gid, "fanduel", "points")
+            test_results.append(f"Props gid={gid}: {len(props_test)} rows from fanduel")
+        else:
+            test_results.append("Props: no games today")
+    except Exception as e:
+        test_results.append(f"Props FAIL: {e}")
+
+    try:
+        # Test 4: advanced stats
+        adv_test = bdl_fetch_advanced_stats([115], _season_year(now_et))
+        adv_games = adv_test.get(115, [])
+        test_results.append(f"Adv stats Curry: {len(adv_games)} games")
+    except Exception as e:
+        test_results.append(f"Adv stats FAIL: {e}")
+
+    diag = "BDL DIAGNOSTIC\n" + "\n".join(test_results)
+    print(f"[TEST] {diag}")
+    send_one(diag)
+    # ---- END SELF-TEST ----
+
     lines_map, games_map = build_today_props(now_et)
 
     season = _season_year(now_et)
