@@ -3384,6 +3384,49 @@ def run():
     state = load_state()
     old_players = state.get("players", {})
 
+    # ---- SELF-TEST: verify BDL is working ----
+    print("[TEST] Running BDL self-test...")
+    test_results = []
+    try:
+        # Test 1: games today
+        games_test = bdl_games_today(now_et)
+        test_results.append(f"Games today: {len(games_test)}")
+    except Exception as e:
+        test_results.append(f"Games FAIL: {e}")
+
+    try:
+        # Test 2: player stats -- Stephen Curry pid=115
+        stats_test = bdl_last_n_games_stats([115], _season_year(now_et), 5, "pts")
+        curry_games = stats_test.get(115, [])
+        test_results.append(f"Curry stats: {len(curry_games)} games, last={curry_games[-1] if curry_games else 'none'}")
+    except Exception as e:
+        test_results.append(f"Stats FAIL: {e}")
+
+    try:
+        # Test 3: props -- check first game
+        games_test2 = bdl_games_today(now_et)
+        if games_test2:
+            gid = list(games_test2.keys())[0]
+            props_test = bdl_fetch_props_for_game(gid, "fanduel", "points")
+            test_results.append(f"Props gid={gid}: {len(props_test)} rows from fanduel")
+        else:
+            test_results.append("Props: no games today")
+    except Exception as e:
+        test_results.append(f"Props FAIL: {e}")
+
+    try:
+        # Test 4: advanced stats
+        adv_test = bdl_fetch_advanced_stats([115], _season_year(now_et))
+        adv_games = adv_test.get(115, [])
+        test_results.append(f"Adv stats Curry: {len(adv_games)} games")
+    except Exception as e:
+        test_results.append(f"Adv stats FAIL: {e}")
+
+    diag = "BDL DIAGNOSTIC\n" + "\n".join(test_results)
+    print(f"[TEST] {diag}")
+    send_one(diag)
+    # ---- END SELF-TEST ----
+
     lines_map, games_map = build_today_props(now_et)
 
     season = _season_year(now_et)
@@ -3467,6 +3510,8 @@ def run():
 
     if LINEUPEXPERTS:
         print(f"[INFO] LineupExperts news_items={len(news_items)} boosts={len(news_boosts)}")
+
+    print(f"[STEP] Starting injury engine. ENABLE_INJURY_TRIGGERS={ENABLE_INJURY_TRIGGERS} USE_LE={USE_LE_MAIN_INJURY_ENGINE} LINEUPEXPERTS={LINEUPEXPERTS}")
 
     # ---- Injury engine ----
     new_players = {}
@@ -3573,9 +3618,12 @@ def run():
 
             new_players = parsed
 
+    print(f"[STEP] Injury engine done. injury_ideas={len(injury_ideas_all)} triggers={len(triggers)}")
+
     # ---- Slate scan ----
     slate_ideas_all = []
     if ENABLE_SLATE_SCAN and (not deadline_exceeded()):
+        print(f"[STEP] Starting slate scan. ENABLE_SLATE_SCAN={ENABLE_SLATE_SCAN} deadline={deadline_exceeded()}")
         for pt in PROP_TYPES:
             if deadline_exceeded():
                 break
@@ -3583,6 +3631,8 @@ def run():
                 slate_scan_edges(now_et, pt, lines_map.get(pt, {}), state=state, now_ts=now_ts,
                                  news_boosts=news_boosts, news_scores=news_scores, games_map=games_map, adv_stats=adv_stats_all)
             )
+
+    print(f"[STEP] Slate scan done. slate_ideas={len(slate_ideas_all)}")
 
     # ---- Lineup news edges ----
     lineup_news_ideas_all = []
@@ -3619,6 +3669,7 @@ def run():
 
     combined = [v[1] for v in best.values()]
     combined = apply_cooldown(state, combined, now_ts)
+    print(f"[STEP] After merge+cooldown: {len(combined)} plays. deadline={deadline_exceeded()}")
 
     out_by_market = {}
     for pt in PROP_TYPES:
