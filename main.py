@@ -3664,9 +3664,14 @@ def run():
 
     # ---- RUN WINDOW CHECK ----
     hour = now_et.hour
-    # After 10pm ET -- games over
-    if hour >= 22:
-        print(f"[INFO] After 10pm ET -- games over, skipping full run")
+    # After 11:30pm ET -- late games over
+    if hour >= 23 and minute >= 30:
+        print(f"[INFO] After 11:30pm ET -- all games over, skipping")
+        save_state(state)
+        return
+    if hour == 23 and minute < 30:
+        pass  # Still running, 9:30pm games still live
+    elif hour > 23:
         save_state(state)
         return
     # Before 7am ET -- no lines posted
