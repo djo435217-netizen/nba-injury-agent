@@ -1998,10 +1998,6 @@ def build_today_props(now_et: datetime):
                 if mtype != "over_under":
                     continue
 
-                # Extra safety: milestone odds are extreme (-1000+), skip those too
-                if isinstance(over_odds, (int, float)) and abs(float(over_odds)) > 500:
-                    continue
-
                 try:
                     line = float(pp.get("line_value"))
                 except Exception:
@@ -2009,6 +2005,10 @@ def build_today_props(now_et: datetime):
 
                 over_odds = market.get("over_odds")
                 under_odds = market.get("under_odds")
+
+                # Extra safety: milestone odds are extreme (-1000+), skip those too
+                if isinstance(over_odds, (int, float)) and abs(float(over_odds)) > 500:
+                    continue
                 if not isinstance(over_odds, (int, float)) or not isinstance(under_odds, (int, float)):
                     continue
 
