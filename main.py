@@ -119,6 +119,18 @@ PLUS_HUNT_MIN_VALUE_EDGE = float(os.environ.get("PLUS_HUNT_MIN_VALUE_EDGE", "0.0
 PLUS_HUNT_MIN_EV = float(os.environ.get("PLUS_HUNT_MIN_EV", "0.01"))
 PLUS_HUNT_TOPN = int(os.environ.get("PLUS_HUNT_TOPN", "7"))
 
+# ---- BREAKOUT DETECTOR ----
+# Catches role players having breakout games or on hot streaks
+# When L3 avg is significantly above baseline, weight it much more heavily
+BREAKOUT_MIN_RATIO = float(os.environ.get("BREAKOUT_MIN_RATIO", "1.25"))  # L3 must be 25% above base
+BREAKOUT_L3_WEIGHT = float(os.environ.get("BREAKOUT_L3_WEIGHT", "0.65"))  # in breakout mode L3 gets 65% weight
+BREAKOUT_BASE_WEIGHT = float(os.environ.get("BREAKOUT_BASE_WEIGHT", "0.15"))  # base gets only 15%
+BREAKOUT_L10_WEIGHT = float(os.environ.get("BREAKOUT_L10_WEIGHT", "0.20"))  # L10 gets 20%
+BREAKOUT_MIN_GAMES = int(os.environ.get("BREAKOUT_MIN_GAMES", "3"))  # need at least 3 L3 games
+
+# Role expansion -- when player's L3 minutes >> L10 minutes (getting more playing time)
+ROLE_EXP_MIN_DELTA = float(os.environ.get("ROLE_EXP_MIN_DELTA", "4.0"))  # 4+ extra min in L3 vs L10
+
 # ---- HIGH ODDS HUNTER (+250 and above) ----
 # Specifically hunts FanDuel alternate lines at +250 or better
 # These are the best value plays -- high payout, model says high probability
@@ -152,8 +164,8 @@ LE_NO_TIME_FILTER = os.environ.get("LE_NO_TIME_FILTER", "0") == "1"
 
 USE_LE_MAIN_INJURY_ENGINE = os.environ.get("USE_LE_MAIN_INJURY_ENGINE", "1") == "1"
 LE_NEWS_ENGINE_ENABLED = os.environ.get("LE_NEWS_ENGINE_ENABLED", "1") == "1"
-LE_NEWS_MIN_SCORE = float(os.environ.get("LE_NEWS_MIN_SCORE", "0.50"))
-LE_NEWS_MIN_EFFECT = float(os.environ.get("LE_NEWS_MIN_EFFECT", "0.03"))
+LE_NEWS_MIN_SCORE = float(os.environ.get("LE_NEWS_MIN_SCORE", "0.30"))
+LE_NEWS_MIN_EFFECT = float(os.environ.get("LE_NEWS_MIN_EFFECT", "0.02"))
 LE_NEWS_TOPN = int(os.environ.get("LE_NEWS_TOPN", "5"))
 
 # Final ranking weights
@@ -1266,14 +1278,18 @@ def thresholds_for_bucket(bucket: str) -> dict:
     if bucket == "high":
         return {"min_edge": 2.2, "min_prob": 0.60, "min_ev": 0.01, "min_value_edge": 0.01}
     if bucket == "medium":
-        return {"min_edge": 2.8, "min_prob": 0.63, "min_ev": 0.02, "min_value_edge": 0.02}
-    return {"min_edge": 1.2, "min_prob": 0.55, "min_ev": 0.00, "min_value_edge": 0.00}
+        return {"min_edge": 1.8, "min_prob": 0.57, "min_ev": 0.00, "min_value_edge": 0.00}
+    return {"min_edge": 1.2, "min_prob": 0.54, "min_ev": 0.00, "min_value_edge": 0.00}
 
 
 def minutes_stability_ok(l10_min: float, l3_min: float, le_score: float) -> bool:
-    if abs(l3_min - l10_min) <= 3.0:
+    # Allow larger minute swings -- role expansion is a GOOD signal not a bad one
+    if abs(l3_min - l10_min) <= 6.0:
         return True
-    if le_score >= 0.8:
+    if le_score >= 0.5:
+        return True
+    # Also OK if player is getting MORE minutes (role expansion)
+    if l3_min > l10_min:
         return True
     return False
 
@@ -2163,17 +2179,63 @@ def compute_projection_components_points(games_all, line):
     }
 
 
-def compute_proj_rate(rate_base, rate_l10, rate_l3):
+def compute_proj_rate(rate_base, rate_l10, rate_l3, base_avg=0.0, l3_avg=0.0,
+                      base_min=0.0, l3_min=0.0):
     """
-    IMPROVEMENT: Use configurable recency weights (default: base 35%, L10 35%, L3 30%).
-    Original was base 45% / L10 35% / L3 20%, which under-weighted recent form.
-    Hot streaks and cold stretches matter more for player points than season averages.
+    Smart recency weighting with breakout detection.
+
+    Normal players: base 35% / L10 35% / L3 30%
+
+    Breakout mode (L3 avg >= 25% above base avg):
+    Heavily weight recent form -- this is a player on a hot streak
+    or in an expanded role. The season average is misleading.
+    Example: Jared McCain averaging 12pts on season but 22pts L3
+    -> weight L3 at 65%, ignore season average almost entirely
+
+    Role expansion mode (L3 minutes >= 4 more than L10 minutes):
+    Player is getting significantly more playing time recently
+    -> adjust for the minutes increase, not just the scoring rate
     """
-    total = PROJ_WEIGHT_BASE + PROJ_WEIGHT_L10 + PROJ_WEIGHT_L3
-    w_base = PROJ_WEIGHT_BASE / total
-    w_l10 = PROJ_WEIGHT_L10 / total
-    w_l3 = PROJ_WEIGHT_L3 / total
-    return (w_base * rate_base) + (w_l10 * rate_l10) + (w_l3 * rate_l3)
+    # Check for breakout
+    if (base_avg > 3.0 and l3_avg > 0 and
+            l3_avg >= base_avg * BREAKOUT_MIN_RATIO):
+        # Breakout mode -- trust recent form much more
+        w_base = BREAKOUT_BASE_WEIGHT
+        w_l10 = BREAKOUT_L10_WEIGHT
+        w_l3 = BREAKOUT_L3_WEIGHT
+        total = w_base + w_l10 + w_l3
+    else:
+        total = PROJ_WEIGHT_BASE + PROJ_WEIGHT_L10 + PROJ_WEIGHT_L3
+        w_base = PROJ_WEIGHT_BASE / total
+        w_l10 = PROJ_WEIGHT_L10 / total
+        w_l3 = PROJ_WEIGHT_L3 / total
+        total = 1.0
+
+    return (w_base * rate_base + w_l10 * rate_l10 + w_l3 * rate_l3) / total
+
+
+def is_breakout_player(base_avg: float, l3_avg: float, l3_min: float, l10_min: float) -> tuple[bool, str]:
+    """
+    Detect if a player is in breakout/hot-streak mode.
+    Returns (is_breakout, reason_string)
+
+    This catches:
+    - Jared McCain type: low season avg but recent explosion
+    - OG Anunoby type: consistent player suddenly playing 40min
+    - Injury beneficiary: role player absorbing star's minutes
+    """
+    reasons = []
+
+    # Scoring breakout: L3 avg >= 25% above season avg
+    if base_avg > 3.0 and l3_avg >= base_avg * BREAKOUT_MIN_RATIO:
+        pct = ((l3_avg / base_avg) - 1.0) * 100
+        reasons.append(f"scoring-breakout(+{pct:.0f}%)")
+
+    # Minutes breakout: getting significantly more playing time
+    if l3_min - l10_min >= ROLE_EXP_MIN_DELTA:
+        reasons.append(f"role-expansion(+{l3_min - l10_min:.1f}min)")
+
+    return bool(reasons), " | ".join(reasons)
 
 
 # -------------------- THREES --------------------
@@ -2711,8 +2773,15 @@ def build_player_projection(
     proj_min = projected_minutes(base_min, l10_min, l3_min, min_delta, injury_boost_min, le_score)
     min_conf = minutes_confidence(proj_min, l10_min, l3_min)
 
-    # IMPROVEMENT: Use compute_proj_rate with configurable weights
-    proj_rate = compute_proj_rate(rate_base, rate_l10, rate_l3)
+    # Use breakout-aware projection rate
+    proj_rate = compute_proj_rate(
+        rate_base, rate_l10, rate_l3,
+        base_avg=base_avg, l3_avg=l3_avg,
+        base_min=base_min, l3_min=l3_min
+    )
+
+    # Detect breakout for display
+    is_breakout, breakout_reason = is_breakout_player(base_avg, l3_avg, l3_min, l10_min)
 
     if prop_type == "threes" and THREES_BETA_BINOM:
         proj = proj_min * proj_rate
@@ -2861,6 +2930,8 @@ def build_player_projection(
         "starter_note": starter_note if "starter_note" in dir() else "",
         "adv_usage_pct": usage_stats.get("avg_usage_pct", 0.0) if "usage_stats" in dir() else 0.0,
         "adv_pie": usage_stats.get("avg_pie", 0.0) if "usage_stats" in dir() else 0.0,
+        "is_breakout": is_breakout if "is_breakout" in dir() else False,
+        "breakout_reason": breakout_reason if "breakout_reason" in dir() else "",
     }
 
 
@@ -3053,6 +3124,8 @@ def build_injury_edges(
 
         ideas.append({
             "section": "injury",
+            "is_breakout": p.get("is_breakout", False),
+            "breakout_reason": p.get("breakout_reason", ""),
             "prop_type": prop_type,
             "player_name": nm,
             "player_id": int(pid),
@@ -3169,10 +3242,17 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
         bucket = player_risk_bucket(p["m10"], p["sigma"], prop_type)
         thr = thresholds_for_bucket(bucket)
 
-        slate_min_edge = max(thr["min_edge"], 2.0)
-        slate_min_prob = max(thr["min_prob"], 0.58)
-        slate_min_ev = max(thr["min_ev"], 0.00)
-        slate_min_value = max(thr["min_value_edge"], 0.00)
+        # For breakout players, use softer thresholds
+        if p.get("is_breakout"):
+            slate_min_edge = max(thr["min_edge"] * 0.7, 1.2)
+            slate_min_prob = max(thr["min_prob"] * 0.92, 0.55)
+            slate_min_ev = 0.00
+            slate_min_value = 0.00
+        else:
+            slate_min_edge = max(thr["min_edge"], 1.8)
+            slate_min_prob = max(thr["min_prob"], 0.57)
+            slate_min_ev = max(thr["min_ev"], 0.00)
+            slate_min_value = max(thr["min_value_edge"], 0.00)
 
         if p["edge"] < slate_min_edge or p["prob_over"] < slate_min_prob:
             continue
@@ -3197,11 +3277,15 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
         stab = stability_score(p["edge"], p["sigma"])
         vol_pen = volatility_penalty(p["sigma"])
         final_score = final_play_score(ev, value_edge, p["edge"], p["min_conf"], p["matchup_score"], le_score, stab, vol_pen)
+        # Boost breakout players to surface them higher in the rankings
+        if p.get("is_breakout"):
+            final_score += 15.0
         tier = confidence_tier(p["edge"], p["prob_over"], ev, value_edge)
         context_notes = " | ".join(filter(None, [p["home_away_note"], p["b2b_note"]]))
+        breakout_tag = f" [BREAKOUT: {p['breakout_reason']}]" if p.get("is_breakout") else ""
 
         why = (
-            f"[{tier}] Slate. base {p['base_avg']:.1f} | L10 {p['l10_avg']:.1f} | L3 {p['l3_avg']:.1f} "
+            f"[{tier}]{breakout_tag} Slate. base {p['base_avg']:.1f} | L10 {p['l10_avg']:.1f} | L3 {p['l3_avg']:.1f} "
             f"(minL10 {p['l10_min']:.1f}, projMin {p['proj_min']:.1f}, rate {p['proj_rate']:.3f}, cons {p['consistency']:.2f}). "
             f"Deltamin={p['min_delta']:+.1f} Deltarate={p['rate_delta']:+.2f}. "
             f"Proj {p['proj']:.1f} vs line {line:.1f} | "
@@ -3213,6 +3297,8 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
         kelly = kelly_bet_size(p["prob_over"], float(offer["over_odds"]))
         ideas.append({
             "section": "slate",
+            "is_breakout": p.get("is_breakout", False),
+            "breakout_reason": p.get("breakout_reason", ""),
             "prop_type": prop_type,
             "player_name": name,
             "player_id": int(pid),
@@ -3341,10 +3427,10 @@ def lineup_news_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news
         bucket = player_risk_bucket(p["m10"], p["sigma"], prop_type)
         thr = thresholds_for_bucket(bucket)
 
-        le_min_edge = max(1.8, thr["min_edge"] - 0.5)
-        le_min_prob = max(0.58, thr["min_prob"] - 0.03)
-        le_min_value = max(0.01, thr["min_value_edge"])
-        le_min_ev = max(0.00, thr["min_ev"] - 0.01)
+        le_min_edge = max(1.2, thr["min_edge"] - 0.8)
+        le_min_prob = max(0.54, thr["min_prob"] - 0.06)
+        le_min_value = 0.00
+        le_min_ev = 0.00
 
         if p["edge"] < le_min_edge or p["prob_over"] < le_min_prob:
             continue
@@ -3860,8 +3946,13 @@ def format_play_card(play: dict, idx: int) -> str:
     # Alt line warning
     alt = " [ALT-LINE-verify]" if alt_line_flag else ""
 
+    # Breakout tag
+    breakout_flag = ""
+    if play.get("is_breakout"):
+        breakout_flag = f" [BREAKOUT: {play.get('breakout_reason','')}]"
+
     card = [
-        f"{idx}. {tier} -- {name} ({team})",
+        f"{idx}. {tier} -- {name} ({team}){breakout_flag}",
         f"   OVER {line:.1f} @ {vendor} {over_odds:+d}{bet_str}",
         f"   Proj {proj:.1f} | P={prob:.0f}% | EV={ev:+.2f} | edge +{edge:.1f}",
         f"   {matchup_hint} {cons_note}{news_flag}{load_warn}{alt}".strip(),
