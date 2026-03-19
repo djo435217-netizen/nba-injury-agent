@@ -30,6 +30,9 @@ MAX_BODY_CHARS = int(os.environ.get("MAX_BODY_CHARS", "1500"))
 BOOK_VENDOR_RAW = os.environ.get("BOOK_VENDORS", os.environ.get("BOOK_VENDOR", "fanduel,draftkings,fanatics,caesars")).strip().lower()
 BOOK_VENDORS = [v.strip() for v in BOOK_VENDOR_RAW.split(",") if v.strip()]
 
+# Extend prop types to include more markets
+# rebounds and assists are often mispriced -- less sharp money on these markets
+# points+rebounds, points+rebounds+assists combos are future additions
 PROP_TYPES_RAW = os.environ.get("PROP_TYPES", "points,threes").strip().lower()
 PROP_TYPES = [p.strip() for p in PROP_TYPES_RAW.split(",") if p.strip()]
 
@@ -130,6 +133,17 @@ BREAKOUT_MIN_GAMES = int(os.environ.get("BREAKOUT_MIN_GAMES", "3"))  # need at l
 
 # Role expansion -- when player's L3 minutes >> L10 minutes (getting more playing time)
 ROLE_EXP_MIN_DELTA = float(os.environ.get("ROLE_EXP_MIN_DELTA", "4.0"))  # 4+ extra min in L3 vs L10
+
+# ---- LADDER BETS ----
+# Ladders: player scores 10+, 20+, 30+ points sequentially
+# Best edge is in the MIDDLE leg (20+) -- books often underprice it
+# FanDuel posts these as separate over_under markets at specific milestone lines
+ENABLE_LADDER_SCAN = os.environ.get("ENABLE_LADDER_SCAN", "1") == "1"
+LADDER_MIN_PROJ = float(os.environ.get("LADDER_MIN_PROJ", "18.0"))  # only chase ladders for high scorers
+LADDER_MIN_PROB = float(os.environ.get("LADDER_MIN_PROB", "0.55"))  # minimum prob for any ladder leg
+LADDER_MIN_EV = float(os.environ.get("LADDER_MIN_EV", "0.05"))  # minimum EV per leg
+LADDER_LEGS = [10.5, 15.5, 20.5, 25.5, 30.5]  # standard ladder rungs
+LADDER_TOPN = int(os.environ.get("LADDER_TOPN", "5"))
 
 # ---- HIGH ODDS HUNTER (+250 and above) ----
 # Specifically hunts FanDuel alternate lines at +250 or better
@@ -437,6 +451,40 @@ def avg_stat_min_std(games):
     m_avg = sum(mins) / n
     var = sum((v - v_avg) ** 2 for v in vals) / max(n, 1)
     return v_avg, m_avg, math.sqrt(var)
+
+
+def median_stat(games, n=None) -> float:
+    """
+    Median is better than mean for volatile players.
+    A player with games [19,20,21,42] has mean=25.5 but median=20.5.
+    The median is the true floor of consistent performance.
+    Use this for ladder bet floor estimates and for filtering out fluky averages.
+    """
+    if not games:
+        return 0.0
+    sl = games[-min(len(games), n):] if n else games
+    vals = sorted(x[1] for x in sl)
+    mid = len(vals) // 2
+    if len(vals) % 2 == 1:
+        return float(vals[mid])
+    return float((vals[mid-1] + vals[mid]) / 2.0)
+
+
+def floor_ceiling(games, n=10) -> tuple[float, float]:
+    """
+    Floor = 25th percentile of recent scoring (what player almost always hits)
+    Ceiling = 75th percentile (what player often reaches on good nights)
+    Used for ladder bets -- floor tells you the safe rung, ceiling the aggressive rung.
+    """
+    if not games:
+        return 0.0, 0.0
+    sl = sorted(x[1] for x in games[-min(len(games), n):])
+    n_sl = len(sl)
+    if n_sl < 4:
+        return float(sl[0]), float(sl[-1])
+    floor_idx = max(0, int(n_sl * 0.25))
+    ceil_idx = min(n_sl-1, int(n_sl * 0.75))
+    return float(sl[floor_idx]), float(sl[ceil_idx])
 
 
 def _slice_last(games, n):
@@ -2157,10 +2205,28 @@ def compute_projection_components_points(games_all, line):
 
     raw_sigma = l10_std if l10_std > 0 else base_std if base_std > 0 else STD_FLOOR
 
-    # IMPROVEMENT: Use adaptive sigma based on consistency
-    # Consistent players get tighter sigma so prob_over is more decisive
+    # Use adaptive sigma based on consistency
     cons = consistency_score(games_all)
     sigma = adaptive_sigma(games_all, max(STD_FLOOR, raw_sigma), cons)
+
+    # Median-blend: for volatile players, blend mean with median
+    # This prevents one big game from inflating projections
+    l10_median = median_stat(l10_slice)
+    l3_median = median_stat(l3_slice)
+    # If median is >15% below mean, player is volatile -- use blend
+    if l10_avg > 5 and l10_median < l10_avg * 0.85:
+        l10_avg_adj = (l10_avg * 0.60) + (l10_median * 0.40)  # 60% mean 40% median
+        l3_avg_adj = (l3_avg * 0.60) + (l3_median * 0.40)
+    else:
+        l10_avg_adj = l10_avg
+        l3_avg_adj = l3_avg
+
+    # Recalculate rates with adjusted averages
+    rate_l10 = _safe_rate(l10_avg_adj, l10_min)
+    rate_l3 = _safe_rate(l3_avg_adj, l3_min)
+
+    # Floor and ceiling for ladder hints
+    p_floor, p_ceiling = floor_ceiling(l10_slice)
 
     return {
         "base_avg": base_avg,
@@ -2176,6 +2242,9 @@ def compute_projection_components_points(games_all, line):
         "raw_sigma": raw_sigma,
         "consistency": cons,
         "line": float(line),
+        "floor": p_floor if "p_floor" in dir() else 0.0,
+        "ceiling": p_ceiling if "p_ceiling" in dir() else 0.0,
+        "l10_median": l10_median if "l10_median" in dir() else 0.0,
     }
 
 
@@ -3620,6 +3689,277 @@ def plus_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, n
     return ideas
 
 
+# -------------------- LADDER SCAN --------------------
+
+def scan_ladder_plays(now_et, lines_map_for_prop, state, now_ts,
+                       news_boosts, news_scores, games_map=None, adv_stats=None):
+    """
+    Ladder bet scanner.
+
+    How ladders work on FanDuel:
+    - You pick a player to score 10+, 20+, 30+ points
+    - Each leg is an independent over bet at escalating lines
+    - The payout compounds as you add legs
+    - Best played as individual bets on the mispriced middle leg
+      OR as a 2-leg same-game parlay (10+ and 20+)
+
+    Strategy:
+    1. Find players projecting 22+ points (high floor)
+    2. Check each ladder rung for value
+    3. The 20+ rung is most often mispriced -- books use round numbers
+       and a player averaging 23pts often gets 20+ at only +120 when
+       true probability is 68%+
+    4. Flag the best single leg AND suggest the 2-leg combo
+
+    Key insight: Consistent high scorers (cons >= 60%) are gold for
+    ladders because variance is low -- they reliably hit the middle rung.
+    """
+    if not ENABLE_LADDER_SCAN or deadline_exceeded():
+        return []
+
+    season = _season_year(now_et)
+    today_str = now_et.strftime("%Y-%m-%d")
+    prop_type = "points"
+
+    pids = list((lines_map_for_prop or {}).keys())
+    if not pids:
+        return []
+
+    # Load stats
+    stats_all = {}
+    stats_deadline = time.time() + 30
+    for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
+        if deadline_exceeded() or time.time() > stats_deadline:
+            break
+        try:
+            stats_all.update(bdl_last_n_games_stats(chunk_ids, season, BASELINE_GAMES, "pts"))
+        except Exception:
+            break
+
+    ladder_plays = []
+
+    for pid in pids:
+        if deadline_exceeded():
+            break
+
+        games = stats_all.get(int(pid), [])
+        if len(games) < 5:
+            continue
+
+        name = PLAYER_NAME_CACHE.get(int(pid), f"Player {pid}")
+        player_team = PLAYER_TEAM_CACHE.get(int(pid), "")
+        le_score = float(news_scores.get(_clean_name(name), {"score": 0.0}).get("score", 0.0))
+
+        # Get a projection first -- only chase ladders for real scorers
+        all_rows = (lines_map_for_prop or {}).get(int(pid), [])
+        if not all_rows:
+            continue
+
+        # Use consensus line as proxy for player quality
+        cons, n_cons, _ = consensus_line(all_rows)
+        if cons is None or cons < 12.0:
+            continue
+
+        # Build full projection
+        gid = int((all_rows[0].get("gid") or all_rows[0].get("game_id") or 0))
+        p = build_player_projection(
+            games=games,
+            line=float(cons),
+            prop_type=prop_type,
+            le_score=le_score,
+            news_boosts=news_boosts,
+            player_name=name,
+            player_team=player_team,
+            games_map=games_map,
+            gid=gid,
+            today_str=today_str,
+            adv_games=(adv_stats or {}).get(int(pid), []),
+            player_id=int(pid),
+        )
+
+        proj = p["proj"]
+        sigma = p["sigma"] or 5.0
+        consistency = p.get("consistency", 0.5)
+
+        # Only chase ladders for players projecting well
+        if proj < LADDER_MIN_PROJ:
+            continue
+
+        # Get floor/ceiling for smarter rung selection
+        p_floor_val, p_ceiling_val = floor_ceiling(games)
+        l10_med = median_stat(games, n=10)
+
+        # Flag if mean >> median (volatile player -- risky for ladders)
+        is_volatile = (p["base_avg"] > 5 and
+                       l10_med < p.get("l10_avg", 0) * 0.80)
+        if is_volatile:
+            # For volatile players, anchor projection to median not mean
+            proj = max(proj * 0.88, l10_med * 1.05)
+
+        # Find all ladder-relevant rows (milestone-style lines at round numbers)
+        # FanDuel posts these as regular over_under at 10.5, 15.5, 20.5, 25.5
+        ladder_rows = {}
+        for r in all_rows:
+            try:
+                line_val = float(r["line"])
+                odds_val = float(r.get("over_odds", -9999))
+                vendor = str(r.get("vendor", "")).lower()
+            except Exception:
+                continue
+
+            # Match ladder rungs
+            for rung in LADDER_LEGS:
+                if abs(line_val - rung) < 0.6:
+                    # Keep best odds for this rung
+                    if rung not in ladder_rows or odds_val > float(ladder_rows[rung].get("over_odds", -9999)):
+                        ladder_rows[rung] = r
+                    break
+
+        if not ladder_rows:
+            continue
+
+        # Evaluate each ladder rung
+        best_leg = None
+        best_leg_ev = -999
+        all_legs = []
+
+        for rung, row in sorted(ladder_rows.items()):
+            over_odds = float(row.get("over_odds", -9999))
+            if over_odds < -300:  # too much juice
+                continue
+
+            # Probability of scoring over this rung
+            z = (proj - rung) / max(sigma, 1e-6)
+            prob = _norm_cdf(z)
+
+            # Adjust for consistency -- consistent players hit rungs more reliably
+            prob_adj = _clamp(prob * (0.85 + consistency * 0.30), 0.0, 0.97)
+
+            if prob_adj < LADDER_MIN_PROB:
+                continue
+
+            ev = ev_per_dollar(prob_adj, over_odds)
+            if ev < LADDER_MIN_EV:
+                continue
+
+            mkt_prob = american_to_prob(over_odds)
+            value_edge = prob_adj - mkt_prob
+            kelly = kelly_bet_size(prob_adj, over_odds)
+
+            leg = {
+                "rung": rung,
+                "prob": prob_adj,
+                "ev": ev,
+                "value_edge": value_edge,
+                "over_odds": over_odds,
+                "vendor": str(row.get("vendor", "")),
+                "kelly": kelly,
+                "row": row,
+            }
+            all_legs.append(leg)
+
+            if ev > best_leg_ev:
+                best_leg_ev = ev
+                best_leg = leg
+
+        if not best_leg:
+            continue
+
+        # Build 2-leg combo suggestion if we have 2+ valid legs
+        combo_note = ""
+        if len(all_legs) >= 2:
+            # Best 2 legs by EV
+            top2 = sorted(all_legs, key=lambda x: x["ev"], reverse=True)[:2]
+            # Combined prob (correlated -- same player scoring both)
+            # Use 0.92 correlation factor (hitting 10+ makes 20+ more likely)
+            corr = 0.92
+            combo_prob = top2[0]["prob"] * top2[1]["prob"] * (1.0 / corr)
+            combo_prob = min(combo_prob, 0.92)
+            # Estimated parlay odds
+            d1 = 1.0 + american_to_payout(top2[0]["over_odds"])
+            d2 = 1.0 + american_to_payout(top2[1]["over_odds"])
+            combo_dec = d1 * d2 * 0.88  # SGP tax
+            if combo_dec >= 2.0:
+                combo_am = int((combo_dec - 1.0) * 100)
+            else:
+                combo_am = int(-100 / max(combo_dec - 1.0, 0.01))
+            combo_ev = ev_per_dollar(combo_prob, combo_am)
+            combo_kelly = kelly_bet_size(combo_prob, combo_am)
+            combo_note = (
+                f"2-LEG COMBO: {top2[0]['rung']:.0f}+ & {top2[1]['rung']:.0f}+ | "
+                f"est. {combo_am:+d} | P={combo_prob*100:.0f}% | EV={combo_ev:+.2f} | BET ${combo_kelly:.0f}"
+            )
+
+        # Format all valid legs
+        legs_str = " | ".join(
+            f"{l['rung']:.0f}+ {int(l['over_odds']):+d} P={l['prob']*100:.0f}% EV={l['ev']:+.2f}"
+            for l in sorted(all_legs, key=lambda x: x["rung"])
+        )
+
+        floor_str = f"floor {p_floor_val:.1f}" if "p_floor_val" in dir() else ""
+        ceil_str = f"ceil {p_ceiling_val:.1f}" if "p_ceiling_val" in dir() else ""
+        med_str = f"median {l10_med:.1f}" if "l10_med" in dir() else ""
+        volatile_str = " VOLATILE-use-median" if ("is_volatile" in dir() and is_volatile) else ""
+
+        why = (
+            f"LADDER. Proj {proj:.1f} | {floor_str} | {ceil_str} | {med_str} | "
+            f"sigma {sigma:.1f} | cons {consistency:.0%}{volatile_str} | "
+            f"legs: {legs_str}"
+        )
+        if combo_note:
+            why += f" | {combo_note}"
+
+        is_breakout, breakout_reason = is_breakout_player(
+            p.get("base_avg", 0), p.get("l3_avg", 0),
+            p.get("l3_min", 0), p.get("l10_min", 0)
+        )
+
+        final_score = (best_leg_ev * 40.0) + (best_leg["value_edge"] * 80.0) + (proj * 0.5)
+        if is_breakout:
+            final_score += 12.0
+
+        ladder_plays.append({
+            "section": "ladder",
+            "prop_type": "points",
+            "player_name": name,
+            "player_id": int(pid),
+            "team": player_team,
+            "gid": gid,
+            "cons_line": float(cons),
+            "line": float(best_leg["rung"]),
+            "proj": float(proj),
+            "edge": float(proj - best_leg["rung"]),
+            "prob_over": float(best_leg["prob"]),
+            "market_prob": float(american_to_prob(best_leg["over_odds"])),
+            "value_edge": float(best_leg["value_edge"]),
+            "ev": float(best_leg["ev"]),
+            "vendor": str(best_leg["vendor"]),
+            "over_odds": float(best_leg["over_odds"]),
+            "under_odds": -999.0,
+            "n_cons": int(n_cons),
+            "n_sharp": 1,
+            "steam": 0.0,
+            "trigger_strength": 0.0,
+            "trigger": "Ladder scan",
+            "why": why,
+            "le_score": float(le_score),
+            "min_conf": float(p.get("min_conf", 0.5)),
+            "stability_score": float(stability_score(proj - best_leg["rung"], sigma)),
+            "final_score": float(final_score),
+            "tier": confidence_tier(proj - best_leg["rung"], best_leg["prob"],
+                                     best_leg["ev"], best_leg["value_edge"]),
+            "consistency": float(consistency),
+            "kelly_bet": float(best_leg["kelly"]),
+            "is_breakout": is_breakout,
+            "breakout_reason": breakout_reason,
+            "all_legs": all_legs,
+            "combo_note": combo_note,
+        })
+
+    ladder_plays.sort(key=lambda x: x["final_score"], reverse=True)
+    return ladder_plays[:LADDER_TOPN]
+
+
 # -------------------- HIGH ODDS HUNTER (+250) --------------------
 
 def high_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts,
@@ -4240,6 +4580,16 @@ def run():
             )
     plus_ideas_all = plus_ideas_all[:PLUS_HUNT_TOPN]
 
+    # ---- Ladder scan ----
+    ladder_all = []
+    if ENABLE_LADDER_SCAN and (not deadline_exceeded()):
+        ladder_all = scan_ladder_plays(
+            now_et, lines_map.get("points", {}), state=state, now_ts=now_ts,
+            news_boosts=news_boosts, news_scores=news_scores,
+            games_map=games_map, adv_stats=adv_stats_all
+        )
+        print(f"[INFO] Ladder scan: {len(ladder_all)} plays found")
+
     # ---- High odds hunt (+250 and above on FanDuel) ----
     high_odds_all = []
     if HIGH_ODDS_HUNT_ENABLED and (not deadline_exceeded()):
@@ -4377,6 +4727,32 @@ def run():
                 msg.append("")
             msg.append("")
 
+        # Ladder section
+        if ladder_all:
+            msg.append("")
+            msg.append("LADDER PLAYS:")
+            msg.append("Best value rung shown -- check app for full ladder")
+            msg.append("")
+            for i in ladder_all:
+                odds = int(i["over_odds"])
+                kelly = i.get("kelly_bet", 0)
+                bet_str = f" BET ${kelly:.0f}" if kelly > 0 else ""
+                breakout_tag = " [BREAKOUT]" if i.get("is_breakout") else ""
+                msg.append(f"- {i['player_name']} ({i['team']}){breakout_tag}")
+                msg.append(f"  BEST LEG: {i['cons_line']:.0f}+ pts @ {i['vendor'].upper()} {odds:+d}{bet_str}")
+                msg.append(f"  Proj {i['proj']:.1f} | P={i['prob_over']*100:.0f}% | EV={i['ev']:+.2f}")
+                # Show all valid legs
+                if i.get("all_legs"):
+                    legs_line = " | ".join(
+                        f"{l['rung']:.0f}+ {int(l['over_odds']):+d}"
+                        for l in sorted(i["all_legs"], key=lambda x: x["rung"])
+                    )
+                    msg.append(f"  All rungs: {legs_line}")
+                if i.get("combo_note"):
+                    msg.append(f"  {i['combo_note']}")
+                msg.append("")
+            msg.append("")
+
         # Same-game parlay suggestions
         if ENABLE_SGP:
             sgp_opps = find_sgp_opportunities(final_out, games_map)
@@ -4413,6 +4789,17 @@ def run():
                 msg.append("")
             send_chunked("\n".join(msg).strip())
             record_sent(state, high_odds_all, now_ts)
+        elif ladder_all:
+            # No main plays but found ladder opportunities
+            msg2 = [f"NBA PROPS {ts_et}", "No main plays -- but ladder opps found:", ""]
+            for i in ladder_all[:3]:
+                odds = int(i["over_odds"])
+                msg2.append(f"- {i['player_name']} ({i['team']}) {i['cons_line']:.0f}+ pts {odds:+d}")
+                msg2.append(f"  Proj {i['proj']:.1f} | P={i['prob_over']*100:.0f}% | EV={i['ev']:+.2f}")
+                if i.get("combo_note"):
+                    msg2.append(f"  {i['combo_note']}")
+                msg2.append("")
+            send_chunked("\n".join(msg2).strip())
         else:
             print("[INFO] No plays cleared thresholds this run.")
 
