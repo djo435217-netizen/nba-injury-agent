@@ -453,6 +453,44 @@ def avg_stat_min_std(games):
     return v_avg, m_avg, math.sqrt(var)
 
 
+def prop_type_to_stat_key(prop_type: str) -> str:
+    """
+    Map prop type to the correct BallDontLie stat field.
+    This is the critical fix -- each prop type must use its own stat history.
+
+    points  -> pts
+    threes  -> fg3m (handled separately via bdl_last_n_games_threes)
+    rebounds -> reb (total rebounds = offensive + defensive)
+    assists  -> ast
+    blocks   -> blk
+    steals   -> stl
+    turnovers -> turnover
+    """
+    mapping = {
+        "points": "pts",
+        "pts": "pts",
+        "rebounds": "reb",
+        "reb": "reb",
+        "total_rebounds": "reb",
+        "assists": "ast",
+        "ast": "ast",
+        "blocks": "blk",
+        "blk": "blk",
+        "steals": "stl",
+        "stl": "stl",
+        "turnovers": "turnover",
+        "turnover": "turnover",
+    }
+    return mapping.get(prop_type.lower().strip(), "pts")
+
+
+def prop_type_is_threes(prop_type: str) -> bool:
+    return prop_type.lower().strip() in (
+        "threes", "three_pointers_made", "fg3m", "3pt_made",
+        "three_points_made", "three_point_field_goals_made"
+    )
+
+
 def median_stat(games, n=None) -> float:
     """
     Median is better than mean for volatile players.
@@ -2802,7 +2840,7 @@ def build_player_projection(
     - Adaptive sigma based on consistency
     - Confidence tier label
     """
-    if prop_type == "threes":
+    if prop_type_is_threes(prop_type):
         long_slice = _slice_last(games, LOOKBACK_GAMES)
         short_slice = _slice_last(games, SHORT_GAMES)
         base = _slice_last(games, BASELINE_GAMES)
@@ -2852,7 +2890,7 @@ def build_player_projection(
     # Detect breakout for display
     is_breakout, breakout_reason = is_breakout_player(base_avg, l3_avg, l3_min, l10_min)
 
-    if prop_type == "threes" and THREES_BETA_BINOM:
+    if prop_type_is_threes(prop_type) and THREES_BETA_BINOM:
         proj = proj_min * proj_rate
         proj += min(0.4, injury_boost_stat * 0.05)
     else:
@@ -2953,7 +2991,7 @@ def build_player_projection(
             pass  # position cached for future use
 
     # Compute edge and probability
-    if prop_type == "threes" and THREES_BETA_BINOM:
+    if prop_type_is_threes(prop_type) and THREES_BETA_BINOM:
         edge = proj - float(line)
         prob_over = threes_prob_over_beta_binom(games, float(line))
         if prob_over is None:
@@ -3034,12 +3072,13 @@ def build_injury_edges(
     if not injured_pid:
         return []
 
-    if prop_type == "threes":
+    if prop_type_is_threes(prop_type):
         inj_games = bdl_last_n_games_threes([injured_pid], season, BASELINE_GAMES).get(injured_pid, [])
         ip10 = sum(float(x[1]) for x in _slice_last(inj_games, LOOKBACK_GAMES)) / max(1, len(_slice_last(inj_games, LOOKBACK_GAMES)))
         im10 = sum(float(x[3]) for x in _slice_last(inj_games, LOOKBACK_GAMES)) / max(1, len(_slice_last(inj_games, LOOKBACK_GAMES)))
     else:
-        inj_games = bdl_last_n_games_stats([injured_pid], season, BASELINE_GAMES, "pts").get(injured_pid, [])
+        inj_stat_key = prop_type_to_stat_key(prop_type)
+        inj_games = bdl_last_n_games_stats([injured_pid], season, BASELINE_GAMES, inj_stat_key).get(injured_pid, [])
         ip10, im10, _ = avg_stat_min_std(_slice_last(inj_games, LOOKBACK_GAMES))
 
     if len(inj_games) < 3:
@@ -3068,16 +3107,17 @@ def build_injury_edges(
     cand_ids = [pid for pid, _ in roster_tuples]
 
     stats_all = {}
-    if prop_type == "threes":
+    if prop_type_is_threes(prop_type):
         for chunk_ids in _chunk(cand_ids, STAT_BATCH_SIZE):
             if deadline_exceeded():
                 break
             stats_all.update(bdl_last_n_games_threes(chunk_ids, season, BASELINE_GAMES))
     else:
+        inj_stat_key = prop_type_to_stat_key(prop_type)
         for chunk_ids in _chunk(cand_ids, STAT_BATCH_SIZE):
             if deadline_exceeded():
                 break
-            stats_all.update(bdl_last_n_games_stats(chunk_ids, season, BASELINE_GAMES, "pts"))
+            stats_all.update(bdl_last_n_games_stats(chunk_ids, season, BASELINE_GAMES, inj_stat_key))
 
     ideas = []
     for pid, nm in roster_tuples:
@@ -3242,16 +3282,17 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
         return []
 
     stats_all = {}
-    if prop_type == "threes" and THREES_BETA_BINOM:
+    if prop_type_is_threes(prop_type):
         for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
             if deadline_exceeded():
                 break
             stats_all.update(bdl_last_n_games_threes(chunk_ids, season, BASELINE_GAMES))
     else:
+        stat_key = prop_type_to_stat_key(prop_type)
         for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
             if deadline_exceeded():
                 break
-            stats_all.update(bdl_last_n_games_stats(chunk_ids, season, BASELINE_GAMES, "pts"))
+            stats_all.update(bdl_last_n_games_stats(chunk_ids, season, BASELINE_GAMES, stat_key))
 
     ideas = []
     for pid in pids:
@@ -3415,16 +3456,17 @@ def lineup_news_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news
         return []
 
     stats_all = {}
-    if prop_type == "threes" and THREES_BETA_BINOM:
+    if prop_type_is_threes(prop_type):
         for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
             if deadline_exceeded():
                 break
             stats_all.update(bdl_last_n_games_threes(chunk_ids, season, BASELINE_GAMES))
     else:
+        stat_key = prop_type_to_stat_key(prop_type)
         for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
             if deadline_exceeded():
                 break
-            stats_all.update(bdl_last_n_games_stats(chunk_ids, season, BASELINE_GAMES, "pts"))
+            stats_all.update(bdl_last_n_games_stats(chunk_ids, season, BASELINE_GAMES, stat_key))
 
     ideas = []
     for pid in pids:
@@ -3567,16 +3609,17 @@ def plus_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, n
         return []
 
     stats_all = {}
-    if prop_type == "threes" and THREES_BETA_BINOM:
+    if prop_type_is_threes(prop_type):
         for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
             if deadline_exceeded():
                 break
             stats_all.update(bdl_last_n_games_threes(chunk_ids, season, BASELINE_GAMES))
     else:
+        stat_key = prop_type_to_stat_key(prop_type)
         for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
             if deadline_exceeded():
                 break
-            stats_all.update(bdl_last_n_games_stats(chunk_ids, season, BASELINE_GAMES, "pts"))
+            stats_all.update(bdl_last_n_games_stats(chunk_ids, season, BASELINE_GAMES, stat_key))
 
     ideas = []
     for pid in pids:
@@ -3992,16 +4035,17 @@ def high_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts,
         return []
 
     stats_all = {}
-    if prop_type == "threes" and THREES_BETA_BINOM:
+    if prop_type_is_threes(prop_type):
         for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
             if deadline_exceeded():
                 break
             stats_all.update(bdl_last_n_games_threes(chunk_ids, season, BASELINE_GAMES))
     else:
+        stat_key = prop_type_to_stat_key(prop_type)
         for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
             if deadline_exceeded():
                 break
-            stats_all.update(bdl_last_n_games_stats(chunk_ids, season, BASELINE_GAMES, "pts"))
+            stats_all.update(bdl_last_n_games_stats(chunk_ids, season, BASELINE_GAMES, stat_key))
 
     ideas = []
     for pid in pids:
@@ -4364,16 +4408,27 @@ def run():
     all_prop_pids = list({int(x) for x in all_prop_pids})
 
     if all_prop_pids:
-        stats_deadline = time.time() + 50  # hard 50s budget for stats warmup
-        for chunk_ids in _chunk(all_prop_pids, STAT_BATCH_SIZE):
+        # Warmup stats for each prop type separately
+        stats_deadline = time.time() + 50
+        warmed_keys = set()
+        for pt in PROP_TYPES:
             if deadline_exceeded() or time.time() > stats_deadline:
-                print("[INFO] Stats warmup time budget reached")
                 break
-            try:
-                bdl_last_n_games_stats(chunk_ids, season, max(LOOKBACK_GAMES, 8), "pts")
-            except Exception as e:
-                print(f"[WARN] warmup stats failed: {e}")
-                break
+            if prop_type_is_threes(pt):
+                continue  # threes handled separately below
+            sk = prop_type_to_stat_key(pt)
+            if sk in warmed_keys:
+                continue
+            warmed_keys.add(sk)
+            for chunk_ids in _chunk(all_prop_pids, STAT_BATCH_SIZE):
+                if deadline_exceeded() or time.time() > stats_deadline:
+                    print(f"[INFO] Stats warmup time budget reached ({sk})")
+                    break
+                try:
+                    bdl_last_n_games_stats(chunk_ids, season, max(LOOKBACK_GAMES, 8), sk)
+                except Exception as e:
+                    print(f"[WARN] warmup stats failed ({sk}): {e}")
+                    break
 
         if "threes" in PROP_TYPES and THREES_BETA_BINOM:
             threes_deadline = time.time() + 30  # hard 30s budget
