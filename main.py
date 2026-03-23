@@ -4705,130 +4705,168 @@ def run():
         msg = []
         hit_rate_str = get_hit_rate_summary()
 
-        # IMPROVEMENT: Clean summary card at top for fast scanning
-        msg.append(f"NBA PROPS {ts_et}")
-        msg.append(f"LOCK=high confidence  STRONG=solid  LEAN=small")
+        # ---- SECTION 1: HEADER ----
+        # One line. Time + hit rate if we have it.
+        header = f"NBA {ts_et}"
         if hit_rate_str:
-            msg.append(hit_rate_str)
-        msg.append("-" * 28)
-        msg.append("")
+            header += f" | {hit_rate_str}"
+        msg.append(header)
 
-        # Quick-scan card for each play
-        for idx, play in enumerate(final_out, 1):
-            msg.append(format_play_card(play, idx))
-        msg.append("")
-        msg.append("-" * 30)
-
-        # Injury context
+        # Injury flags on one line at top
         if triggers:
-            msg.append("")
-            msg.append("INJURIES DRIVING PLAYS:")
-            for t in triggers[:6]:
-                star_flag = " -- STAR OUT" if any(
-                    n in t.lower() for n in ["luka","embiid","giannis","curry",
-                    "lebron","durant","tatum","jokic","gilgeous","mitchell"]
-                ) else ""
-                msg.append(f"  {t}{star_flag}")
-            msg.append("")
-
-        # Detail section for each play
-        msg.append("[LIST] DETAIL:")
+            star_outs = [t for t in triggers if any(
+                n in t.lower() for n in ["luka","embiid","giannis","curry",
+                "lebron","durant","tatum","jokic","gilgeous","mitchell","sga"]
+            )]
+            if star_outs:
+                msg.append("STAR OUT: " + " | ".join(star_outs[:3]))
+            elif triggers:
+                msg.append("INJ: " + " | ".join(triggers[:2]))
         msg.append("")
-        for pt in PROP_TYPES:
-            picks = out_by_market.get(pt, [])
-            if not picks:
-                continue
-            label = "Points" if pt == "points" else ("3PT" if pt in ("threes", "three_pointers_made") else pt)
-            msg.append(f"[ {label} ]")
 
-            for i in picks:
-                msg.append(f"- {i['player_name']} OVER {i['cons_line']:.1f}")
-                msg.append(f"  {i['why']}")
-                msg.append("")
+        # ---- SECTION 2: STRAIGHT BETS ----
+        # Each play is exactly 3 lines:
+        # Line 1: Player + market + line + book + odds
+        # Line 2: Proj / probability / EV / kelly bet
+        # Line 3: Why in plain English
+        msg.append("-- STRAIGHT BETS --")
+        for i, play in enumerate(final_out, 1):
+            tier = play.get("tier", "")
+            name = play["player_name"]
+            team = play.get("team", "")
+            line = play["cons_line"]
+            book = play["vendor"].upper()
+            odds = int(play["over_odds"])
+            proj = play["proj"]
+            prob = play["prob_over"] * 100
+            ev = play["ev"]
+            kelly = play.get("kelly_bet", 0)
+            prop = play.get("prop_type", "pts").upper()[:3]
+            breakout = " BREAKOUT" if play.get("is_breakout") else ""
+            inj = " INJ" if play.get("section") == "injury" else ""
+            bet_str = f"BET ${kelly:.0f}" if kelly > 0 else ""
 
-        # Plus odds section
-        plus_bucket = [x for x in final_out if x.get("over_odds", -999) >= PLUS_ODDS_MIN]
-        plus_bucket.sort(key=lambda x: (x["ev"], x["value_edge"]), reverse=True)
-        plus_bucket = plus_bucket[:PLUS_ODDS_TOPN]
+            # Plain English why
+            base = play.get("base_avg", 0) or play.get("base_avg", 0)
+            l3 = play.get("l3_avg", proj)
+            why_plain = ""
+            if play.get("is_breakout") and play.get("breakout_reason"):
+                why_plain = play["breakout_reason"]
+            elif play.get("section") == "injury":
+                why_plain = play.get("trigger", "injury trigger")[:60]
+            elif l3 > 0 and base > 0:
+                trend = "trending up" if l3 > base * 1.1 else "trending down" if l3 < base * 0.9 else "consistent"
+                why_plain = f"L3 avg {l3:.1f} vs season {base:.1f} -- {trend}"
 
-        if plus_bucket or plus_ideas_all:
-            msg.append("[PLUS] PLUS ODDS -- bet the book shown:")
+            msg.append(
+                f"{i}. [{tier}]{breakout}{inj} {name} ({team})"
+            )
+            msg.append(
+                f"   {prop} OVER {line:.1f} | {book} {odds:+d} | {bet_str}"
+            )
+            msg.append(
+                f"   Proj {proj:.1f} | P={prob:.0f}% | EV={ev:+.2f}"
+            )
+            if why_plain:
+                msg.append(f"   {why_plain}")
             msg.append("")
-            seen_plus = set()
-            for i in (plus_bucket + [x for x in plus_ideas_all if x not in plus_bucket])[:PLUS_ODDS_TOPN]:
-                if i["player_id"] in seen_plus:
-                    continue
-                seen_plus.add(i["player_id"])
-                book = i["vendor"].upper()
+
+        # ---- SECTION 3: PLUS ODDS (value bets at good prices) ----
+        plus_bucket = [x for x in final_out if x.get("over_odds", -999) >= 100]
+        extra_plus = [x for x in plus_ideas_all if x["player_id"] not in
+                      {p["player_id"] for p in final_out}]
+        all_plus = sorted(plus_bucket + extra_plus,
+                          key=lambda x: x["ev"], reverse=True)[:PLUS_ODDS_TOPN]
+
+        if all_plus:
+            msg.append("-- PLUS ODDS --")
+            for i in all_plus:
                 odds = int(i["over_odds"])
-                msg.append(f"- {i.get('tier','')} {i['player_name']} OVER {i['cons_line']:.1f}")
-                msg.append(f"  BET: {book} {odds:+d} | Proj {i['proj']:.1f} | edge +{i['edge']:.1f} | P={i['prob_over']*100:.0f}% | EV={i['ev']:+.2f}")
-                msg.append("")
+                kelly = i.get("kelly_bet", 0)
+                bet_str = f" BET ${kelly:.0f}" if kelly > 0 else ""
+                msg.append(
+                    f"{i['player_name']} ({i.get('team','')}) "
+                    f"OVER {i['cons_line']:.1f} {i['vendor'].upper()} {odds:+d}{bet_str}"
+                )
+                msg.append(
+                    f"  P={i['prob_over']*100:.0f}% EV={i['ev']:+.2f} "
+                    f"Proj {i['proj']:.1f}"
+                )
             msg.append("")
 
-        # High odds section (+250 and above)
+        # High odds (+250 and above)
         if high_odds_all:
-            msg.append("FANDUEL +250 ATTACK:")
-            msg.append("These are alt lines at big plus odds -- smaller bets, big upside")
-            msg.append("")
+            msg.append("-- HIGH ODDS +250 --")
             for i in high_odds_all:
                 odds = int(i["over_odds"])
-                inj_flag = " [INJ-BOOST]" if i.get("injury_boost") else ""
+                inj = " INJ" if i.get("injury_boost") else ""
                 kelly = i.get("kelly_bet", 0)
                 bet_str = f" BET ${kelly:.0f}" if kelly > 0 else ""
-                msg.append(f"- {i['player_name']} ({i['team']}) OVER {i['cons_line']:.1f}")
-                msg.append(f"  FANDUEL {odds:+d}{inj_flag}{bet_str}")
-                msg.append(f"  Proj {i['proj']:.1f} | P={i['prob_over']*100:.0f}% | EV={i['ev']:+.2f} | edge +{i['edge']:.1f}")
-                msg.append("")
+                msg.append(
+                    f"{i['player_name']} ({i['team']}) "
+                    f"OVER {i['cons_line']:.1f} FD {odds:+d}{inj}{bet_str}"
+                )
+                msg.append(
+                    f"  P={i['prob_over']*100:.0f}% EV={i['ev']:+.2f} "
+                    f"Proj {i['proj']:.1f}"
+                )
             msg.append("")
 
-        # Ladder section
+        # Ladders
         if ladder_all:
-            msg.append("")
-            msg.append("LADDER PLAYS:")
-            msg.append("Best value rung shown -- check app for full ladder")
-            msg.append("")
+            msg.append("-- LADDERS --")
             for i in ladder_all:
+                breakout = " BREAKOUT" if i.get("is_breakout") else ""
+                # Best single leg
                 odds = int(i["over_odds"])
                 kelly = i.get("kelly_bet", 0)
                 bet_str = f" BET ${kelly:.0f}" if kelly > 0 else ""
-                breakout_tag = " [BREAKOUT]" if i.get("is_breakout") else ""
-                msg.append(f"- {i['player_name']} ({i['team']}){breakout_tag}")
-                msg.append(f"  BEST LEG: {i['cons_line']:.0f}+ pts @ {i['vendor'].upper()} {odds:+d}{bet_str}")
-                msg.append(f"  Proj {i['proj']:.1f} | P={i['prob_over']*100:.0f}% | EV={i['ev']:+.2f}")
-                # Show all valid legs
+                msg.append(
+                    f"{i['player_name']} ({i['team']}){breakout}"
+                )
+                msg.append(
+                    f"  BEST: {i['cons_line']:.0f}+ "
+                    f"{i['vendor'].upper()} {odds:+d}{bet_str} "
+                    f"P={i['prob_over']*100:.0f}% EV={i['ev']:+.2f}"
+                )
+                # All rungs on one line
                 if i.get("all_legs"):
-                    legs_line = " | ".join(
+                    rungs = " | ".join(
                         f"{l['rung']:.0f}+ {int(l['over_odds']):+d}"
                         for l in sorted(i["all_legs"], key=lambda x: x["rung"])
                     )
-                    msg.append(f"  All rungs: {legs_line}")
+                    msg.append(f"  Rungs: {rungs}")
+                # 2-leg combo
                 if i.get("combo_note"):
-                    msg.append(f"  {i['combo_note']}")
+                    msg.append(f"  COMBO: {i['combo_note']}")
                 msg.append("")
             msg.append("")
 
-        # Same-game parlay suggestions
+        # SGP
         if ENABLE_SGP:
             sgp_opps = find_sgp_opportunities(final_out, games_map)
             if sgp_opps:
-                msg.append("")
-                msg.append("[SGP] SAME-GAME PARLAYS:")
-                msg.append("Estimated only -- verify odds on app")
-                msg.append("")
+                msg.append("-- SAME-GAME PARLAYS --")
                 for sgp in sgp_opps:
-                    msg.append(f"- {sgp['label']}")
-                    msg.append(f"  {sgp['note']}")
-                    if sgp['sgp_kelly'] > 0:
-                        msg.append(f"  Suggested bet: ${sgp['sgp_kelly']:.0f}")
+                    kelly = sgp.get("sgp_kelly", 0)
+                    bet_str = f" BET ${kelly:.0f}" if kelly > 0 else ""
+                    msg.append(
+                        f"{sgp['label']}"
+                    )
+                    msg.append(
+                        f"  est. {sgp['sgp_odds']:+d}{bet_str} "
+                        f"P={sgp['combined_prob']*100:.0f}% "
+                        f"EV={sgp['combined_ev']:+.2f}"
+                    )
                     msg.append("")
 
-        # Expected value summary
+        # Footer -- total action summary
         total_kelly = sum(p.get("kelly_bet", 0) for p in final_out)
         total_ev = sum(p.get("ev", 0) * p.get("kelly_bet", 0) for p in final_out)
         if total_kelly > 0:
-            msg.append(f"TOTAL ACTION: ${total_kelly:.0f} | EXPECTED: +${total_ev:.0f}")
-        msg.append(f"Caps: team<={MAX_PLAYS_PER_TEAM} game<={MAX_PLAYS_PER_GAME}")
+            msg.append(
+                f"ACTION: ${total_kelly:.0f} | EXPECTED: +${total_ev:.0f}"
+            )
         send_chunked("\n".join(msg).strip())
 
         record_sent(state, final_out, now_ts)
