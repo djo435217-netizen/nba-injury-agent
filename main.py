@@ -2177,17 +2177,40 @@ def build_today_props(now_et: datetime):
                 if not row_vendor:
                     row_vendor = "unknown"
 
+                # Use BDL's prop_type field to correctly categorize the line
+                bdl_prop_type = str(pp.get("prop_type") or pt).strip().lower()
+                # Normalize BDL prop type names to our standard names
+                bdl_prop_type = {
+                    "points": "points",
+                    "rebounds": "rebounds",
+                    "total_rebounds": "rebounds",
+                    "assists": "assists",
+                    "three_pointers_made": "threes",
+                    "threes": "threes",
+                    "fg3m": "threes",
+                    "blocks": "blocks",
+                    "steals": "steals",
+                    "turnovers": "turnovers",
+                }.get(bdl_prop_type, bdl_prop_type)
+
                 row = {
                     "pid": pid,
                     "gid": int(pp.get("game_id")) if pp.get("game_id") is not None else int(gid),
                     "vendor": row_vendor,
-                    "prop_type": (pp.get("prop_type") or pt),
+                    "prop_type": bdl_prop_type,
                     "line": float(line),
                     "over_odds": float(over_odds),
                     "under_odds": float(under_odds),
                     "updated_at": pp.get("updated_at"),
                 }
-                lines_map.setdefault(pt, {}).setdefault(pid, []).append(row)
+                # Only store this row under the correct prop type bucket
+                # Prevents rebounds lines from polluting the points scan
+                row_pt = row["prop_type"]
+                if row_pt in lines_map:
+                    lines_map[row_pt].setdefault(pid, []).append(row)
+                elif row_pt in PROP_TYPES:
+                    lines_map.setdefault(row_pt, {}).setdefault(pid, []).append(row)
+                # If the row's prop type isn't in our scan list, skip it
 
     return lines_map, games_map
 
@@ -3375,6 +3398,7 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
             stats_all.update(bdl_last_n_games_threes(chunk_ids, season, BASELINE_GAMES))
     else:
         stat_key = prop_type_to_stat_key(prop_type)
+        print(f"[INFO] Fetching {stat_key} stats for prop_type={prop_type} ({len(pids)} players)")
         for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
             if deadline_exceeded():
                 break
@@ -3557,6 +3581,7 @@ def lineup_news_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news
             stats_all.update(bdl_last_n_games_threes(chunk_ids, season, BASELINE_GAMES))
     else:
         stat_key = prop_type_to_stat_key(prop_type)
+        print(f"[INFO] Fetching {stat_key} stats for prop_type={prop_type} ({len(pids)} players)")
         for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
             if deadline_exceeded():
                 break
@@ -3710,6 +3735,7 @@ def plus_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, n
             stats_all.update(bdl_last_n_games_threes(chunk_ids, season, BASELINE_GAMES))
     else:
         stat_key = prop_type_to_stat_key(prop_type)
+        print(f"[INFO] Fetching {stat_key} stats for prop_type={prop_type} ({len(pids)} players)")
         for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
             if deadline_exceeded():
                 break
@@ -4621,6 +4647,7 @@ def high_odds_hunt_edges(now_et, prop_type, lines_map_for_prop, state, now_ts,
             stats_all.update(bdl_last_n_games_threes(chunk_ids, season, BASELINE_GAMES))
     else:
         stat_key = prop_type_to_stat_key(prop_type)
+        print(f"[INFO] Fetching {stat_key} stats for prop_type={prop_type} ({len(pids)} players)")
         for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
             if deadline_exceeded():
                 break
@@ -4948,16 +4975,21 @@ def run():
 
     # ---- RUN WINDOW CHECK ----
     hour = now_et.hour
-    # After 11:30pm ET -- late games over
-    if hour >= 23 and minute >= 30:
+    # After 11:30pm: all games done
+    if (hour == 23 and minute >= 30) or hour > 23:
         print(f"[INFO] After 11:30pm ET -- all games over, skipping")
         save_state(state)
         return
-    if hour == 23 and minute < 30:
-        pass  # Still running, 9:30pm games still live
-    elif hour > 23:
-        save_state(state)
-        return
+
+    # Dead zone: early games live (7:30-9:15pm ET), lines fully efficient
+    # Bot still runs but prints warning -- late slate (9:30pm) still valid
+    in_dead_zone = (
+        (hour == 19 and minute >= 30) or
+        hour in (20, 21) or
+        (hour == 22 and minute < 50)
+    )
+    if in_dead_zone:
+        print(f"[INFO] Early slate live -- late slate focus ({ts_et})")
     # Before 7am ET -- no lines posted
     if hour < 7:
         print(f"[INFO] Before 7am ET -- no lines yet, skipping")
@@ -4988,6 +5020,7 @@ def run():
 
     if all_prop_pids:
         # Warmup stats for each prop type separately
+        print(f"[INFO] Warming up stats for PROP_TYPES={PROP_TYPES}")
         stats_deadline = time.time() + 50
         warmed_keys = set()
         for pt in PROP_TYPES:
@@ -5320,7 +5353,10 @@ def run():
             prob = play["prob_over"] * 100
             ev = play["ev"]
             kelly = play.get("kelly_bet", 0)
-            prop = play.get("prop_type", "pts").upper()[:3]
+            _pt = play.get("prop_type", "points").lower()
+            prop = {"points": "PTS", "rebounds": "REB", "assists": "AST",
+                    "threes": "3PT", "blocks": "BLK", "steals": "STL",
+                    "turnovers": "TO"}.get(_pt, _pt.upper()[:3])
             breakout = " BREAKOUT" if play.get("is_breakout") else ""
             inj = " INJ" if play.get("section") == "injury" else ""
             bet_str = f"BET ${kelly:.0f}" if kelly > 0 else ""
@@ -5499,7 +5535,16 @@ def run():
                 msg2.append("")
             send_chunked("\n".join(msg2).strip())
         else:
-            print("[INFO] No plays cleared thresholds this run.")
+            total_players = sum(len(v) for v in lines_map.values())
+            print(f"[INFO] No plays. Players with lines: {total_players} | MIN_VENDORS={MIN_VENDORS_FOR_CONSENSUS} | MIN_SHARP={MIN_SHARP_VENDORS}")
+            passed_cons = 0
+            for pt in PROP_TYPES:
+                for pid, rows in lines_map.get(pt, {}).items():
+                    cons, n_cons, n_sharp = consensus_line(rows)
+                    if cons is not None and n_cons >= MIN_VENDORS_FOR_CONSENSUS and n_sharp >= MIN_SHARP_VENDORS:
+                        passed_cons += 1
+                        break
+            print(f"[INFO] Players passing consensus: {passed_cons}")
 
 
     state["players"] = new_players
