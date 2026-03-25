@@ -4975,6 +4975,7 @@ def run():
 
     # ---- RUN WINDOW CHECK ----
     hour = now_et.hour
+    minute = now_et.minute
     # After 11:30pm: all games done
     if (hour == 23 and minute >= 30) or hour > 23:
         print(f"[INFO] After 11:30pm ET -- all games over, skipping")
