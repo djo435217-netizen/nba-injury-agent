@@ -108,7 +108,7 @@ BET_COOLDOWN_MIN = int(os.environ.get("BET_COOLDOWN_MIN", "180"))
 EDGE_JUMP_TO_RESEND = float(os.environ.get("EDGE_JUMP_TO_RESEND", "1.5"))
 
 # Runtime guard
-RUN_MAX_SECONDS = int(os.environ.get("RUN_MAX_SECONDS", "250"))
+RUN_MAX_SECONDS = int(os.environ.get("RUN_MAX_SECONDS", "200"))
 STAT_BATCH_SIZE = int(os.environ.get("STAT_BATCH_SIZE", "90"))
 
 DEBUG_PROP_SAMPLE_TYPES = os.environ.get("DEBUG_PROP_SAMPLE_TYPES", "0").strip().lower()
@@ -2350,6 +2350,8 @@ def compute_projection_components_points(games_all, line):
         "l10_median": l10_median if "l10_median" in dir() else 0.0,
         "situation_label": situation_label if "situation_label" in dir() else "",
         "minute_warn": minute_warn if "minute_warn" in dir() else "",
+        "instinct_label": instinct_label if "instinct_label" in dir() else "",
+        "fade_label": fade_label if "fade_label" in dir() else "",
     }
 
 
@@ -2950,6 +2952,10 @@ def build_player_projection(
     if "minute_cap_signal" in dir() and minute_cap_signal != 0.0:
         proj, minute_warn = apply_minute_cap(proj, proj_min, l10_min, minute_cap_signal)
 
+    # Apply instinct boost -- your read on top of the model
+    if "instinct_boost" in dir() and instinct_boost != 0.0:
+        proj += instinct_boost
+
     min_conf = minutes_confidence(proj_min, l10_min, l3_min)
 
     # Use breakout-aware projection rate
@@ -3027,7 +3033,6 @@ def build_player_projection(
         proj *= (1.0 + usage_adj)
 
     # ---- MINUTE CAP CHECK ----
-    # Check manual caps first, then LE news
     minute_cap_signal = 0.0
     minute_warn = ""
     if games:
@@ -3035,6 +3040,31 @@ def build_player_projection(
         manual_caps = get_manual_minute_caps()
         if name_key_mc in manual_caps:
             minute_cap_signal = manual_caps[name_key_mc]
+
+    # ---- INSTINCT OVERRIDES ----
+    # Your personal read -- applied before probability calculation
+    instinct_boost = 0.0
+    instinct_label = ""
+    fade_label = ""
+    name_key_inst = _clean_name(player_name)
+
+    instinct_map = get_instinct_boosts()
+    if name_key_inst in instinct_map:
+        instinct_boost = instinct_map[name_key_inst]
+        if instinct_boost > 0:
+            instinct_label = f"YOUR CALL +{instinct_boost:.1f}pts"
+        else:
+            instinct_label = f"YOUR FADE {instinct_boost:.1f}pts"
+
+    fade_set = get_fade_players()
+    if name_key_inst in fade_set:
+        instinct_boost -= FADE_PENALTY
+        fade_label = f"FADING THIS PLAYER (-{FADE_PENALTY:.1f}pts)"
+
+    target_set = get_target_players()
+    if name_key_inst in target_set:
+        instinct_boost += TARGET_BOOST
+        instinct_label = f"TARGETING (+{TARGET_BOOST:.1f}pts)"
         # Will apply after proj_min is calculated
 
     # Situational edge analysis
@@ -3344,6 +3374,13 @@ def build_injury_edges(
             "section": "injury",
             "is_breakout": p.get("is_breakout", False),
             "breakout_reason": p.get("breakout_reason", ""),
+            "instinct_label": p.get("instinct_label", ""),
+            "fade_label": p.get("fade_label", ""),
+            "base_avg": float(p.get("base_avg", 0)),
+            "l3_avg": float(p.get("l3_avg", 0)),
+            "l10_avg": float(p.get("l10_avg", 0)),
+            "l10_min": float(p.get("l10_min", 0)),
+            "proj_min": float(p.get("proj_min", 0)),
             "prop_type": prop_type,
             "player_name": nm,
             "player_id": int(pid),
@@ -3398,7 +3435,7 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
             stats_all.update(bdl_last_n_games_threes(chunk_ids, season, BASELINE_GAMES))
     else:
         stat_key = prop_type_to_stat_key(prop_type)
-        print(f"[INFO] Fetching {stat_key} stats for prop_type={prop_type} ({len(pids)} players)")
+        print(f"[INFO] {prop_type} scan: {len(pids)} players, stat={stat_key}")
         for chunk_ids in _chunk(pids, STAT_BATCH_SIZE):
             if deadline_exceeded():
                 break
@@ -3500,12 +3537,17 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
         # Boost breakout players to surface them higher in the rankings
         if p.get("is_breakout"):
             final_score += 15.0
-        # Boost situational plays -- bounce back, revenge, return
+        # Boost situational plays
         sit = p.get("situation_label", "")
         if "BOUNCE-BACK" in sit or "REVENGE" in sit or "RETURN FROM INJURY" in sit:
             final_score += 20.0
         elif "NATIONAL TV" in sit or "REST-SPOT" in sit:
             final_score += 8.0
+        # Your instinct overrides everything -- targeted players always surface
+        if p.get("instinct_label") and "YOUR CALL" in p.get("instinct_label", ""):
+            final_score += 30.0  # put at top of card
+        if p.get("fade_label"):
+            final_score -= 50.0  # push to bottom / off card
         tier = confidence_tier(p["edge"], p["prob_over"], ev, value_edge)
         context_notes = " | ".join(filter(None, [p["home_away_note"], p["b2b_note"]]))
         breakout_tag = f" [BREAKOUT: {p['breakout_reason']}]" if p.get("is_breakout") else ""
@@ -3527,6 +3569,14 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
             "breakout_reason": p.get("breakout_reason", ""),
             "situation_label": p.get("situation_label", ""),
             "minute_warn": p.get("minute_warn", ""),
+            "instinct_label": p.get("instinct_label", ""),
+            "fade_label": p.get("fade_label", ""),
+            "base_avg": float(p.get("base_avg", 0)),
+            "l3_avg": float(p.get("l3_avg", 0)),
+            "l10_avg": float(p.get("l10_avg", 0)),
+            "l10_min": float(p.get("l10_min", 0)),
+            "proj_min": float(p.get("proj_min", 0)),
+            "market_prob": float(p.get("market_prob", 0)),
             "prop_type": prop_type,
             "player_name": name,
             "player_id": int(pid),
@@ -3870,11 +3920,80 @@ RETURNING_PLAYERS_RAW = os.environ.get("RETURNING_PLAYERS", "").strip()
 # Example: "Kawhi Leonard:22;LeBron James:28"
 MINUTE_CAPS_RAW = os.environ.get("MINUTE_CAPS", "").strip()
 
+# ---- YOUR INSTINCT OVERRIDES ----
+# When you KNOW a player is going off tonight -- set this manually
+# The model adds your boost on top of the statistical projection
+# Format: "player_name:boost_pts;player_name2:boost_pts"
+# Positive = you like them, Negative = you think they go under
+# Example: "Kyrie Irving:4;Luka Doncic:-3"
+# Use this when: revenge game, player looks locked in warmups,
+# coach called them out, just signed extension, playing angry,
+# specific defender is hurt/slow, you watched last game and saw
+# something the box score didnt capture
+INSTINCT_BOOSTS_RAW = os.environ.get("INSTINCT_BOOSTS", "").strip()
+
+# Players you want to FADE today -- model will lower their projection
+# and they will show as a warning if the model still likes them
+# Format: "player_name,player_name2"
+FADE_PLAYERS_RAW = os.environ.get("FADE_PLAYERS", "").strip()
+FADE_PENALTY = float(os.environ.get("FADE_PENALTY", "4.0"))
+
+# Players you want to TARGET today -- model will boost them
+# and they will surface higher in rankings regardless of math
+# Format: "player_name,player_name2"  
+TARGET_PLAYERS_RAW = os.environ.get("TARGET_PLAYERS", "").strip()
+TARGET_BOOST = float(os.environ.get("TARGET_BOOST", "3.5"))
+
 # How aggressively to apply minute restrictions from LE news
 # When we detect "minutes restriction" in news, cap minutes to this fraction
 # of their normal average (0.65 = cap at 65% of usual minutes)
 MINUTES_RESTRICT_FRACTION = float(os.environ.get("MINUTES_RESTRICT_FRACTION", "0.65"))
 MINUTES_LOAD_MANAGE_FRACTION = float(os.environ.get("MINUTES_LOAD_MANAGE_FRACTION", "0.55"))
+
+
+def get_instinct_boosts() -> dict:
+    """
+    Your personal read on tonight's games.
+    Set INSTINCT_BOOSTS=Kyrie Irving:4;Luka Doncic:-3 in Render env.
+
+    This is the edge the model cant calculate:
+    - You watched warmups and Kyrie looked locked in
+    - Luka has been carrying himself differently since the trade rumors
+    - This is Klay's first game back in Golden State and hes going to go nuclear
+    - The backup PG is guarding someone who is 6 inches taller than him
+    - A player just posted something on Instagram that reads like a statement game
+
+    A +4 boost means you think he scores 4 more than the model projects.
+    The model still needs to find statistical edge -- your boost just surfaces
+    the right players to the top of the card.
+    """
+    out = {}
+    if not INSTINCT_BOOSTS_RAW:
+        return out
+    for pair in INSTINCT_BOOSTS_RAW.split(";"):
+        pair = pair.strip()
+        if ":" not in pair:
+            continue
+        player, boost = pair.split(":", 1)
+        try:
+            out[_clean_name(player.strip())] = float(boost.strip())
+        except Exception:
+            pass
+    return out
+
+
+def get_fade_players() -> set:
+    """Players you want to avoid today regardless of what the model says."""
+    if not FADE_PLAYERS_RAW:
+        return set()
+    return {_clean_name(p.strip()) for p in FADE_PLAYERS_RAW.split(",") if p.strip()}
+
+
+def get_target_players() -> set:
+    """Players you are targeting today -- model surfaces them higher."""
+    if not TARGET_PLAYERS_RAW:
+        return set()
+    return {_clean_name(p.strip()) for p in TARGET_PLAYERS_RAW.split(",") if p.strip()}
 
 
 def get_manual_minute_caps() -> dict:
@@ -3970,6 +4089,90 @@ def apply_minute_cap(proj: float, proj_min: float, typical_min: float,
     adjusted = proj * min_ratio
     reduction = proj - adjusted
     return adjusted, f"FADE -- {cap_label} proj -{reduction:.1f}pts"
+
+
+def explain_confidence(play: dict) -> str:
+    """
+    Plain English breakdown of why the model is confident.
+    Shows the 3 most important factors driving the projection.
+
+    This replaces cryptic numbers with actual reasoning:
+    Instead of: "P=93% EV=+0.87 edge +11.3"
+    Shows: "Line set for 18min role. Injury gives 30min. L3 avg 14.2 vs line 9.5"
+    """
+    reasons = []
+
+    proj = play.get("proj", 0)
+    line = play.get("cons_line", 0)
+    edge = play.get("edge", 0)
+    prob = play.get("prob_over", 0) * 100
+    ev = play.get("ev", 0)
+    base_avg = play.get("base_avg", 0)
+    l3_avg = play.get("l3_avg", 0)
+    l10_avg = play.get("l10_avg", 0)
+    l10_min = play.get("l10_min", 0)
+    proj_min = play.get("proj_min", 0)
+    value_edge = play.get("value_edge", 0) * 100
+    market_prob = play.get("market_prob", 0) * 100
+    section = play.get("section", "")
+    trigger = play.get("trigger", "")
+    breakout = play.get("breakout_reason", "")
+    sit_label = play.get("situation_label", "")
+    minute_warn = play.get("minute_warn", "")
+
+    # Most important: why is the line where it is vs where we project
+    if edge > 8:
+        reasons.append(f"Line {line:.1f} is way below proj {proj:.1f} (edge +{edge:.1f})")
+    elif edge > 4:
+        reasons.append(f"Proj {proj:.1f} comfortably clears line {line:.1f}")
+    else:
+        reasons.append(f"Proj {proj:.1f} vs line {line:.1f}")
+
+    # Injury context
+    if section == "injury" and trigger:
+        reasons.append(f"INJ: {trigger}")
+
+    # Minutes context -- why are we projecting this many minutes
+    if proj_min > 0 and l10_min > 0:
+        if proj_min > l10_min + 5:
+            reasons.append(f"Minutes: {l10_min:.0f} usual -> {proj_min:.0f} proj (+{proj_min-l10_min:.0f} from injury)")
+        elif proj_min < l10_min - 3:
+            reasons.append(f"Minutes DOWN: {l10_min:.0f} usual -> {proj_min:.0f} proj")
+
+    # Scoring trend
+    if l3_avg > 0 and base_avg > 0:
+        if l3_avg > base_avg * 1.20:
+            reasons.append(f"Hot: L3 avg {l3_avg:.1f} vs season {base_avg:.1f}")
+        elif l3_avg < base_avg * 0.80:
+            reasons.append(f"Cold: L3 avg {l3_avg:.1f} vs season {base_avg:.1f}")
+        else:
+            reasons.append(f"Consistent: L3 {l3_avg:.1f} / season {base_avg:.1f}")
+
+    # Book mispricing
+    if value_edge > 15:
+        reasons.append(f"Book implied {market_prob:.0f}% -- we say {prob:.0f}% (book wrong by {value_edge:.0f}pts)")
+    elif value_edge > 8:
+        reasons.append(f"Book at {market_prob:.0f}%, model at {prob:.0f}%")
+
+    # Your instinct
+    instinct = play.get("instinct_label", "")
+    fade = play.get("fade_label", "")
+    if instinct:
+        reasons.insert(0, f"YOUR CALL: {instinct}")  # put first -- you called it
+    if fade:
+        reasons.insert(0, f"FADE WARNING: {fade}")
+
+    # Situational
+    if sit_label and not instinct:
+        reasons.append(f"Spot: {sit_label}")
+    if breakout and not instinct:
+        reasons.append(f"Trend: {breakout}")
+
+    # Minute restriction warning
+    if minute_warn:
+        reasons.append(f"WARNING: {minute_warn}")
+
+    return " | ".join(reasons[:3])
 
 
 def get_revenge_matchups() -> dict:
@@ -5020,28 +5223,19 @@ def run():
     all_prop_pids = list({int(x) for x in all_prop_pids})
 
     if all_prop_pids:
-        # Warmup stats for each prop type separately
+        # Warmup stats -- points only in main warmup (fast)
+        # rebounds/assists fetched on-demand per engine (cached after first call)
         print(f"[INFO] Warming up stats for PROP_TYPES={PROP_TYPES}")
-        stats_deadline = time.time() + 50
-        warmed_keys = set()
-        for pt in PROP_TYPES:
+        stats_deadline = time.time() + 40
+        for chunk_ids in _chunk(all_prop_pids, STAT_BATCH_SIZE):
             if deadline_exceeded() or time.time() > stats_deadline:
+                print("[INFO] Points warmup time budget reached")
                 break
-            if prop_type_is_threes(pt):
-                continue  # threes handled separately below
-            sk = prop_type_to_stat_key(pt)
-            if sk in warmed_keys:
-                continue
-            warmed_keys.add(sk)
-            for chunk_ids in _chunk(all_prop_pids, STAT_BATCH_SIZE):
-                if deadline_exceeded() or time.time() > stats_deadline:
-                    print(f"[INFO] Stats warmup time budget reached ({sk})")
-                    break
-                try:
-                    bdl_last_n_games_stats(chunk_ids, season, max(LOOKBACK_GAMES, 8), sk)
-                except Exception as e:
-                    print(f"[WARN] warmup stats failed ({sk}): {e}")
-                    break
+            try:
+                bdl_last_n_games_stats(chunk_ids, season, max(LOOKBACK_GAMES, 8), "pts")
+            except Exception as e:
+                print(f"[WARN] warmup pts failed: {e}")
+                break
 
         if "threes" in PROP_TYPES and THREES_BETA_BINOM:
             threes_deadline = time.time() + 30  # hard 30s budget
@@ -5215,9 +5409,11 @@ def run():
 
     # ---- Slate scan ----
     slate_ideas_all = []
+    slate_deadline = time.time() + 80  # 80s total for all slate scans
     if ENABLE_SLATE_SCAN and (not deadline_exceeded()):
         for pt in PROP_TYPES:
-            if deadline_exceeded():
+            if deadline_exceeded() or time.time() > slate_deadline:
+                print(f"[INFO] Slate scan time budget reached at prop_type={pt}")
                 break
             slate_ideas_all.extend(
                 slate_scan_edges(now_et, pt, lines_map.get(pt, {}), state=state, now_ts=now_ts,
@@ -5226,10 +5422,13 @@ def run():
 
     # ---- Lineup news edges ----
     lineup_news_ideas_all = []
+    lineup_deadline = time.time() + 30  # 30s for lineup news
     if LE_NEWS_ENGINE_ENABLED and (not deadline_exceeded()):
-        for pt in PROP_TYPES:
-            if deadline_exceeded():
+        for pt in ["points", "threes"]:  # lineup news only for main markets
+            if deadline_exceeded() or time.time() > lineup_deadline:
                 break
+            if pt not in PROP_TYPES:
+                continue
             lineup_news_ideas_all.extend(
                 lineup_news_edges(now_et, pt, lines_map.get(pt, {}), state=state, now_ts=now_ts,
                                   news_boosts=news_boosts, news_scores=news_scores, games_map=games_map, adv_stats=adv_stats_all)
@@ -5384,14 +5583,10 @@ def run():
                 f"   Proj {proj:.1f} | P={prob:.0f}% | EV={ev:+.2f}"
             )
             # Situation label -- the educated guess factor
-            minute_warn = play.get("minute_warn", "")
-            sit_label = play.get("situation_label", "")
-            if minute_warn:
-                msg.append(f"   {minute_warn}")
-            elif sit_label:
-                msg.append(f"   SPOT: {sit_label}")
-            elif why_plain:
-                msg.append(f"   {why_plain}")
+            # Plain English explanation -- most important info first
+            explanation = explain_confidence(play)
+            if explanation:
+                msg.append(f"   {explanation}")
             msg.append("")
 
         # ---- SECTION 3: PLUS ODDS (value bets at good prices) ----
