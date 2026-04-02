@@ -2295,7 +2295,7 @@ def best_offer_near_consensus(rows, cons_line: float):
 
 
 # -------------------- PROJECTION CORE --------------------
-def compute_projection_components_points(games_all, line):
+def compute_projection_components_points(games_all, line, prop_type="points"):
     base_slice = _slice_last(games_all, BASELINE_GAMES)
     l10_slice = _slice_last(games_all, LOOKBACK_GAMES)
     l3_slice = _slice_last(games_all, SHORT_GAMES)
