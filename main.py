@@ -82,6 +82,19 @@ MIN_PROB = float(os.environ.get("MIN_PROB", "0.62"))
 # estimates artificially toward 50%, causing us to miss high-confidence overs.
 STD_FLOOR = float(os.environ.get("STD_FLOOR", "3.5"))
 
+# Per-stat STD floors -- assists and rebounds have lower natural variance
+STD_FLOOR_BY_STAT = {
+    "pts": float(os.environ.get("STD_FLOOR", "3.5")),
+    "reb": float(os.environ.get("STD_FLOOR_REB", "1.8")),
+    "ast": float(os.environ.get("STD_FLOOR_AST", "1.5")),
+    "blk": float(os.environ.get("STD_FLOOR_BLK", "0.8")),
+    "stl": float(os.environ.get("STD_FLOOR_STL", "0.8")),
+}
+
+def get_std_floor(prop_type: str) -> float:
+    sk = prop_type_to_stat_key(prop_type)
+    return STD_FLOOR_BY_STAT.get(sk, STD_FLOOR)
+
 # EV filter
 EV_MIN = float(os.environ.get("EV_MIN", "0.00"))
 VALUE_EDGE_MIN = float(os.environ.get("VALUE_EDGE_MIN", "0.00"))
@@ -2177,21 +2190,10 @@ def build_today_props(now_et: datetime):
                 if not row_vendor:
                     row_vendor = "unknown"
 
-                # Use BDL's prop_type field to correctly categorize the line
-                bdl_prop_type = str(pp.get("prop_type") or pt).strip().lower()
-                # Normalize BDL prop type names to our standard names
-                bdl_prop_type = {
-                    "points": "points",
-                    "rebounds": "rebounds",
-                    "total_rebounds": "rebounds",
-                    "assists": "assists",
-                    "three_pointers_made": "threes",
-                    "threes": "threes",
-                    "fg3m": "threes",
-                    "blocks": "blocks",
-                    "steals": "steals",
-                    "turnovers": "turnovers",
-                }.get(bdl_prop_type, bdl_prop_type)
+                # CRITICAL: BDL returns "points" as prop_type for ALL props
+                # regardless of what we queried. Use pt (our fetch param) as
+                # the authoritative prop type, not BDL's field.
+                bdl_prop_type = pt  # trust what we asked for, not what BDL returns
 
                 row = {
                     "pid": pid,
@@ -2306,11 +2308,13 @@ def compute_projection_components_points(games_all, line):
     rate_l10 = _safe_rate(l10_avg, l10_min)
     rate_l3 = _safe_rate(l3_avg, l3_min)
 
-    raw_sigma = l10_std if l10_std > 0 else base_std if base_std > 0 else STD_FLOOR
+    # Use per-stat STD floor -- assists/rebounds have lower natural variance
+    stat_std_floor = get_std_floor(prop_type)
+    raw_sigma = l10_std if l10_std > 0 else base_std if base_std > 0 else stat_std_floor
 
     # Use adaptive sigma based on consistency
     cons = consistency_score(games_all)
-    sigma = adaptive_sigma(games_all, max(STD_FLOOR, raw_sigma), cons)
+    sigma = adaptive_sigma(games_all, max(stat_std_floor, raw_sigma), cons)
 
     # Median-blend: for volatile players, blend mean with median
     # This prevents one big game from inflating projections
@@ -3510,6 +3514,12 @@ def slate_scan_edges(now_et, prop_type, lines_map_for_prop, state, now_ts, news_
             slate_min_prob = max(thr["min_prob"], 0.57)
             slate_min_ev = max(thr["min_ev"], 0.00)
             slate_min_value = max(thr["min_value_edge"], 0.00)
+
+        # Sanity check: projection > 3x line = bad stat data (wrong stat history)
+        # e.g. projecting 11 assists when line is 3.5 -- skip
+        if p["proj"] > line * 3.0 and line > 1.5:
+            print(f"[WARN] {name} {prop_type}: proj {p['proj']:.1f} > 3x line {line:.1f} -- skipping (bad stat data)")
+            continue
 
         if p["edge"] < slate_min_edge or p["prob_over"] < slate_min_prob:
             continue
