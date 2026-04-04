@@ -238,13 +238,14 @@ def _now_et() -> datetime:
 
 
 def _season_year(dt: datetime = None) -> int:
-    """Get NBA season year (e.g., 2025 for 2024-25 season)."""
+    """Get BDL season year. BDL uses the year the season STARTS (Oct 2025 = season 2025).
+    April 2026 → season 2025. October 2026 → season 2026."""
     if dt is None:
         dt = _now_et()
     year = dt.year
     if dt.month < 10:
-        return year
-    return year + 1
+        return year - 1  # Apr 2026 -> 2025 (season started Oct 2025)
+    return year          # Oct 2026 -> 2026 (new season starting)
 
 
 def _parse_minutes(min_str: str) -> float:
