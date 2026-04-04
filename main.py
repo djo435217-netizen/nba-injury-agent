@@ -18,10 +18,17 @@ import traceback
 
 try:
     import requests
-    from twilio.rest import Client as TwilioClient
+    print("[INIT] requests loaded OK")
 except ImportError:
     requests = None
+    print("[INIT] WARNING: requests not installed")
+
+try:
+    from twilio.rest import Client as TwilioClient
+    print("[INIT] twilio loaded OK")
+except ImportError:
     TwilioClient = None
+    print("[INIT] WARNING: twilio not installed - WhatsApp will be MOCK only")
 
 
 # ============================================================================
@@ -505,20 +512,21 @@ def save_state(state: Dict) -> None:
         print(f"ERROR saving state: {e}")
 
 
-def send_one(client: TwilioClient, msg: str) -> bool:
+def send_one(client, msg: str) -> bool:
     """Send single WhatsApp message via Twilio."""
     if not client or not RECIPIENT_WHATSAPP:
-        print(f"[MOCK] WhatsApp: {msg}")
+        print(f"[MOCK] WhatsApp ({len(msg)} chars) - no client or recipient")
         return True
     try:
-        client.messages.create(
+        result = client.messages.create(
             from_=TWILIO_WHATSAPP_FROM,
             to=RECIPIENT_WHATSAPP,
             body=msg
         )
+        print(f"[TWILIO] Sent OK: SID={result.sid}, status={result.status}")
         return True
     except Exception as e:
-        print(f"ERROR sending WhatsApp: {e}")
+        print(f"[TWILIO] Send FAILED: {e}")
         return False
 
 
@@ -2740,11 +2748,17 @@ def run():
         print("[INFO] Message ready, sending via WhatsApp...")
 
         client = None
+        print(f"[TWILIO] SID set: {bool(ACCOUNT_SID)}, Token set: {bool(AUTH_TOKEN)}, "
+              f"TwilioClient: {TwilioClient is not None}, "
+              f"From: {TWILIO_WHATSAPP_FROM}, To: {bool(RECIPIENT_WHATSAPP)}")
         if ACCOUNT_SID and AUTH_TOKEN and TwilioClient:
             try:
                 client = TwilioClient(ACCOUNT_SID, AUTH_TOKEN)
+                print("[TWILIO] Client created OK")
             except Exception as e:
-                print(f"[WARN] Twilio init failed: {e}")
+                print(f"[TWILIO] Client init FAILED: {e}")
+        else:
+            print("[TWILIO] Missing creds or library - messages will be MOCK")
 
         send_chunked(client, msg)
 
