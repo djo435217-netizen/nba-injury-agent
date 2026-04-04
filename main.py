@@ -616,6 +616,11 @@ def bdl_games_today(dt: datetime = None) -> List[Dict]:
 
     games = resp.get("data", []) if resp else []
 
+    # DEBUG: dump first game to see structure
+    if games:
+        print(f"[DEBUG] game[0] keys: {list(games[0].keys())}")
+        print(f"[DEBUG] game[0]: {json.dumps(games[0], default=str)[:500]}")
+
     # Parse and enrich games with time info
     for game in games:
         if "scheduled_at" in game:
@@ -765,7 +770,15 @@ def bdl_fetch_props_for_game(game_id: int, prop_types: List[str] = None) -> Dict
 
         if resp.status_code == 200:
             data = resp.json()
-            for prop in data.get("data", []):
+            # DEBUG: dump raw response structure
+            print(f"[DEBUG] props keys: {list(data.keys())}")
+            raw_items = data.get("data", [])
+            if raw_items and len(raw_items) > 0:
+                print(f"[DEBUG] props[0] keys: {list(raw_items[0].keys())}")
+                print(f"[DEBUG] props[0]: {json.dumps(raw_items[0], default=str)[:500]}")
+            else:
+                print(f"[DEBUG] props raw (first 500): {json.dumps(data, default=str)[:500]}")
+            for prop in raw_items:
                 # BDL v2 response: player info, prop_type, line_value, vendor, market
                 player_info = prop.get("player", {})
                 player_name = ""
@@ -868,6 +881,15 @@ def bdl_fetch_game_odds_full(game_id: int) -> Dict:
 
     # BDL odds endpoint: /v1/odds?game_id=XXX (singular, no brackets)
     resp = _bdl_get("odds", {"game_id": game_id})
+
+    # DEBUG: dump raw response keys and first item to see actual structure
+    if resp:
+        print(f"[DEBUG] odds keys: {list(resp.keys())}")
+        if resp.get("data") and len(resp["data"]) > 0:
+            print(f"[DEBUG] odds[0] keys: {list(resp['data'][0].keys())}")
+            print(f"[DEBUG] odds[0]: {json.dumps(resp['data'][0], default=str)[:500]}")
+        else:
+            print(f"[DEBUG] odds raw (first 500): {json.dumps(resp, default=str)[:500]}")
 
     result = {
         "game_total": 220.0,
