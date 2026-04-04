@@ -2384,7 +2384,58 @@ def find_correlated_parlays(
     return corr_parlays[:3]
 
 
-LADDER_RUNGS = [10.5, 15.5, 20.5, 25.5, 30.5]
+LADDER_RUNGS = [10.5, 15.5, 20.5, 25.5, 30.5, 35.5]
+
+
+def _player_scoring_profile(games: List[Dict], line: float) -> Dict:
+    """
+    Build a scoring profile: floor, ceiling, consistency, hot streak, ceiling games.
+    This is what makes ladder analysis actually useful.
+    """
+    if not games:
+        return {}
+
+    values = [g.get("value", 0) for g in games]
+    l5 = values[:5] if len(values) >= 5 else values
+    l10 = values[:10] if len(values) >= 10 else values
+
+    floor = min(values) if values else 0
+    ceiling = max(values) if values else 0
+    avg = sum(values) / len(values) if values else 0
+    l5_avg = sum(l5) / len(l5) if l5 else 0
+    l10_avg = sum(l10) / len(l10) if l10 else 0
+
+    # How many times they've hit various thresholds
+    ceiling_20 = sum(1 for v in values if v >= 20)
+    ceiling_25 = sum(1 for v in values if v >= 25)
+    ceiling_30 = sum(1 for v in values if v >= 30)
+
+    # Hot streak: consecutive games over line
+    streak = 0
+    for v in values:
+        if v > line:
+            streak += 1
+        else:
+            break
+
+    # Scoring trend (L5 vs L10)
+    trend = "heating up" if l5_avg > l10_avg * 1.10 else (
+        "cooling down" if l5_avg < l10_avg * 0.90 else "steady"
+    )
+
+    return {
+        "floor": floor,
+        "ceiling": ceiling,
+        "avg": avg,
+        "l5_avg": l5_avg,
+        "l10_avg": l10_avg,
+        "ceiling_20": ceiling_20,
+        "ceiling_25": ceiling_25,
+        "ceiling_30": ceiling_30,
+        "games_sampled": len(values),
+        "streak_over_line": streak,
+        "trend": trend,
+    }
 
 
 def scan_ladder_plays(
@@ -2393,19 +2444,15 @@ def scan_ladder_plays(
     now_et: datetime = None,
 ) -> List[Dict]:
     """
-    Ladder bet scanner.
-    Only for players projecting 18+ points.
-    Find available lines near each rung.
-    Min prob per leg 0.52, min EV 0.04.
-    Return top 4.
-
-    BUG FIX: Fixed compute_projection call signature.
+    Smart ladder scanner with full analysis context.
+    Finds players whose scoring profile supports multi-rung ladder bets.
+    Includes narrative reasoning for WHY each ladder works.
+    Lowered floor to 10+ PPG to catch role players with +200 alt lines.
     """
     if now_et is None:
         now_et = _now_et()
 
     ladders = []
-    state = load_state()
 
     for game_id, game_props in lines_map.items():
         game_info = games_map.get(game_id, {})
@@ -2422,6 +2469,12 @@ def scan_ladder_plays(
 
         prop_lines = game_props.get("player_points", {})
 
+        # Get matchup context
+        home_team = game_info.get("home_team", {})
+        away_team = game_info.get("away_team", {})
+        home_name = home_team.get("full_name", home_team.get("name", ""))
+        away_name = away_team.get("full_name", away_team.get("name", ""))
+
         for player_name, book_lines in prop_lines.items():
             if not book_lines:
                 continue
@@ -2431,22 +2484,23 @@ def scan_ladder_plays(
                 continue
 
             avg_line = sum(all_lines) / len(all_lines)
-            if avg_line < 18.0:
+
+            # Lower floor to 8+ to catch role players with +200 upside
+            if avg_line < 8.0:
                 continue
 
-            # Get player_id from props data
             player_id = None
+            vendor = "FanDuel"
             for bl in book_lines:
                 if bl.get("player_id"):
                     player_id = bl["player_id"]
+                if bl.get("book"):
+                    vendor = bl["book"]
+                if player_id:
                     break
             if not player_id:
                 continue
 
-            home_team = game_info.get("home_team", {})
-            away_team = game_info.get("away_team", {})
-            home_name = home_team.get("full_name", home_team.get("name", ""))
-            away_name = away_team.get("full_name", away_team.get("name", ""))
             is_home = True
             opp_team = away_name
 
@@ -2461,57 +2515,168 @@ def scan_ladder_plays(
                 -110, game_info, game_context
             )
 
-            if not proj_result or proj_result.proj < 18.0:
+            if not proj_result or proj_result.proj < 10.0:
                 continue
 
             projection = proj_result.proj
 
+            # Build scoring profile from raw game data
+            games = bdl_last_n_games_stats(player_id, "pts", BASELINE_GAMES)
+            profile = _player_scoring_profile(games, avg_line)
+
+            # Hit rates at each rung
             ladder_legs = []
             for rung in LADDER_RUNGS:
-                best_odds = -110
+                if rung > projection * 1.8:
+                    continue  # Skip unreachable rungs
+
+                # Find matching book line for this rung
+                best_odds = None
                 for bl in book_lines:
                     line = bl.get("line", 0)
-                    if abs(line - rung) < 0.5:
+                    if abs(line - rung) < 1.0:
                         best_odds = bl.get("odds", -110)
                         break
+
+                # Estimate odds for alt lines based on distance from main line
+                if best_odds is None:
+                    dist = rung - avg_line
+                    if dist < -10:
+                        best_odds = -350
+                    elif dist < -5:
+                        best_odds = -200
+                    elif dist < 0:
+                        best_odds = -130
+                    elif dist < 5:
+                        best_odds = +150
+                    elif dist < 10:
+                        best_odds = +250
+                    elif dist < 15:
+                        best_odds = +450
+                    else:
+                        best_odds = +800
 
                 z = (projection - rung) / proj_result.sigma if proj_result.sigma > 0 else 0
                 raw_prob = _norm_cdf(z)
                 prob = calibrated_prob(raw_prob)
 
-                if prob < 0.52:
+                # Also compute empirical hit rate at this rung
+                rung_hits = sum(1 for g in games if g.get("value", 0) > rung)
+                rung_hr = rung_hits / len(games) if games else 0
+
+                # Blend model + empirical
+                blended_prob = 0.40 * prob + 0.60 * rung_hr
+
+                if blended_prob < 0.15:
                     continue
 
-                ev = ev_per_dollar(prob, best_odds)
-                if ev < 0.04:
-                    continue
+                ev = ev_per_dollar(blended_prob, best_odds)
+
+                odds_str = f"+{best_odds}" if best_odds > 0 else str(best_odds)
 
                 ladder_legs.append({
                     "rung": rung,
                     "line": rung,
                     "odds": best_odds,
-                    "prob": prob,
+                    "odds_str": odds_str,
+                    "prob": blended_prob,
+                    "model_prob": prob,
+                    "hit_rate": rung_hr,
+                    "hits": rung_hits,
+                    "total": len(games),
                     "ev": ev,
                 })
 
-            if len(ladder_legs) >= 2:
-                best_leg = max(ladder_legs, key=lambda x: x["ev"])
+            if len(ladder_legs) < 2:
+                continue
 
-                ladder = {
-                    "player": player_name,
-                    "player_id": player_id,
-                    "game_id": game_id,
-                    "projection": projection,
-                    "all_legs": ladder_legs,
-                    "best_leg": best_leg,
-                    "ev": best_leg["ev"],
-                    "bet_size": kelly_bet_size(best_leg["ev"] * 100, best_leg["prob"], BANKROLL),
-                    "type": "ladder",
-                }
-                ladders.append(ladder)
+            best_leg = max(ladder_legs, key=lambda x: x["ev"])
 
-    ladders.sort(key=lambda l: -l["ev"])
-    return ladders[:4]
+            # Build narrative analysis
+            opp_short = opp_team.split()[-1] if opp_team else "?"
+            opp_def = fetch_def_rating(opp_team, "pts")
+
+            narrative_parts = []
+
+            # Season/recent averages
+            narrative_parts.append(
+                f"Avg: {profile.get('l5_avg', 0):.1f} L5 / "
+                f"{profile.get('l10_avg', 0):.1f} L10 / "
+                f"{profile.get('avg', 0):.1f} Szn"
+            )
+
+            # Trend
+            trend = profile.get("trend", "steady")
+            if trend == "heating up":
+                narrative_parts.append("TRENDING UP")
+            elif trend == "cooling down":
+                narrative_parts.append("cooling off")
+
+            # Ceiling
+            ceiling = profile.get("ceiling", 0)
+            narrative_parts.append(f"Ceiling: {ceiling:.0f}")
+
+            # Ceiling game frequency
+            c20 = profile.get("ceiling_20", 0)
+            c25 = profile.get("ceiling_25", 0)
+            total = profile.get("games_sampled", 20)
+            if c25 > 0:
+                narrative_parts.append(f"25+ in {c25}/{total} games")
+            elif c20 > 0:
+                narrative_parts.append(f"20+ in {c20}/{total} games")
+
+            # Matchup
+            if opp_def > 112.0:
+                narrative_parts.append(f"vs {opp_short} (weak def)")
+            elif opp_def < 109.5:
+                narrative_parts.append(f"vs {opp_short} (elite def)")
+            else:
+                narrative_parts.append(f"vs {opp_short}")
+
+            # Home/away
+            narrative_parts.append("HOME" if is_home else "ROAD")
+
+            # Hot streak
+            streak = profile.get("streak_over_line", 0)
+            if streak >= 3:
+                narrative_parts.append(f"{streak}-game streak over line")
+
+            narrative = " | ".join(narrative_parts)
+
+            # Ladder recommendation
+            # Find the "sweet spot" rung — highest rung with prob > 0.45 and EV > 0
+            plus_odds_legs = [l for l in ladder_legs if l["odds"] >= 200]
+            sweet_spot = None
+            if plus_odds_legs:
+                sweet_spot = max(plus_odds_legs, key=lambda x: x["ev"])
+
+            ladder = {
+                "player": player_name,
+                "player_id": player_id,
+                "game_id": game_id,
+                "projection": projection,
+                "all_legs": ladder_legs,
+                "best_leg": best_leg,
+                "sweet_spot": sweet_spot,
+                "ev": best_leg["ev"],
+                "bet_size": kelly_bet_size(best_leg["ev"] * 100, best_leg["prob"], BANKROLL),
+                "type": "ladder",
+                "profile": profile,
+                "narrative": narrative,
+                "vendor": vendor,
+                "opp_team": opp_team,
+                "is_home": is_home,
+                "main_line": avg_line,
+            }
+            ladders.append(ladder)
+
+    # Sort by combination of EV and ceiling potential
+    ladders.sort(key=lambda l: -(
+        l["ev"] * 30 +
+        l["profile"].get("ceiling", 0) * 0.5 +
+        (10 if l.get("sweet_spot") else 0)
+    ))
+    return ladders[:6]
 
 
 # ============================================================================
@@ -2569,7 +2734,7 @@ def format_play_card(play: Dict, index: int) -> str:
 
 def explain_play(play: Dict) -> str:
     """
-    Generate concise context: averages, matchup, home/away.
+    Generate analysis-style context: averages, trend, matchup, why this play.
     """
     parts = []
 
@@ -2577,16 +2742,21 @@ def explain_play(play: Dict) -> str:
     l5_avg = play.get("l5_avg", 0)
     l10_avg = play.get("l10_avg", 0)
     base_avg = play.get("base_avg", 0)
-    line = play.get("line", 0)
 
     if l5_avg > 0:
         parts.append(f"Avg: {l5_avg:.1f} L5 / {l10_avg:.1f} L10 / {base_avg:.1f} Szn")
 
+    # Trend detection
+    if l5_avg > 0 and l10_avg > 0:
+        if l5_avg > l10_avg * 1.10:
+            parts.append("HEATING UP")
+        elif l5_avg < l10_avg * 0.90:
+            parts.append("cooling off")
+
     # Matchup
     opp_team = play.get("opp_team", "")
     if opp_team:
-        # Shorten team name
-        short_opp = opp_team.split()[-1] if opp_team else ""  # "Celtics", "Heat" etc
+        short_opp = opp_team.split()[-1] if opp_team else ""
         opp_def = fetch_def_rating(opp_team, play.get("stat_key", "pts"))
         if opp_def > 112.0:
             parts.append(f"vs {short_opp} (weak def)")
@@ -2596,17 +2766,18 @@ def explain_play(play: Dict) -> str:
             parts.append(f"vs {short_opp}")
 
     # Home/away
-    if play.get("is_home"):
-        parts.append("HOME")
-    else:
-        parts.append("ROAD")
+    parts.append("HOME" if play.get("is_home") else "ROAD")
 
     # Breakout evidence
     breakout_ev = play.get("breakout_evidence", {})
-    if breakout_ev and breakout_ev.get("minutes_trending_up"):
-        parts.append("mins trending up")
-    if breakout_ev and breakout_ev.get("usage_pct"):
-        parts.append(f"USG {breakout_ev['usage_pct']:.0f}%")
+    if breakout_ev:
+        if breakout_ev.get("minutes_trending_up"):
+            parts.append("mins trending up")
+        if breakout_ev.get("usage_pct"):
+            parts.append(f"USG {breakout_ev['usage_pct']:.0f}%")
+        cs = breakout_ev.get("consistency_score", 0)
+        if cs > 0.7:
+            parts.append("very consistent")
 
     context = " | ".join(parts)
     return context if context else "Neutral matchup"
@@ -2631,25 +2802,61 @@ def format_parlay_card(parlay: Dict) -> str:
 
 
 def format_ladder_card(ladder: Dict) -> str:
-    """Format ladder card for WhatsApp output."""
+    """
+    Format ladder card with full analysis narrative.
+    Shows: player profile, why they're a ladder candidate, each rung with
+    hit rate evidence, and the recommended sweet spot play.
+    """
     player = ladder.get("player", "?")
     proj = ladder.get("projection", 0)
-    best = ladder.get("best_leg", {})
+    main_line = ladder.get("main_line", 0)
+    narrative = ladder.get("narrative", "")
+    vendor = ladder.get("vendor", "FanDuel")
+    legs = ladder.get("all_legs", [])
+    sweet = ladder.get("sweet_spot")
+    profile = ladder.get("profile", {})
 
-    best_line = best.get("line", 0)
-    best_odds = best.get("odds", -110)
-    best_prob = best.get("prob", 0)
-    best_ev = best.get("ev", 0)
+    lines = []
+    lines.append(f"LADDER: {player} (Proj {proj:.1f} | Line {main_line})")
+    lines.append(f"  {narrative}")
 
-    odds_str = f"+{best_odds}" if best_odds > 0 else str(best_odds)
+    # Show each rung with hit rate evidence
+    lines.append(f"  Rungs:")
+    for leg in legs:
+        rung = leg["rung"]
+        odds_str = leg.get("odds_str", str(leg["odds"]))
+        prob = leg["prob"]
+        hr = leg.get("hit_rate", 0)
+        hits = leg.get("hits", 0)
+        total = leg.get("total", 20)
+        ev = leg.get("ev", 0)
 
-    rungs_list = ", ".join([f"{l['rung']}" for l in ladder.get("all_legs", [])])
+        marker = ""
+        if sweet and leg["rung"] == sweet["rung"]:
+            marker = " << SWEET SPOT"
+        elif leg == ladder.get("best_leg"):
+            marker = " << BEST EV"
 
-    return (
-        f"LADDER: {player} Proj {proj:.1f}\n"
-        f"  BEST: {best_line}+ {odds_str} P={best_prob*100:.0f}% EV=+{best_ev:.2f}\n"
-        f"  Rungs: {rungs_list}"
-    )
+        lines.append(
+            f"    {rung}+ {odds_str} | P={prob*100:.0f}% | "
+            f"Hit {hits}/{total} | EV {'+' if ev >= 0 else ''}{ev:.2f}{marker}"
+        )
+
+    # Recommendation
+    if sweet:
+        lines.append(
+            f"  PLAY: {player} {sweet['rung']}+ PTS {sweet.get('odds_str', '')} "
+            f"(hit {sweet.get('hits', 0)}/{sweet.get('total', 20)} szn, "
+            f"P={sweet['prob']*100:.0f}%)"
+        )
+    else:
+        best = ladder.get("best_leg", {})
+        lines.append(
+            f"  PLAY: {player} {best.get('rung', 0)}+ PTS "
+            f"(best EV at {best.get('odds_str', str(best.get('odds', -110)))})"
+        )
+
+    return "\n".join(lines)
 
 
 # ============================================================================
