@@ -111,6 +111,9 @@ CONSISTENCY_WINDOW = 10
 CONSISTENCY_BAND = 0.20
 
 # Book vendors and prop types
+# PRIMARY_BOOK is the preferred sportsbook — only its lines/odds are used.
+# Falls back to others only if primary has no data for a player/prop.
+PRIMARY_BOOK = os.getenv("PRIMARY_BOOK", "fanduel").lower()
 BOOK_VENDORS = [
     "DraftKings",
     "FanDuel",
@@ -903,9 +906,13 @@ def bdl_fetch_props_for_game(game_id: int, prop_types: List[str] = None) -> Dict
             print(f"[API] Resolving {len(unique_pids)} player names...")
             bdl_batch_player_names(list(unique_pids))
 
-        # Step 3: Parse each prop entry
+        # Step 3: Parse each prop entry into temp structure
+        # temp[player_name][prop_type][vendor_lower] = [{book, line, odds, player_id}]
+        temp = {}
         skipped_milestone = 0
         parsed = 0
+        vendor_counts = {}
+
         for prop in raw_items:
             pid = prop.get("player_id")
             if not pid:
@@ -926,7 +933,7 @@ def bdl_fetch_props_for_game(game_id: int, prop_types: List[str] = None) -> Dict
 
             if market_type == "milestone":
                 skipped_milestone += 1
-                continue  # Milestone bets aren't standard over/under
+                continue
 
             # Get over odds from market
             over_odds = market.get("over_odds", -110)
@@ -944,14 +951,17 @@ def bdl_fetch_props_for_game(game_id: int, prop_types: List[str] = None) -> Dict
                 continue
 
             vendor = prop.get("vendor", "Consensus")
+            vendor_lower = vendor.lower().replace(" ", "").replace("_", "")
+            vendor_counts[vendor] = vendor_counts.get(vendor, 0) + 1
 
-            # Store by player_name -> prop_type -> [offers]
-            if player_name not in result:
-                result[player_name] = {}
-            if prop_type not in result[player_name]:
-                result[player_name][prop_type] = []
+            if player_name not in temp:
+                temp[player_name] = {}
+            if prop_type not in temp[player_name]:
+                temp[player_name][prop_type] = {}
+            if vendor_lower not in temp[player_name][prop_type]:
+                temp[player_name][prop_type][vendor_lower] = []
 
-            result[player_name][prop_type].append({
+            temp[player_name][prop_type][vendor_lower].append({
                 "book": vendor,
                 "line": line_val,
                 "odds": float(over_odds),
@@ -959,9 +969,30 @@ def bdl_fetch_props_for_game(game_id: int, prop_types: List[str] = None) -> Dict
             })
             parsed += 1
 
+        print(f"[API] Vendors found: {vendor_counts}")
+
+        # Step 4: For each player/prop, prefer PRIMARY_BOOK lines
+        primary_key = PRIMARY_BOOK.replace(" ", "").replace("_", "")
+        primary_used = 0
+        fallback_used = 0
+
+        for player_name, props_dict in temp.items():
+            result[player_name] = {}
+            for prop_type, vendors_dict in props_dict.items():
+                if primary_key in vendors_dict:
+                    result[player_name][prop_type] = vendors_dict[primary_key]
+                    primary_used += 1
+                else:
+                    # Fallback: pick the vendor with the most entries
+                    best_vendor = max(vendors_dict.keys(), key=lambda v: len(vendors_dict[v]))
+                    result[player_name][prop_type] = vendors_dict[best_vendor]
+                    fallback_used += 1
+
         total_players = len(result)
-        total_props = sum(len(v) for p in result.values() for v in p.values())
-        print(f"[API] player_props: {total_players} players, {total_props} lines ({skipped_milestone} milestones skipped)")
+        total_props = sum(len(v) for player_props in result.values() for v in player_props.values())
+        print(f"[API] player_props: {total_players} players | "
+              f"PRIMARY ({PRIMARY_BOOK}): {primary_used} props, fallback: {fallback_used} | "
+              f"({skipped_milestone} milestones skipped)")
 
     except Exception as e:
         print(f"[API] player_props exception: {e}")
@@ -1396,7 +1427,9 @@ def compute_projection(
     prob_over = calibrated_prob(raw_prob)
 
     # Step 12: Edge and EV (edge as percentage, not absolute)
-    edge_pct = ((proj - line) / line * 100) if line > 0 else 0.0
+    raw_edge_pct = ((proj - line) / line * 100) if line > 0 else 0.0
+    # Cap edge at 50% to prevent low-line props (0.5 blk/stl) from inflating rankings
+    edge_pct = min(raw_edge_pct, 50.0)
     implied_prob = american_to_prob(over_odds)
     ev = ev_per_dollar(prob_over, over_odds)
 
@@ -1825,6 +1858,9 @@ def slate_scan_edges(
             if has_recent_play(state, player_name, prop_type):
                 continue
 
+            # Get vendor from the book line data
+            play_vendor = book_lines[0].get("book", "FanDuel") if book_lines else "FanDuel"
+
             play = {
                 "player": player_name,
                 "player_id": player_id,
@@ -1842,6 +1878,7 @@ def slate_scan_edges(
                 "is_breakout": proj_result.is_breakout,
                 "breakout_evidence": proj_result.breakout_evidence,
                 "odds": best_odds,
+                "vendor": play_vendor,
                 "bet_size": kelly_bet_size(proj_result.edge, proj_result.prob_over, BANKROLL),
                 "score": proj_result.edge + proj_result.ev * 10,
                 "l5_avg": proj_result.l5_avg,
