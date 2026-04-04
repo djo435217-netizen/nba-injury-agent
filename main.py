@@ -2921,9 +2921,11 @@ def build_player_projection(
         base_avg = sum(float(x[1]) for x in base) / max(1, len(base))
         l10_avg = sum(float(x[1]) for x in long_slice) / max(1, len(long_slice))
         l3_avg = sum(float(x[1]) for x in short_slice) / max(1, len(short_slice))
-        base_min = sum(float(x[3]) for x in base) / max(1, len(base))
-        l10_min = sum(float(x[3]) for x in long_slice) / max(1, len(long_slice))
-        l3_min = sum(float(x[3]) for x in short_slice) / max(1, len(short_slice))
+        # Threes tuples: (date, fg3m, fg3a, mins) -- 4 elements
+        # Guard against 3-element tuples passed by mistake
+        base_min = sum(float(x[3]) if len(x) > 3 else float(x[2]) for x in base) / max(1, len(base))
+        l10_min = sum(float(x[3]) if len(x) > 3 else float(x[2]) for x in long_slice) / max(1, len(long_slice))
+        l3_min = sum(float(x[3]) if len(x) > 3 else float(x[2]) for x in short_slice) / max(1, len(short_slice))
 
         rate_base = _safe_rate(base_avg, base_min)
         rate_l10 = _safe_rate(l10_avg, l10_min)
@@ -3218,7 +3220,7 @@ def build_injury_edges(
     if prop_type_is_threes(prop_type):
         inj_games = bdl_last_n_games_threes([injured_pid], season, BASELINE_GAMES).get(injured_pid, [])
         ip10 = sum(float(x[1]) for x in _slice_last(inj_games, LOOKBACK_GAMES)) / max(1, len(_slice_last(inj_games, LOOKBACK_GAMES)))
-        im10 = sum(float(x[3]) for x in _slice_last(inj_games, LOOKBACK_GAMES)) / max(1, len(_slice_last(inj_games, LOOKBACK_GAMES)))
+        im10 = sum(float(x[3]) if len(x) > 3 else float(x[2]) for x in _slice_last(inj_games, LOOKBACK_GAMES)) / max(1, len(_slice_last(inj_games, LOOKBACK_GAMES)))
     else:
         inj_stat_key = prop_type_to_stat_key(prop_type)
         inj_games = bdl_last_n_games_stats([injured_pid], season, BASELINE_GAMES, inj_stat_key).get(injured_pid, [])
@@ -4426,7 +4428,7 @@ def find_correlated_parlays(final_out: list, lines_map: dict,
         team = play1.get("team", "")
         gid = play1.get("gid", 0)
 
-        for pt2 in ["rebounds", "assists", "threes"]:
+        for pt2 in ["rebounds", "assists"]:  # threes handled separately
             if deadline_exceeded():
                 break
             if pt2 == play1["prop_type"]:
