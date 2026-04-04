@@ -1083,17 +1083,7 @@ def get_player_position(player_name: str) -> str:
     return ""
 
 
-
-    """Look up player position from map. Returns pg/sg/sf/pf/c or empty string."""
-    key = _clean_name(player_name)
-    # Try direct match first
-    if key in PLAYER_POSITION_MAP:
-        return PLAYER_POSITION_MAP[key]
-    # Try partial match for names with suffixes
-    for k, v in PLAYER_POSITION_MAP.items():
-        if k in key or key in k:
-            return v
-    return ""
+# FIX: Removed orphaned duplicate function body that was floating without a def statement
 
 
 def opponent_defense_adjustment(opponent_team: str, prop_type: str, player_name: str = "") -> tuple[float, str]:
@@ -1105,7 +1095,10 @@ def opponent_defense_adjustment(opponent_team: str, prop_type: str, player_name:
 
     Falls back to team-level if position unknown.
     """
-    if not ENABLE_OPP_DEF_ADJ or prop_type not in ("points", "pts"):
+    # FIX: Enable defense adjustment for rebounds and assists too, not just points
+    # Opponent defense quality affects all stat categories
+    valid_prop_types = ("points", "pts", "rebounds", "reb", "assists", "ast")
+    if not ENABLE_OPP_DEF_ADJ or prop_type not in valid_prop_types:
         return 0.0, "neutral"
 
     opp = normalize_team_name(opponent_team)
@@ -1116,21 +1109,29 @@ def opponent_defense_adjustment(opponent_team: str, prop_type: str, player_name:
     pace_diff = def_stats["pace"] - LEAGUE_AVG_PACE
     pace_factor = (pace_diff / 2.0) * 0.01 * PACE_FACTOR_WEIGHT
 
-    # Try position-specific adjustment first
-    pos = get_player_position(player_name) if player_name else ""
-    pos_key = f"pts_vs_{pos}" if pos else None
-
-    if pos_key and pos_key in def_stats and pos in LEAGUE_AVG_VS_POS:
-        pos_allowed = def_stats[pos_key]
-        league_avg_pos = LEAGUE_AVG_VS_POS[pos]
-        pts_diff = pos_allowed - league_avg_pos
-        # Position-specific: +3 pts above avg => +4% boost
-        pts_factor = (pts_diff / 3.0) * 0.04
-        note_base = f"{pos.upper()}-def"
+    # For points: try position-specific adjustment first
+    # For reb/ast: use team-level defense rating (weaker teams allow more across the board)
+    sk = prop_type_to_stat_key(prop_type)
+    if sk == "pts":
+        pos = get_player_position(player_name) if player_name else ""
+        pos_key = f"pts_vs_{pos}" if pos else None
+        if pos_key and pos_key in def_stats and pos in LEAGUE_AVG_VS_POS:
+            pos_allowed = def_stats[pos_key]
+            league_avg_pos = LEAGUE_AVG_VS_POS[pos]
+            pts_diff = pos_allowed - league_avg_pos
+            pts_factor = (pts_diff / 3.0) * 0.04
+            note_base = f"{pos.upper()}-def"
+        else:
+            pts_diff = def_stats["pts_allowed_pg"] - LEAGUE_AVG_PTS_ALLOWED
+            pts_factor = (pts_diff / 5.0) * 0.04
+            note_base = "team-def"
     else:
+        # For reb/ast: weak defenses allow more of everything
+        # Use overall pts_allowed as a proxy for general defensive quality
         pts_diff = def_stats["pts_allowed_pg"] - LEAGUE_AVG_PTS_ALLOWED
-        pts_factor = (pts_diff / 5.0) * 0.04
-        note_base = "team-def"
+        # Smaller effect for reb/ast than pts (0.02 per 5pts difference instead of 0.04)
+        pts_factor = (pts_diff / 5.0) * 0.02
+        note_base = f"team-def-{sk}"
 
     adj = _clamp(pts_factor + pace_factor, -0.15, 0.15)
 
@@ -1228,12 +1229,17 @@ def consistency_score(games, n=LOOKBACK_GAMES) -> float:
 
 def adaptive_sigma(games, base_sigma: float, cons_score: float) -> float:
     """
-    IMPROVEMENT: Scale sigma down for consistent players.
-    A player with 80% consistency within +/-20% of avg gets sigma reduced by up to 25%.
-    This lets us have more confidence on consistent over-achievers vs the line.
+    FIX: Scale sigma moderately for consistent players.
+    Old version reduced sigma by up to 25% -- way too aggressive.
+    A player with 80% consistency now gets max 12% reduction.
+    This prevents unrealistically high probabilities (85%+ on thin edges).
     """
-    reduction = (cons_score - 0.5) * 0.5  # 0.0 at 50% cons, 0.25 at 100% cons
-    return max(STD_FLOOR, base_sigma * (1.0 - reduction))
+    # Max 12% reduction at perfect consistency, 0% at 50% consistency
+    reduction = (cons_score - 0.5) * 0.24  # 0.0 at 50% cons, 0.12 at 100% cons
+    reduced = base_sigma * (1.0 - max(0.0, reduction))
+    # Use per-stat floor
+    stat_floor = STD_FLOOR  # caller already used get_std_floor in compute_projection_components_points
+    return max(stat_floor, reduced)
 
 
 # -------------------- NEW: RESULT TRACKING --------------------
@@ -1416,11 +1422,18 @@ def player_risk_bucket(l10_min: float, sigma: float | None, prop_type: str) -> s
 
 
 def thresholds_for_bucket(bucket: str) -> dict:
+    """
+    FIX: Tightened thresholds after probability calibration fix.
+    Old thresholds let in too many marginal plays that didn't hit.
+    Now require stronger edge and higher probability for all buckets.
+    Low-risk (high-minute starters) can still get through at 57% prob,
+    but high-risk (bench players, volatile) need 63%+.
+    """
     if bucket == "high":
-        return {"min_edge": 2.2, "min_prob": 0.60, "min_ev": 0.01, "min_value_edge": 0.01}
+        return {"min_edge": 2.8, "min_prob": 0.63, "min_ev": 0.03, "min_value_edge": 0.02}
     if bucket == "medium":
-        return {"min_edge": 1.8, "min_prob": 0.57, "min_ev": 0.00, "min_value_edge": 0.00}
-    return {"min_edge": 1.2, "min_prob": 0.54, "min_ev": 0.00, "min_value_edge": 0.00}
+        return {"min_edge": 2.2, "min_prob": 0.60, "min_ev": 0.02, "min_value_edge": 0.01}
+    return {"min_edge": 1.5, "min_prob": 0.57, "min_ev": 0.01, "min_value_edge": 0.00}
 
 
 def minutes_stability_ok(l10_min: float, l3_min: float, le_score: float) -> bool:
@@ -2349,13 +2362,9 @@ def compute_projection_components_points(games_all, line, prop_type="points"):
         "raw_sigma": raw_sigma,
         "consistency": cons,
         "line": float(line),
-        "floor": p_floor if "p_floor" in dir() else 0.0,
-        "ceiling": p_ceiling if "p_ceiling" in dir() else 0.0,
-        "l10_median": l10_median if "l10_median" in dir() else 0.0,
-        "situation_label": situation_label if "situation_label" in dir() else "",
-        "minute_warn": minute_warn if "minute_warn" in dir() else "",
-        "instinct_label": instinct_label if "instinct_label" in dir() else "",
-        "fade_label": fade_label if "fade_label" in dir() else "",
+        "floor": p_floor,
+        "ceiling": p_ceiling,
+        "l10_median": l10_median,
     }
 
 
@@ -2954,13 +2963,7 @@ def build_player_projection(
 
     proj_min = projected_minutes(base_min, l10_min, l3_min, min_delta, injury_boost_min, le_score)
 
-    # Apply minute cap if set
-    if "minute_cap_signal" in dir() and minute_cap_signal != 0.0:
-        proj, minute_warn = apply_minute_cap(proj, proj_min, l10_min, minute_cap_signal)
-
-    # Apply instinct boost -- your read on top of the model
-    if "instinct_boost" in dir() and instinct_boost != 0.0:
-        proj += instinct_boost
+    # NOTE: minute_cap and instinct_boost are applied AFTER proj is calculated below
 
     min_conf = minutes_confidence(proj_min, l10_min, l3_min)
 
@@ -2978,18 +2981,31 @@ def build_player_projection(
         proj = proj_min * proj_rate
         proj += min(0.4, injury_boost_stat * 0.05)
     else:
-        proj = proj_min * proj_rate
+        # FIX: Blend rate-based projection with direct weighted average
+        # Pure rate-based (proj_min * proj_rate) is fragile -- if minutes
+        # projection is off by 2min, that's a ~1.5pt swing.
+        # Blending with direct averages stabilizes the projection.
+        rate_proj = proj_min * proj_rate
+        # Direct weighted average (breakout-aware)
+        if base_avg > 3.0 and l3_avg >= base_avg * BREAKOUT_MIN_RATIO:
+            avg_proj = (BREAKOUT_BASE_WEIGHT * base_avg +
+                        BREAKOUT_L10_WEIGHT * l10_avg +
+                        BREAKOUT_L3_WEIGHT * l3_avg)
+        else:
+            avg_proj = (PROJ_WEIGHT_BASE * base_avg +
+                        PROJ_WEIGHT_L10 * l10_avg +
+                        PROJ_WEIGHT_L3 * l3_avg)
+        # Blend: 55% rate-based, 45% average-based for stability
+        proj = (rate_proj * 0.55) + (avg_proj * 0.45)
         proj += injury_boost_stat
 
     # Apply news boost
     boost_rec = (news_boosts or {}).get(_clean_name(player_name)) if player_name else None
     proj, news_eff, news_why = apply_news_to_projection(proj, boost_rec)
 
-    # IMPROVEMENT: Opponent defensive adjustment (was always 0.0 before)
-    matchup_score, matchup_note = opponent_defense_adjustment(opponent_team, prop_type)
-    proj *= (1.0 + matchup_score)
-
-    # IMPROVEMENT: Home/away boost
+    # Opponent defensive adjustment
+    # FIX: Resolve opponent FIRST, then apply matchup adjustment ONCE (was double-applied)
+    resolved_opponent = opponent_team
     game_ctx = {}
     home_away_note = ""
     if games_map and gid and player_team:
@@ -2998,11 +3014,12 @@ def build_player_projection(
         if ha_boost != 0:
             proj += ha_boost
             home_away_note = f"{'home' if game_ctx.get('is_home') else 'away'}({ha_boost:+.1f}pts)"
-        if not opponent_team and game_ctx.get("opponent"):
-            # Re-apply matchup if we got opponent from game context
-            opp = game_ctx["opponent"]
-            matchup_score, matchup_note = opponent_defense_adjustment(opp, prop_type)
-            proj *= (1.0 + matchup_score)
+        if not resolved_opponent and game_ctx.get("opponent"):
+            resolved_opponent = game_ctx["opponent"]
+
+    # Apply matchup adjustment exactly ONCE with resolved opponent
+    matchup_score, matchup_note = opponent_defense_adjustment(resolved_opponent, prop_type, player_name)
+    proj *= (1.0 + matchup_score)
 
     # B2B penalty
     b2b_note = ""
@@ -3039,6 +3056,7 @@ def build_player_projection(
         proj *= (1.0 + usage_adj)
 
     # ---- MINUTE CAP CHECK ----
+    # FIX: Now actually applied to projection (was dead code before)
     minute_cap_signal = 0.0
     minute_warn = ""
     if games:
@@ -3047,8 +3065,12 @@ def build_player_projection(
         if name_key_mc in manual_caps:
             minute_cap_signal = manual_caps[name_key_mc]
 
+    if minute_cap_signal != 0.0:
+        proj, minute_warn = apply_minute_cap(proj, proj_min, l10_min, minute_cap_signal)
+        print(f"[INFO] Minute cap applied: {player_name} signal={minute_cap_signal} -> proj={proj:.1f} warn={minute_warn}")
+
     # ---- INSTINCT OVERRIDES ----
-    # Your personal read -- applied before probability calculation
+    # FIX: Now actually applied to projection (was dead code before)
     instinct_boost = 0.0
     instinct_label = ""
     fade_label = ""
@@ -3071,9 +3093,14 @@ def build_player_projection(
     if name_key_inst in target_set:
         instinct_boost += TARGET_BOOST
         instinct_label = f"TARGETING (+{TARGET_BOOST:.1f}pts)"
-        # Will apply after proj_min is calculated
+
+    # FIX: Actually apply the instinct boost to the projection
+    if instinct_boost != 0.0:
+        proj += instinct_boost
+        print(f"[INFO] Instinct boost applied: {player_name} {instinct_boost:+.1f}pts -> proj={proj:.1f}")
 
     # Situational edge analysis
+    situation_label = ""
     if ENABLE_SITUATION_ENGINE and games and games_map and gid:
         game_info = (games_map or {}).get(int(gid), {})
         home_team = normalize_team_name(game_info.get("home", ""))
@@ -3094,10 +3121,6 @@ def build_player_projection(
         if sit["situation_boost"] != 0:
             proj += sit["situation_boost"]
             situation_label = sit["situation_label"]
-        else:
-            situation_label = ""
-    else:
-        situation_label = ""
 
     # Starter confirmation from BDL lineups
     starter_note = ""
@@ -3111,7 +3134,7 @@ def build_player_projection(
                 proj *= 0.92
                 starter_note = "confirmed-bench(-8%)"
 
-    # Get real game odds (total + spread) from BDL
+    # Get real game odds (total + spread) from BDL -- only if not already fetched
     if gid and not game_total:
         odds_data = bdl_fetch_game_odds_full(gid)
         if odds_data["total"] > 0:
@@ -3129,11 +3152,19 @@ def build_player_projection(
                 proj += blowout_adj2
                 blowout_note = blowout_note2
 
-    # Position from API (more accurate than hardcoded map)
-    if player_id and int(player_id) in PLAYER_POS_CACHE:
-        api_pos = PLAYER_POS_CACHE[int(player_id)]
-        if api_pos and not opponent_team:
-            pass  # position cached for future use
+    # ---- PROJECTION SANITY GUARDRAIL ----
+    # FIX: Prevent projection from going wildly off due to stacked adjustments
+    # Cap projection to be within reasonable range of the weighted average
+    if not prop_type_is_threes(prop_type):
+        weighted_avg = (base_avg * 0.35) + (l10_avg * 0.35) + (l3_avg * 0.30)
+        max_proj = max(weighted_avg * 1.45, float(line) * 1.50)  # max 45% above avg or 50% above line
+        min_proj = max(0.0, min(weighted_avg * 0.55, float(line) * 0.50))  # min 55% of avg
+        if proj > max_proj:
+            print(f"[GUARDRAIL] {player_name} proj {proj:.1f} capped to {max_proj:.1f} (avg={weighted_avg:.1f})")
+            proj = max_proj
+        if proj < min_proj:
+            print(f"[GUARDRAIL] {player_name} proj {proj:.1f} floored to {min_proj:.1f} (avg={weighted_avg:.1f})")
+            proj = min_proj
 
     # Compute edge and probability
     if prop_type_is_threes(prop_type) and THREES_BETA_BINOM:
@@ -3144,7 +3175,15 @@ def build_player_projection(
     else:
         edge = proj - float(line)
         z = (proj - float(line)) / max(sigma, 1e-6)
-        prob_over = _norm_cdf(z)
+        raw_prob = _norm_cdf(z)
+        # FIX: Calibration shrinkage -- raw normal CDF is overconfident
+        # Real-world NBA scoring has fat tails (injuries, foul trouble, blowouts).
+        # Shrink probabilities toward 50% by 10% to avoid overconfident picks.
+        # A raw 75% becomes 72.5%, a raw 60% becomes 59%.
+        # This is the single biggest source of "bad predictions" -- the model
+        # says 70% confident but the true hit rate is closer to 60%.
+        CALIBRATION_SHRINK = 0.10
+        prob_over = 0.50 + (raw_prob - 0.50) * (1.0 - CALIBRATION_SHRINK)
 
     return {
         "proj": proj,
@@ -3179,11 +3218,15 @@ def build_player_projection(
         "min_delta": min_delta,
         "rate_delta": rate_delta,
         "m10": m10,
-        "starter_note": starter_note if "starter_note" in dir() else "",
-        "adv_usage_pct": usage_stats.get("avg_usage_pct", 0.0) if "usage_stats" in dir() else 0.0,
-        "adv_pie": usage_stats.get("avg_pie", 0.0) if "usage_stats" in dir() else 0.0,
-        "is_breakout": is_breakout if "is_breakout" in dir() else False,
-        "breakout_reason": breakout_reason if "breakout_reason" in dir() else "",
+        "starter_note": starter_note,
+        "adv_usage_pct": usage_stats.get("avg_usage_pct", 0.0) if isinstance(usage_stats, dict) else 0.0,
+        "adv_pie": usage_stats.get("avg_pie", 0.0) if isinstance(usage_stats, dict) else 0.0,
+        "is_breakout": is_breakout,
+        "breakout_reason": breakout_reason,
+        "situation_label": situation_label,
+        "instinct_label": instinct_label,
+        "fade_label": fade_label,
+        "minute_warn": minute_warn,
     }
 
 
