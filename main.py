@@ -254,6 +254,14 @@ TEAM_DEFENSE_RATINGS = {
 BDL_BASE = "https://api.balldontlie.io/v1"
 LINEUP_EXPERTS_BASE = "https://api.lineupexperts.com/v1"
 
+# ESPN public API (no auth needed)
+ESPN_API_BASE = "https://site.api.espn.com/apis"
+ESPN_PLAYER_SEARCH = f"{ESPN_API_BASE}/common/v3/sports/basketball/nba/athletes"
+ESPN_SCOREBOARD = f"{ESPN_API_BASE}/site/v2/sports/basketball/nba/scoreboard"
+
+# NBA.com CDN stats (public, no auth)
+NBACOM_STATS_BASE = "https://stats.nba.com/stats"
+
 # Caches
 PROPS_CACHE = {}
 ADV_STATS_CACHE = {}
@@ -263,6 +271,8 @@ TEAM_ID_CACHE = {}
 LINEUPS_CACHE = {}
 DEF_RATINGS_CACHE = {}
 PLAYER_NAME_CACHE = {}
+ESPN_PLAYER_CACHE = {}  # name -> {espn_id, stats, gamelog, news}
+MULTI_SOURCE_CACHE = {}  # player_id -> cross-referenced data
 
 # State tracking
 RUNTIME_START = time.time()
@@ -524,6 +534,201 @@ def hit_rates_by_window(base_games, l10_games, l5_games, line: float) -> Dict:
         "l10_hits": sum(1 for g in l10_games if g.get("value", 0) > line),
         "base_hits": sum(1 for g in base_games if g.get("value", 0) > line),
     }
+
+
+def build_deep_analysis(
+    player_name: str,
+    player_id: int,
+    stat_key: str,
+    line: float,
+    proj: float,
+    games: List[Dict],
+    opp_team: str = "",
+    is_home: bool = True,
+    breakout_evidence: Dict = None,
+    hit_rates: Dict = None,
+    xref: Dict = None,
+) -> str:
+    """
+    Build a multi-line research-style analysis for a pick.
+    Uses raw game data to find narratives, streaks, trends, ceiling games,
+    matchup context — the same depth a human analyst would provide.
+    """
+    if not games:
+        return "Insufficient data"
+
+    values = [g.get("value", 0) for g in games]
+    n = len(values)
+    l5 = values[:5] if n >= 5 else values
+    l10 = values[:10] if n >= 10 else values
+
+    l5_avg = sum(l5) / len(l5) if l5 else 0
+    l10_avg = sum(l10) / len(l10) if l10 else 0
+    szn_avg = sum(values) / n if n else 0
+    floor_val = min(values) if values else 0
+    ceiling_val = max(values) if values else 0
+
+    STAT_LABELS = {"pts": "points", "reb": "rebounds", "ast": "assists",
+                   "threes": "threes", "blk": "blocks", "stl": "steals"}
+    stat_label = STAT_LABELS.get(stat_key, stat_key)
+
+    parts = []
+
+    # ---- Line 1: Averages and trend ----
+    trend = ""
+    if l5_avg > l10_avg * 1.10:
+        trend = " (TRENDING UP)"
+    elif l5_avg < l10_avg * 0.90:
+        trend = " (cooling off)"
+    parts.append(f"  Avg: {l5_avg:.1f} L5 / {l10_avg:.1f} L10 / {szn_avg:.1f} Szn{trend}")
+
+    # ---- Line 2: Recent form narrative ----
+    # Find streaks: consecutive games over line
+    streak_over = 0
+    for v in values:
+        if v > line:
+            streak_over += 1
+        else:
+            break
+
+    # Count of games in a range over recent stretch
+    double_digit_l10 = sum(1 for v in l10 if v >= 10)
+    over_line_l10 = sum(1 for v in l10 if v > line)
+    over_line_l5 = sum(1 for v in l5 if v > line)
+
+    form_parts = []
+    if streak_over >= 3:
+        form_parts.append(f"{streak_over}-game streak over {line}")
+    if over_line_l5 >= 4:
+        form_parts.append(f"cleared line in {over_line_l5}/5 recent")
+    elif over_line_l10 >= 7:
+        form_parts.append(f"over line in {over_line_l10}/10 L10")
+
+    if stat_key == "pts" and double_digit_l10 >= 8:
+        form_parts.append(f"double digits in {double_digit_l10}/10 L10")
+
+    # Look for a standout recent game
+    if l5:
+        best_recent = max(l5)
+        if best_recent > line * 1.5:
+            form_parts.append(f"hit {best_recent:.0f} recently")
+
+    if form_parts:
+        parts.append(f"  Form: {' | '.join(form_parts)}")
+
+    # ---- Line 3: Floor/Ceiling ----
+    # Count ceiling games
+    if stat_key == "pts":
+        c20 = sum(1 for v in values if v >= 20)
+        c25 = sum(1 for v in values if v >= 25)
+        c30 = sum(1 for v in values if v >= 30)
+        ceil_parts = [f"Floor {floor_val:.0f} / Ceiling {ceiling_val:.0f}"]
+        if c30 > 0:
+            ceil_parts.append(f"30+ in {c30}/{n}")
+        elif c25 > 0:
+            ceil_parts.append(f"25+ in {c25}/{n}")
+        elif c20 > 0:
+            ceil_parts.append(f"20+ in {c20}/{n}")
+        parts.append(f"  Range: {' | '.join(ceil_parts)}")
+    else:
+        parts.append(f"  Range: Floor {floor_val:.0f} / Ceiling {ceiling_val:.0f}")
+
+    # ---- Line 4: Matchup ----
+    matchup_parts = []
+    if opp_team:
+        short_opp = opp_team.split()[-1] if opp_team else "?"
+        opp_def = fetch_def_rating(opp_team, stat_key)
+        if opp_def > 113.0:
+            matchup_parts.append(f"vs {short_opp} (bottom-10 defense)")
+        elif opp_def > 111.0:
+            matchup_parts.append(f"vs {short_opp} (weak def, {opp_def:.0f} DRTG)")
+        elif opp_def < 109.0:
+            matchup_parts.append(f"vs {short_opp} (elite def, {opp_def:.0f} DRTG)")
+        else:
+            matchup_parts.append(f"vs {short_opp} ({opp_def:.0f} DRTG)")
+
+    matchup_parts.append("HOME" if is_home else "ROAD")
+
+    # Breakout extras
+    if breakout_evidence:
+        if breakout_evidence.get("minutes_trending_up"):
+            matchup_parts.append("mins trending up")
+        if breakout_evidence.get("usage_pct"):
+            matchup_parts.append(f"USG {breakout_evidence['usage_pct']:.0f}%")
+
+    if matchup_parts:
+        parts.append(f"  Matchup: {' | '.join(matchup_parts)}")
+
+    # ---- Line 5: Data verification (multi-source) ----
+    if xref:
+        xref_parts = []
+        primary = xref.get("primary_source", "BDL")
+        sources = xref.get("sources", [])
+
+        if len(sources) > 1:
+            espn_a = xref.get("espn_avg", 0)
+            bdl_a = xref.get("bdl_avg", 0)
+            disc = xref.get("discrepancy", 0)
+
+            if espn_a > 0 and bdl_a > 0:
+                if disc <= 8:
+                    xref_parts.append(f"ESPN {espn_a:.1f} / BDL {bdl_a:.1f} (AGREE)")
+                else:
+                    xref_parts.append(f"ESPN {espn_a:.1f} vs BDL {bdl_a:.1f} ({disc:.0f}% diff)")
+
+            conf = xref.get("confidence", "high").upper()
+            if conf != "HIGH":
+                xref_parts.append(f"Confidence: {conf}")
+        elif "ESPN" in sources:
+            xref_parts.append("ESPN verified")
+        else:
+            xref_parts.append("BDL only")
+
+        # Injury alerts
+        for note in xref.get("notes", []):
+            if "INJURY" in note:
+                xref_parts.append(note)
+
+        if xref.get("espn_team"):
+            xref_parts.append(xref["espn_team"])
+
+        label = "Verified" if len(sources) > 1 else "Source"
+        parts.append(f"  {label}: {' | '.join(xref_parts)}")
+
+    # ---- Line 6: Why this play (the verdict) ----
+    reasons = []
+    hr = hit_rates or {}
+    composite_hr = hr.get("composite", 0)
+
+    if composite_hr >= 0.75:
+        reasons.append(f"hits at {composite_hr*100:.0f}% rate")
+    elif composite_hr >= 0.60:
+        reasons.append(f"solid {composite_hr*100:.0f}% hit rate")
+
+    if proj > line * 1.15:
+        reasons.append(f"proj {proj:.1f} well above line {line}")
+    elif proj > line:
+        reasons.append(f"proj {proj:.1f} above line {line}")
+
+    if streak_over >= 3:
+        reasons.append("on a streak")
+
+    if l5_avg > l10_avg * 1.10:
+        reasons.append("heating up lately")
+
+    if opp_team:
+        opp_def = fetch_def_rating(opp_team, stat_key)
+        if opp_def > 112.0:
+            reasons.append("soft matchup")
+
+    # Add cross-ref agreement as a reason
+    if xref and xref.get("agreement", False) and len(xref.get("sources", [])) > 1:
+        reasons.append("multi-source verified")
+
+    if reasons:
+        parts.append(f"  Why: {' + '.join(reasons)}")
+
+    return "\n".join(parts)
 
 
 def normalize_team_name(team_name: str) -> str:
@@ -1186,6 +1391,429 @@ def bdl_fetch_lineups(game_id: int) -> Dict:
     return result
 
 
+# ============================================================================
+# SECTION 5b: ESPN + NBA.COM MULTI-SOURCE DATA
+# ============================================================================
+
+def _espn_get(url: str, params: Dict = None, timeout: int = 8) -> Dict:
+    """Safe ESPN API call with caching."""
+    if not requests:
+        return {}
+    try:
+        resp = requests.get(url, params=params or {}, timeout=timeout)
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            print(f"[ESPN] {url.split('/')[-1]} -> {resp.status_code}")
+            return {}
+    except Exception as e:
+        print(f"[ESPN] Error: {e}")
+        return {}
+
+
+def espn_search_player(player_name: str) -> Dict:
+    """
+    Search ESPN for a player by name. Returns ESPN athlete data with ID,
+    team, position, and recent stats/news.
+    """
+    if not player_name or not requests:
+        return {}
+
+    cache_key = _clean_name(player_name)
+    if cache_key in ESPN_PLAYER_CACHE:
+        return ESPN_PLAYER_CACHE[cache_key]
+
+    try:
+        # ESPN athlete search endpoint (public, no auth)
+        url = f"{ESPN_API_BASE}/common/v3/sports/basketball/nba/athletes"
+        resp = requests.get(url, params={"search": player_name, "limit": 3}, timeout=8)
+
+        if resp.status_code != 200:
+            ESPN_PLAYER_CACHE[cache_key] = {}
+            return {}
+
+        data = resp.json()
+        athletes = data.get("items", data.get("athletes", []))
+
+        if not athletes:
+            ESPN_PLAYER_CACHE[cache_key] = {}
+            return {}
+
+        # Take best match
+        athlete = athletes[0] if athletes else {}
+
+        result = {
+            "espn_id": athlete.get("id"),
+            "name": athlete.get("displayName", player_name),
+            "team": athlete.get("team", {}).get("displayName", ""),
+            "team_abbr": athlete.get("team", {}).get("abbreviation", ""),
+            "position": athlete.get("position", {}).get("abbreviation", ""),
+            "jersey": athlete.get("jersey", ""),
+            "injuries": [],
+            "news": [],
+        }
+
+        # Check for injury status
+        injuries = athlete.get("injuries", [])
+        if injuries:
+            for inj in injuries:
+                result["injuries"].append({
+                    "status": inj.get("status", ""),
+                    "detail": inj.get("type", {}).get("description", ""),
+                })
+
+        ESPN_PLAYER_CACHE[cache_key] = result
+        return result
+
+    except Exception as e:
+        print(f"[ESPN] Player search error for {player_name}: {e}")
+        ESPN_PLAYER_CACHE[cache_key] = {}
+        return {}
+
+
+def espn_fetch_gamelog(espn_id: str, season: str = "2026") -> List[Dict]:
+    """
+    Fetch player game log from ESPN's public API.
+    Returns list of game entries with pts, reb, ast, min, etc.
+    """
+    if not espn_id or not requests:
+        return []
+
+    cache_key = f"espn_gl_{espn_id}"
+    if cache_key in MULTI_SOURCE_CACHE:
+        return MULTI_SOURCE_CACHE[cache_key]
+
+    try:
+        url = f"{ESPN_API_BASE}/common/v3/sports/basketball/nba/athletes/{espn_id}/gamelog"
+        resp = requests.get(url, params={"season": season}, timeout=10)
+
+        if resp.status_code != 200:
+            print(f"[ESPN] gamelog {espn_id} -> {resp.status_code}")
+            MULTI_SOURCE_CACHE[cache_key] = []
+            return []
+
+        data = resp.json()
+
+        # ESPN gamelog has various formats; try to parse
+        games = []
+        categories = data.get("categories", [])
+        events = data.get("events", data.get("entries", []))
+
+        # Try the seasonTypes -> categories -> events structure
+        season_types = data.get("seasonTypes", [])
+        for st in season_types:
+            for cat in st.get("categories", []):
+                cat_events = cat.get("events", [])
+                stat_labels = cat.get("displayNames", cat.get("labels", []))
+
+                for event in cat_events:
+                    stats = event.get("stats", [])
+                    if not stats or not stat_labels:
+                        continue
+
+                    game = {}
+                    for i, label in enumerate(stat_labels):
+                        if i < len(stats):
+                            game[label.upper()] = stats[i]
+
+                    # Normalize field names
+                    normalized = {
+                        "pts": _safe_float(game.get("PTS", 0)),
+                        "reb": _safe_float(game.get("REB", 0)),
+                        "ast": _safe_float(game.get("AST", 0)),
+                        "blk": _safe_float(game.get("BLK", 0)),
+                        "stl": _safe_float(game.get("STL", 0)),
+                        "fg3m": _safe_float(game.get("3PM", game.get("FG3M", 0))),
+                        "min": _safe_float(game.get("MIN", 0)),
+                        "fgm": _safe_float(game.get("FGM", 0)),
+                        "fga": _safe_float(game.get("FGA", 0)),
+                    }
+
+                    if normalized["min"] > 0:  # Skip DNPs
+                        games.append(normalized)
+
+        # Limit to last 20 games
+        games = games[:20]
+        print(f"[ESPN] gamelog for {espn_id}: {len(games)} games found")
+
+        MULTI_SOURCE_CACHE[cache_key] = games
+        return games
+
+    except Exception as e:
+        print(f"[ESPN] gamelog error: {e}")
+        MULTI_SOURCE_CACHE[cache_key] = []
+        return []
+
+
+def _safe_float(val) -> float:
+    """Safely convert any value to float."""
+    if val is None:
+        return 0.0
+    try:
+        return float(str(val).replace("-", "0").split("/")[0])
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def espn_fetch_team_defense(team_name: str) -> Dict:
+    """
+    Fetch live team defensive stats from ESPN's team stats endpoint.
+    More accurate than hardcoded ratings.
+    """
+    cache_key = f"espn_def_{_clean_name(team_name)}"
+    if cache_key in DEF_RATINGS_CACHE:
+        return DEF_RATINGS_CACHE[cache_key]
+
+    if not requests:
+        return {}
+
+    try:
+        # ESPN team search
+        url = f"{ESPN_API_BASE}/site/v2/sports/basketball/nba/teams"
+        resp = requests.get(url, params={"limit": 50}, timeout=8)
+
+        if resp.status_code != 200:
+            return {}
+
+        data = resp.json()
+        teams = data.get("sports", [{}])[0].get("leagues", [{}])[0].get("teams", [])
+
+        for team_entry in teams:
+            team = team_entry.get("team", {})
+            full_name = team.get("displayName", "")
+            if _clean_name(team_name) in _clean_name(full_name):
+                team_id = team.get("id")
+                if team_id:
+                    # Fetch team stats
+                    stats_url = f"{ESPN_API_BASE}/site/v2/sports/basketball/nba/teams/{team_id}/statistics"
+                    stats_resp = requests.get(stats_url, timeout=8)
+                    if stats_resp.status_code == 200:
+                        stats_data = stats_resp.json()
+                        result = _parse_espn_team_defense(stats_data)
+                        DEF_RATINGS_CACHE[cache_key] = result
+                        return result
+    except Exception as e:
+        print(f"[ESPN] team defense error: {e}")
+
+    return {}
+
+
+def _parse_espn_team_defense(data: Dict) -> Dict:
+    """Parse ESPN team stats response for defensive numbers."""
+    result = {}
+    try:
+        splits = data.get("results", {}).get("stats", {})
+        categories = splits.get("categories", [])
+        for cat in categories:
+            if "defensive" in cat.get("displayName", "").lower():
+                for stat in cat.get("stats", []):
+                    name = stat.get("name", "")
+                    val = stat.get("value", 0)
+                    if "reboundsDefensive" in name:
+                        result["dreb"] = float(val)
+                    elif "steals" in name:
+                        result["stl_allowed"] = float(val)
+    except:
+        pass
+    return result
+
+
+def fetch_player_games_multisource(
+    player_name: str,
+    player_id: int,
+    stat_key: str,
+    n: int = BASELINE_GAMES,
+    is_threes: bool = False,
+) -> Tuple[List[Dict], str]:
+    """
+    ESPN-FIRST game fetcher. Tries ESPN public API as primary truth,
+    falls back to BDL if ESPN unavailable or insufficient.
+
+    Returns: (games_list, source_tag)
+      - games_list: list of dicts with 'value' key (same format compute_projection expects)
+      - source_tag: "ESPN" | "BDL" | "ESPN+BDL"
+    """
+    espn_games = []
+    source_tag = "BDL"  # default fallback
+
+    # --- ESPN Primary ---
+    espn_data = espn_search_player(player_name)
+    if espn_data and espn_data.get("espn_id"):
+        raw_espn = espn_fetch_gamelog(espn_data["espn_id"])
+        if raw_espn and len(raw_espn) >= 8:
+            # Convert ESPN gamelog to {value: X} format
+            espn_stat_map = {
+                "pts": "pts", "reb": "reb", "ast": "ast",
+                "blk": "blk", "stl": "stl", "threes": "fg3m",
+                "min": "min",
+            }
+            espn_field = espn_stat_map.get(stat_key, stat_key)
+            if is_threes:
+                espn_field = "fg3m"
+
+            for g in raw_espn[:n]:
+                val = float(g.get(espn_field, 0) or 0)
+                espn_games.append({"value": val, "source": "ESPN"})
+
+            if len(espn_games) >= 10:
+                source_tag = "ESPN"
+                print(f"[SOURCE] {player_name} {stat_key}: ESPN primary ({len(espn_games)} games)")
+                return espn_games, source_tag
+            else:
+                print(f"[SOURCE] {player_name} {stat_key}: ESPN only {len(espn_games)} games, supplementing with BDL")
+
+    # --- BDL Fallback/Supplement ---
+    if is_threes:
+        bdl_games = bdl_last_n_games_threes(player_id, n)
+    else:
+        bdl_games = bdl_last_n_games_stats(player_id, stat_key, n)
+
+    if espn_games and bdl_games:
+        # ESPN had some data but not enough — use ESPN as primary, fill gaps with BDL
+        combined = espn_games[:]
+        needed = n - len(combined)
+        if needed > 0 and len(bdl_games) > len(espn_games):
+            for g in bdl_games[len(espn_games):len(espn_games) + needed]:
+                g["source"] = "BDL"
+                combined.append(g)
+        source_tag = "ESPN+BDL"
+        print(f"[SOURCE] {player_name} {stat_key}: ESPN+BDL combined ({len(combined)} games)")
+        return combined, source_tag
+
+    if bdl_games:
+        for g in bdl_games:
+            g["source"] = "BDL"
+        source_tag = "BDL"
+        print(f"[SOURCE] {player_name} {stat_key}: BDL fallback ({len(bdl_games)} games)")
+        return bdl_games, source_tag
+
+    print(f"[SOURCE] {player_name} {stat_key}: NO DATA from either source")
+    return [], "NONE"
+
+
+def fetch_minutes_multisource(
+    player_name: str,
+    player_id: int,
+    n: int = BASELINE_GAMES,
+) -> Tuple[float, float, float]:
+    """
+    Fetch minutes windows using ESPN-first approach.
+    Returns (base_min, l10_min, l5_min) averages.
+    """
+    games, source = fetch_player_games_multisource(player_name, player_id, "min", n)
+    if not games:
+        return fetch_minutes_windows(player_id, n)  # BDL-only fallback
+
+    base = games[:n]
+    l10 = games[:10] if len(games) >= 10 else games
+    l5 = games[:5] if len(games) >= 5 else games
+
+    def _avg(lst):
+        if not lst:
+            return 0.0
+        vals = [g.get("value", 0) for g in lst]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    return _avg(base), _avg(l10), _avg(l5)
+
+
+def cross_reference_player(
+    player_name: str,
+    player_id: int,
+    stat_key: str,
+    primary_games: List[Dict],
+) -> Dict:
+    """
+    Cross-reference player data across ESPN (primary) and BDL (secondary).
+    ESPN is treated as ground truth. BDL is the cross-check.
+    Returns confidence assessment and any discrepancies.
+    """
+    result = {
+        "sources": [],
+        "primary_source": "ESPN",
+        "bdl_avg": 0,
+        "espn_avg": 0,
+        "agreement": True,
+        "discrepancy": 0,
+        "confidence": "high",
+        "espn_team": "",
+        "injuries": [],
+        "notes": [],
+    }
+
+    # --- ESPN (Primary Truth) ---
+    espn_data = espn_search_player(player_name)
+    if espn_data and espn_data.get("espn_id"):
+        result["sources"].append("ESPN")
+        result["espn_team"] = espn_data.get("team", "")
+
+        # Check injuries from ESPN
+        if espn_data.get("injuries"):
+            for inj in espn_data["injuries"]:
+                status = inj.get("status", "")
+                detail = inj.get("detail", "")
+                result["injuries"].append(f"{status}: {detail}")
+                if status.lower() in ("out", "doubtful"):
+                    result["notes"].append(f"INJURY ALERT: {status} - {detail}")
+                    result["confidence"] = "low"
+
+        # ESPN averages from gamelog
+        espn_games = espn_fetch_gamelog(espn_data["espn_id"])
+        if espn_games:
+            espn_stat_map = {"threes": "fg3m"}
+            espn_field = espn_stat_map.get(stat_key, stat_key)
+            espn_values = [g.get(espn_field, 0) for g in espn_games]
+            if espn_values:
+                result["espn_avg"] = sum(espn_values) / len(espn_values)
+    else:
+        result["notes"].append("ESPN lookup failed")
+        result["primary_source"] = "BDL"
+
+    # --- BDL (Secondary Cross-Check) ---
+    bdl_games = bdl_last_n_games_stats(player_id, stat_key, BASELINE_GAMES)
+    if stat_key == "threes":
+        bdl_games = bdl_last_n_games_threes(player_id, BASELINE_GAMES)
+
+    if bdl_games:
+        result["sources"].append("BDL")
+        bdl_values = [g.get("value", 0) for g in bdl_games if g]
+        if bdl_values:
+            result["bdl_avg"] = sum(bdl_values) / len(bdl_values)
+
+    # --- Compare sources ---
+    if result["espn_avg"] > 0 and result["bdl_avg"] > 0:
+        # Use ESPN as denominator since it's our truth
+        diff_pct = abs(result["espn_avg"] - result["bdl_avg"]) / result["espn_avg"] * 100
+        result["discrepancy"] = diff_pct
+
+        if diff_pct > 15:
+            result["agreement"] = False
+            if result["confidence"] != "low":  # Don't override injury-based low
+                result["confidence"] = "low"
+            result["notes"].append(
+                f"DATA MISMATCH: ESPN avg {result['espn_avg']:.1f} vs "
+                f"BDL avg {result['bdl_avg']:.1f} ({diff_pct:.0f}% off) — trusting ESPN"
+            )
+        elif diff_pct > 8:
+            if result["confidence"] == "high":
+                result["confidence"] = "medium"
+            result["notes"].append(
+                f"Minor diff: ESPN {result['espn_avg']:.1f} vs BDL {result['bdl_avg']:.1f}"
+            )
+        else:
+            result["notes"].append(f"Sources agree ({diff_pct:.0f}% diff)")
+    elif result["espn_avg"] > 0:
+        result["notes"].append("ESPN only — no BDL cross-check")
+    elif result["bdl_avg"] > 0:
+        result["notes"].append("BDL only — ESPN unavailable")
+        result["primary_source"] = "BDL"
+    else:
+        result["notes"].append("No stat averages from either source")
+        result["confidence"] = "low"
+
+    return result
+
+
 def fetch_lineupexperts_news() -> List[Dict]:
     """
     Fetch daily news/injuries from LineupExperts.
@@ -1392,20 +2020,21 @@ def compute_projection(
         return None
 
     stat_key = prop_type_to_stat_key(prop_type)
+    is_threes = prop_type_is_threes(prop_type)
 
-    # Step 1: Fetch game history
-    if prop_type_is_threes(prop_type):
-        games = bdl_last_n_games_threes(player_id, BASELINE_GAMES)
-    else:
-        games = bdl_last_n_games_stats(player_id, stat_key, BASELINE_GAMES)
+    # Step 1: Fetch game history — ESPN FIRST, BDL fallback
+    games, data_source = fetch_player_games_multisource(
+        player_name, player_id, stat_key, BASELINE_GAMES, is_threes
+    )
 
     if len(games) < 10:
-        print(f"[SKIP] {player_name}: only {len(games)} games")
+        print(f"[SKIP] {player_name}: only {len(games)} games (source: {data_source})")
         return None
 
-    # Debug: show first game value for this player
+    # Debug: show data source and sample values
     if games:
-        print(f"[DEBUG] {player_name} {prop_type}: {len(games)} games, first val={games[0].get('value', '?')}, last val={games[-1].get('value', '?')}")
+        print(f"[PROJ] {player_name} {prop_type}: {len(games)} games from {data_source}, "
+              f"first val={games[0].get('value', '?')}, last val={games[-1].get('value', '?')}")
 
     # Step 2: Window averages
     base_games = _slice_last(games, BASELINE_GAMES)
@@ -1419,8 +2048,8 @@ def compute_projection(
     if base_avg < 0.1:
         return None
 
-    # Step 2b: Fetch minutes separately (BUG FIX: was using min_val from avg_stat)
-    base_min, l10_min, l5_min = fetch_minutes_windows(player_id, BASELINE_GAMES)
+    # Step 2b: Fetch minutes — ESPN first, BDL fallback
+    base_min, l10_min, l5_min = fetch_minutes_multisource(player_name, player_id, BASELINE_GAMES)
 
     # Step 3: Breakout detection with evidence gathering
     breakout_evidence = {}
@@ -1964,17 +2593,57 @@ def slate_scan_edges(
             if has_recent_play(state, player_name, prop_type):
                 continue
 
+            # ---- Multi-Source Cross-Reference (ESPN primary) ----
+            stat_k_xref = prop_type_to_stat_key(prop_type)
+            xref = cross_reference_player(player_name, player_id, stat_k_xref, [])
+
+            # If cross-reference confidence is low, penalize or skip
+            xref_confidence = xref.get("confidence", "high")
+            xref_penalty = 1.0
+            if xref_confidence == "low":
+                # Large data mismatch or injury alert — apply heavy penalty
+                xref_penalty = 0.70
+                print(f"[XREF] {player_name} LOW confidence — penalty applied. Notes: {xref.get('notes')}")
+            elif xref_confidence == "medium":
+                xref_penalty = 0.90
+                print(f"[XREF] {player_name} MEDIUM confidence — minor penalty. Notes: {xref.get('notes')}")
+            else:
+                print(f"[XREF] {player_name} HIGH confidence. Notes: {xref.get('notes')}")
+
+            # Apply cross-ref penalty to edge and probability
+            adjusted_edge = proj_result.edge * xref_penalty
+            adjusted_prob = proj_result.prob_over * xref_penalty
+
+            # Re-check thresholds after cross-ref adjustment
+            if adjusted_edge < min_edge_for_stat:
+                print(f"[XREF SKIP] {player_name} edge {adjusted_edge:.1f}% < {min_edge_for_stat}% after xref penalty")
+                continue
+            if adjusted_prob < min_prob_for_stat:
+                print(f"[XREF SKIP] {player_name} prob {adjusted_prob:.3f} < {min_prob_for_stat} after xref penalty")
+                continue
+
+            # Skip players with active OUT/DOUBTFUL injuries from ESPN
+            if any("INJURY ALERT" in n and ("Out" in n or "Doubtful" in n) for n in xref.get("notes", [])):
+                print(f"[XREF SKIP] {player_name} has OUT/DOUBTFUL injury from ESPN")
+                continue
+
             # Get vendor from the book line data
             play_vendor = book_lines[0].get("book", "FanDuel") if book_lines else "FanDuel"
 
             # Compute composite score: weight EV and probability most heavily
             hr_data = proj_result.hit_rates or {}
+            # Boost score for multi-source agreement, penalize for disagreement
+            xref_score_bonus = 5 if xref.get("agreement", True) and len(xref.get("sources", [])) > 1 else 0
+            xref_score_penalty = -8 if not xref.get("agreement", True) else 0
+
             composite_score = (
                 proj_result.ev * 40 +           # EV is king
                 proj_result.prob_over * 30 +    # Probability matters
                 proj_result.edge * 0.5 +        # Edge % as tiebreaker
                 proj_result.consistency * 10 +  # Consistency bonus
-                (5 if proj_result.is_breakout else 0)  # Breakout bonus
+                (5 if proj_result.is_breakout else 0) +  # Breakout bonus
+                xref_score_bonus +              # Multi-source agreement bonus
+                xref_score_penalty              # Data mismatch penalty
             )
 
             play = {
@@ -2003,12 +2672,29 @@ def slate_scan_edges(
                 "opp_team": opp_team,
                 "is_home": is_home,
                 "hit_rates": hr_data,
+                "xref": xref,  # Cross-reference data from ESPN
+                "xref_confidence": xref_confidence,
+                "adjusted_edge": adjusted_edge,
+                "adjusted_prob": adjusted_prob,
             }
+
+            # Build deep analysis narrative (ESPN-first data + cross-ref)
+            stat_k = prop_type_to_stat_key(prop_type)
+            raw_games, _ = fetch_player_games_multisource(
+                player_name, player_id, stat_k, BASELINE_GAMES,
+                is_threes=prop_type_is_threes(prop_type)
+            )
+
+            play["analysis"] = build_deep_analysis(
+                player_name, player_id, stat_k, best_line,
+                proj_result.proj, raw_games, opp_team, is_home,
+                proj_result.breakout_evidence, hr_data, xref,
+            )
 
             plays.append(play)
 
     tier_order = {"LOCK": 0, "STRONG": 1, "LEAN": 2, "SKIP": 3}
-    plays.sort(key=lambda p: (tier_order.get(p["confidence_tier"], 3), -p["edge"]))
+    plays.sort(key=lambda p: (tier_order.get(p["confidence_tier"], 3), -p["score"]))
 
     return plays
 
@@ -2641,6 +3327,21 @@ def scan_ladder_plays(
             if streak >= 3:
                 narrative_parts.append(f"{streak}-game streak over line")
 
+            # ESPN cross-reference for ladders
+            ladder_xref = cross_reference_player(player_name, player_id, "pts", games)
+            if ladder_xref and len(ladder_xref.get("sources", [])) > 1:
+                bdl_a = ladder_xref.get("bdl_avg", 0)
+                espn_a = ladder_xref.get("espn_avg", 0)
+                if bdl_a > 0 and espn_a > 0:
+                    disc = ladder_xref.get("discrepancy", 0)
+                    if disc <= 8:
+                        narrative_parts.append(f"Verified: BDL/ESPN agree")
+                    else:
+                        narrative_parts.append(f"BDL {bdl_a:.1f} vs ESPN {espn_a:.1f}")
+                for note in ladder_xref.get("notes", []):
+                    if "INJURY" in note:
+                        narrative_parts.append(note)
+
             narrative = " | ".join(narrative_parts)
 
             # Ladder recommendation
@@ -2685,7 +3386,8 @@ def scan_ladder_plays(
 
 def format_play_card(play: Dict, index: int) -> str:
     """
-    Format play card for WhatsApp with hit rates, evidence, and FanDuel odds.
+    Format play card with full research-style analysis.
+    Multi-line output showing the STORY behind each pick.
     """
     player = play.get("player", "?")
     prop_type = play.get("prop_type", "pts")
@@ -2713,21 +3415,24 @@ def format_play_card(play: Dict, index: int) -> str:
 
     odds_str = f"+{odds}" if odds > 0 else str(odds)
 
-    # Hit rate line (most important for bettors)
+    # Hit rate line
     hr = play.get("hit_rates", {})
     l5_hits = hr.get("l5_hits", 0)
     l10_hits = hr.get("l10_hits", 0)
     base_hits = hr.get("base_hits", 0)
-    hit_line = f"Hit: {l5_hits}/5 L5 | {l10_hits}/10 L10 | {base_hits}/20 Szn"
+    hit_line = f"  Hit Rate: {l5_hits}/5 L5 | {l10_hits}/10 L10 | {base_hits}/20 Szn"
 
-    context = explain_play(play)
+    # Use deep analysis if available, fall back to explain_play
+    analysis = play.get("analysis", "")
+    if not analysis:
+        analysis = "  " + explain_play(play)
 
     card = (
         f"{index}. [{tier}] {player}{breakout_tag}\n"
-        f"   {prop_name} OVER {line} | {vendor} {odds_str} | ${bet_size:.0f}\n"
-        f"   Proj {proj:.1f} | Edge {edge:.1f}% | P={prob*100:.0f}% | EV +{ev:.2f}\n"
-        f"   {hit_line}\n"
-        f"   {context}"
+        f"  {prop_name} OVER {line} | {vendor} {odds_str} | ${bet_size:.0f}\n"
+        f"  Proj {proj:.1f} | Edge {edge:.1f}% | P={prob*100:.0f}% | EV +{ev:.2f}\n"
+        f"{hit_line}\n"
+        f"{analysis}"
     )
     return card
 
