@@ -54,9 +54,30 @@ MAX_RUNTIME_SECONDS = int(os.getenv("MAX_RUNTIME_SECONDS", "300"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 
 # Model thresholds - CONSERVATIVE
-MIN_EDGE = 3.0  # min 3% edge to claim
+MIN_EDGE = 3.0  # default min 3% edge to claim
 MIN_PROB = 0.58  # calibrated probability threshold
 STD_FLOOR = 4.0  # global min std dev
+
+# Per-stat minimum edge thresholds (% over line)
+# Higher volume stats need less edge because they're more predictable
+STAT_MIN_EDGE = {
+    "pts": 3.0,      # Points: most predictable, 3% edge
+    "reb": 5.0,      # Rebounds: moderate variance, need 5%
+    "ast": 5.0,      # Assists: moderate variance, need 5%
+    "blk": 10.0,     # Blocks: high variance, need 10%
+    "stl": 10.0,     # Steals: high variance, need 10%
+    "threes": 8.0,   # Threes: high variance, need 8%
+}
+
+# Per-stat minimum probability thresholds
+STAT_MIN_PROB = {
+    "pts": 0.57,
+    "reb": 0.58,
+    "ast": 0.58,
+    "blk": 0.60,     # Need higher confidence for volatile stats
+    "stl": 0.60,
+    "threes": 0.59,
+}
 
 # Per-stat standard deviation floors (prevent overconfident narrows)
 STAT_STD_FLOORS = {
@@ -66,6 +87,16 @@ STAT_STD_FLOORS = {
     "blk": 0.9,
     "stl": 0.9,
     "threes": 1.2,
+}
+
+# Per-stat max picks (ensures diversity across stat types)
+STAT_MAX_PICKS = {
+    "pts": 3,
+    "reb": 2,
+    "ast": 2,
+    "blk": 1,
+    "stl": 1,
+    "threes": 2,
 }
 
 # Projection window weights - L10 is most reliable (king of windows)
@@ -466,6 +497,33 @@ def consistency_score(games_list: List[Dict], mean: float) -> float:
             count_consistent += 1
 
     return count_consistent / len(games_list) if games_list else 0.0
+
+
+def hit_rate(games_list: List[Dict], line: float) -> float:
+    """
+    Calculate hit rate: % of games that went OVER the line.
+    This is THE most important signal for profitability.
+    """
+    if not games_list:
+        return 0.0
+    hits = sum(1 for g in games_list if g.get("value", 0) > line)
+    return hits / len(games_list)
+
+
+def hit_rates_by_window(base_games, l10_games, l5_games, line: float) -> Dict:
+    """Calculate hit rates across all windows + weighted composite."""
+    base_hr = hit_rate(base_games, line)
+    l10_hr = hit_rate(l10_games, line)
+    l5_hr = hit_rate(l5_games, line)
+    # Weighted: recent matters more
+    composite = 0.25 * base_hr + 0.35 * l10_hr + 0.40 * l5_hr
+    return {
+        "base": base_hr, "l10": l10_hr, "l5": l5_hr,
+        "composite": composite,
+        "l5_hits": sum(1 for g in l5_games if g.get("value", 0) > line),
+        "l10_hits": sum(1 for g in l10_games if g.get("value", 0) > line),
+        "base_hits": sum(1 for g in base_games if g.get("value", 0) > line),
+    }
 
 
 def normalize_team_name(team_name: str) -> str:
@@ -971,27 +1029,53 @@ def bdl_fetch_props_for_game(game_id: int, prop_types: List[str] = None) -> Dict
 
         print(f"[API] Vendors found: {vendor_counts}")
 
-        # Step 4: For each player/prop, prefer PRIMARY_BOOK lines
-        primary_key = PRIMARY_BOOK.replace(" ", "").replace("_", "")
+        # Step 4: For each player/prop, use ONLY PRIMARY_BOOK lines.
+        # Try multiple name variants to match BDL's vendor strings.
+        primary_variants = set()
+        pb = PRIMARY_BOOK.lower().replace(" ", "").replace("_", "").replace("-", "")
+        primary_variants.add(pb)
+        # Common BDL vendor name variations
+        FANDUEL_ALIASES = {"fanduel", "fan_duel", "fd", "fanduelus", "fanduelsportsbook"}
+        if pb in FANDUEL_ALIASES:
+            primary_variants.update(FANDUEL_ALIASES)
+
         primary_used = 0
         fallback_used = 0
+        skipped_no_primary = 0
 
         for player_name, props_dict in temp.items():
-            result[player_name] = {}
             for prop_type, vendors_dict in props_dict.items():
-                if primary_key in vendors_dict:
-                    result[player_name][prop_type] = vendors_dict[primary_key]
+                matched_key = None
+                for vk in vendors_dict.keys():
+                    if vk in primary_variants:
+                        matched_key = vk
+                        break
+
+                if matched_key:
+                    if player_name not in result:
+                        result[player_name] = {}
+                    result[player_name][prop_type] = vendors_dict[matched_key]
                     primary_used += 1
                 else:
-                    # Fallback: pick the vendor with the most entries
+                    # No FanDuel line — use best available as fallback
+                    # (user can set STRICT_BOOK=true to skip non-FanDuel entirely)
+                    if os.getenv("STRICT_BOOK", "false").lower() == "true":
+                        skipped_no_primary += 1
+                        continue
                     best_vendor = max(vendors_dict.keys(), key=lambda v: len(vendors_dict[v]))
+                    if player_name not in result:
+                        result[player_name] = {}
+                    # Tag fallback lines so display shows the actual book
+                    for entry in vendors_dict[best_vendor]:
+                        entry["is_fallback"] = True
                     result[player_name][prop_type] = vendors_dict[best_vendor]
                     fallback_used += 1
 
         total_players = len(result)
         total_props = sum(len(v) for player_props in result.values() for v in player_props.values())
-        print(f"[API] player_props: {total_players} players | "
-              f"PRIMARY ({PRIMARY_BOOK}): {primary_used} props, fallback: {fallback_used} | "
+        print(f"[API] player_props: {total_players} players, {total_props} lines | "
+              f"PRIMARY ({PRIMARY_BOOK}): {primary_used} props, fallback: {fallback_used}, "
+              f"skipped: {skipped_no_primary} | "
               f"({skipped_milestone} milestones skipped)")
 
     except Exception as e:
@@ -1285,6 +1369,7 @@ class ProjectionResult:
     minutes_proj: float
     adjustment_total: float
     breakout_evidence: Dict = None
+    hit_rates: Dict = None
 
 
 def compute_projection(
@@ -1421,12 +1506,27 @@ def compute_projection(
     consistency = consistency_score(l10_games, l10_avg)
     sigma = adaptive_sigma(base_std, l10_std, l5_std, consistency, stat_key)
 
-    # Step 11: Probability (calibrated)
-    z = (proj - line) / sigma if sigma > 0 else 0
-    raw_prob = _norm_cdf(z)
-    prob_over = calibrated_prob(raw_prob)
+    # Step 11: Hit rate analysis (THE key profitability signal)
+    hr = hit_rates_by_window(base_games, l10_games, l5_games, line)
 
-    # Step 12: Edge and EV (edge as percentage, not absolute)
+    # Step 12: Probability — blend model z-score with empirical hit rates
+    # Hit rate is more reliable for well-sampled props
+    z = (proj - line) / sigma if sigma > 0 else 0
+    raw_prob_model = _norm_cdf(z)
+    model_prob = calibrated_prob(raw_prob_model)
+
+    # Empirical probability from actual hit rates (weighted toward recent)
+    empirical_prob = hr["composite"]
+
+    # Blend: 40% model, 60% empirical (empirical is king for props)
+    raw_prob = raw_prob_model
+    prob_over = 0.40 * model_prob + 0.60 * empirical_prob
+
+    # Safety: if empirical and model wildly disagree, be conservative
+    if abs(model_prob - empirical_prob) > 0.20:
+        prob_over = min(model_prob, empirical_prob)
+
+    # Step 13: Edge and EV (edge as percentage, not absolute)
     raw_edge_pct = ((proj - line) / line * 100) if line > 0 else 0.0
     # Cap edge at 50% to prevent low-line props (0.5 blk/stl) from inflating rankings
     edge_pct = min(raw_edge_pct, 50.0)
@@ -1459,6 +1559,7 @@ def compute_projection(
         minutes_proj=proj_min,
         adjustment_total=adj_total,
         breakout_evidence=breakout_evidence if is_breakout else None,
+        hit_rates=hr,
     )
 
 
@@ -1844,15 +1945,20 @@ def slate_scan_edges(
                 continue
 
             # Debug: show projection values
-            print(f"[PROJ] {player_name} {prop_type}: line={best_line}, proj={proj_result.proj:.1f}, "
-                  f"edge={proj_result.edge:.1f}%, prob={proj_result.prob_over:.3f}, ev={proj_result.ev:.3f}, "
-                  f"base={proj_result.base_avg:.1f}, l10={proj_result.l10_avg:.1f}, l5={proj_result.l5_avg:.1f}")
+            stat_key_for_filter = prop_type_to_stat_key(prop_type)
+            min_edge_for_stat = STAT_MIN_EDGE.get(stat_key_for_filter, MIN_EDGE)
+            min_prob_for_stat = STAT_MIN_PROB.get(stat_key_for_filter, MIN_PROB)
 
-            if proj_result.edge < MIN_EDGE:
+            print(f"[PROJ] {player_name} {prop_type}: line={best_line}, proj={proj_result.proj:.1f}, "
+                  f"edge={proj_result.edge:.1f}% (need {min_edge_for_stat}%), "
+                  f"prob={proj_result.prob_over:.3f} (need {min_prob_for_stat}), "
+                  f"ev={proj_result.ev:.3f}")
+
+            if proj_result.edge < min_edge_for_stat:
                 continue
-            if proj_result.prob_over < MIN_PROB:
+            if proj_result.prob_over < min_prob_for_stat:
                 continue
-            if proj_result.ev < 0.03:
+            if proj_result.ev < 0.02:
                 continue
 
             if has_recent_play(state, player_name, prop_type):
@@ -1860,6 +1966,16 @@ def slate_scan_edges(
 
             # Get vendor from the book line data
             play_vendor = book_lines[0].get("book", "FanDuel") if book_lines else "FanDuel"
+
+            # Compute composite score: weight EV and probability most heavily
+            hr_data = proj_result.hit_rates or {}
+            composite_score = (
+                proj_result.ev * 40 +           # EV is king
+                proj_result.prob_over * 30 +    # Probability matters
+                proj_result.edge * 0.5 +        # Edge % as tiebreaker
+                proj_result.consistency * 10 +  # Consistency bonus
+                (5 if proj_result.is_breakout else 0)  # Breakout bonus
+            )
 
             play = {
                 "player": player_name,
@@ -1880,12 +1996,13 @@ def slate_scan_edges(
                 "odds": best_odds,
                 "vendor": play_vendor,
                 "bet_size": kelly_bet_size(proj_result.edge, proj_result.prob_over, BANKROLL),
-                "score": proj_result.edge + proj_result.ev * 10,
+                "score": composite_score,
                 "l5_avg": proj_result.l5_avg,
                 "l10_avg": proj_result.l10_avg,
                 "base_avg": proj_result.base_avg,
                 "opp_team": opp_team,
                 "is_home": is_home,
+                "hit_rates": hr_data,
             }
 
             plays.append(play)
@@ -2403,43 +2520,48 @@ def scan_ladder_plays(
 
 def format_play_card(play: Dict, index: int) -> str:
     """
-    Format play card for WhatsApp output with evidence-backed context.
-    Clean, professional format with full context.
+    Format play card for WhatsApp with hit rates, evidence, and FanDuel odds.
     """
     player = play.get("player", "?")
-    team = play.get("team", "?")
     prop_type = play.get("prop_type", "pts")
     line = play.get("line", 0)
     proj = play.get("proj", 0)
     odds = play.get("odds", -110)
-    vendor = play.get("vendor", "Books")
+    vendor = play.get("vendor", "FanDuel")
     bet_size = play.get("bet_size", 0)
     prob = play.get("prob", play.get("prob_over", 0))
     ev = play.get("ev", 0)
     edge = play.get("edge", 0)
 
-    prop_name = {
+    PROP_NAMES = {
         "player_points": "PTS",
         "player_rebounds": "REB",
         "player_assists": "AST",
         "player_threes": "3PM",
         "player_blocks": "BLK",
         "player_steals": "STL",
-    }.get(prop_type, "?")
+    }
+    prop_name = PROP_NAMES.get(prop_type, "?")
 
-    breakout_tag = " [BREAKOUT]" if play.get("is_breakout") else ""
+    breakout_tag = " *BREAKOUT*" if play.get("is_breakout") else ""
+    tier = play.get("confidence_tier", "LEAN")
 
-    if odds > 0:
-        odds_str = f"+{odds}"
-    else:
-        odds_str = str(odds)
+    odds_str = f"+{odds}" if odds > 0 else str(odds)
+
+    # Hit rate line (most important for bettors)
+    hr = play.get("hit_rates", {})
+    l5_hits = hr.get("l5_hits", 0)
+    l10_hits = hr.get("l10_hits", 0)
+    base_hits = hr.get("base_hits", 0)
+    hit_line = f"Hit: {l5_hits}/5 L5 | {l10_hits}/10 L10 | {base_hits}/20 Szn"
 
     context = explain_play(play)
 
     card = (
-        f"{index}. [{play.get('confidence_tier', 'LEAN')}] {player}{breakout_tag}\n"
-        f"   {prop_name} OVER {line} | {vendor} {odds_str} | Kelly ${bet_size:.0f}\n"
-        f"   Proj {proj:.1f} vs Line {line} | Edge +{edge:.1f}% | P={prob*100:.0f}% | EV=+{ev:.2f}\n"
+        f"{index}. [{tier}] {player}{breakout_tag}\n"
+        f"   {prop_name} OVER {line} | {vendor} {odds_str} | ${bet_size:.0f}\n"
+        f"   Proj {proj:.1f} | Edge {edge:.1f}% | P={prob*100:.0f}% | EV +{ev:.2f}\n"
+        f"   {hit_line}\n"
         f"   {context}"
     )
     return card
@@ -2447,39 +2569,31 @@ def format_play_card(play: Dict, index: int) -> str:
 
 def explain_play(play: Dict) -> str:
     """
-    Generate a detailed context explanation showing WHY the play is recommended.
-    Includes: L5/L10 averages with hit rates, usage, matchup quality, rest, injury boosts.
+    Generate concise context: averages, matchup, home/away.
     """
     parts = []
 
-    # L5 average with hit rate
+    # Averages
     l5_avg = play.get("l5_avg", 0)
-    if l5_avg > 0:
-        breakout_evidence = play.get("breakout_evidence", {})
-        if breakout_evidence:
-            l5_hits = breakout_evidence.get("l5_hits", 0)
-            parts.append(f"L5 avg {l5_avg:.1f} ({l5_hits}/5 over line)")
-        else:
-            parts.append(f"L5 avg {l5_avg:.1f}")
-
-    # L10 average
     l10_avg = play.get("l10_avg", 0)
-    if l10_avg > 0:
-        parts.append(f"L10 avg {l10_avg:.1f}")
+    base_avg = play.get("base_avg", 0)
+    line = play.get("line", 0)
 
-    # Usage percent if available
-    breakout_evidence = play.get("breakout_evidence", {})
-    if breakout_evidence and breakout_evidence.get("usage_pct"):
-        parts.append(f"Usage {breakout_evidence['usage_pct']:.1f}%")
+    if l5_avg > 0:
+        parts.append(f"Avg: {l5_avg:.1f} L5 / {l10_avg:.1f} L10 / {base_avg:.1f} Szn")
 
-    # Matchup/opponent strength
+    # Matchup
     opp_team = play.get("opp_team", "")
     if opp_team:
+        # Shorten team name
+        short_opp = opp_team.split()[-1] if opp_team else ""  # "Celtics", "Heat" etc
         opp_def = fetch_def_rating(opp_team, play.get("stat_key", "pts"))
-        if opp_def > 111.0:
-            parts.append(f"vs weak def {opp_def:.0f}")
+        if opp_def > 112.0:
+            parts.append(f"vs {short_opp} (weak def)")
+        elif opp_def < 109.5:
+            parts.append(f"vs {short_opp} (elite def)")
         else:
-            parts.append(f"vs tough def {opp_def:.0f}")
+            parts.append(f"vs {short_opp}")
 
     # Home/away
     if play.get("is_home"):
@@ -2487,14 +2601,14 @@ def explain_play(play: Dict) -> str:
     else:
         parts.append("ROAD")
 
-    # Rest status
-    if breakout_evidence and breakout_evidence.get("minutes_trending_up"):
-        parts.append("minutes up")
+    # Breakout evidence
+    breakout_ev = play.get("breakout_evidence", {})
+    if breakout_ev and breakout_ev.get("minutes_trending_up"):
+        parts.append("mins trending up")
+    if breakout_ev and breakout_ev.get("usage_pct"):
+        parts.append(f"USG {breakout_ev['usage_pct']:.0f}%")
 
     context = " | ".join(parts)
-    if len(context) > 100:
-        context = context[:97] + "..."
-
     return context if context else "Neutral matchup"
 
 
@@ -2649,34 +2763,58 @@ def build_whatsapp_message(
     ladders: List[Dict],
     state: Dict = None,
 ) -> str:
-    """Assemble full WhatsApp message with all play types and detailed context."""
+    """Assemble WhatsApp message grouped by stat type with hit rates."""
     if state is None:
         state = load_state()
 
     now_et = _now_et()
     date_str = now_et.strftime("%m/%d")
     time_str = now_et.strftime("%I:%M %p")
+    book_label = PRIMARY_BOOK.upper()
 
-    lines = [f"NBA PICKS {date_str} {time_str} ET"]
+    lines = [f"NBA PICKS {date_str} {time_str} ET ({book_label})"]
 
-    hit_rate = get_hit_rate_summary(state)
-    if "No plays" not in hit_rate:
-        lines.append(f"({hit_rate})")
+    hit_rate_str = get_hit_rate_summary(state)
+    if "No plays" not in hit_rate_str:
+        lines.append(f"Season: {hit_rate_str}")
 
-    lines.append("\n-- STRAIGHT BETS --")
+    # Combine straights + plus_plays, then group by stat type
+    all_plays = straights + plus_plays
 
-    if straights:
-        for i, play in enumerate(straights, 1):
-            lines.append(format_play_card(play, i))
+    # Group by stat category
+    STAT_ORDER = ["pts", "reb", "ast", "threes", "blk", "stl"]
+    STAT_LABELS = {
+        "pts": "POINTS", "reb": "REBOUNDS", "ast": "ASSISTS",
+        "threes": "THREES", "blk": "BLOCKS", "stl": "STEALS",
+    }
+    grouped = {}
+    for play in all_plays:
+        sk = play.get("stat_key", "pts")
+        if sk not in grouped:
+            grouped[sk] = []
+        grouped[sk].append(play)
+
+    # Apply per-stat max picks
+    total_idx = 0
+    for stat_key in STAT_ORDER:
+        if stat_key not in grouped:
+            continue
+        stat_plays = grouped[stat_key]
+        # Sort by score descending within each stat
+        stat_plays.sort(key=lambda p: -p.get("score", 0))
+        # Cap per stat type
+        max_for_stat = STAT_MAX_PICKS.get(stat_key, 2)
+        stat_plays = stat_plays[:max_for_stat]
+
+        label = STAT_LABELS.get(stat_key, stat_key.upper())
+        lines.append(f"\n-- {label} --")
+        for play in stat_plays:
+            total_idx += 1
+            lines.append(format_play_card(play, total_idx))
             lines.append("")
-    else:
-        lines.append("None")
 
-    if plus_plays:
-        lines.append("\n-- PLUS ODDS --")
-        for i, play in enumerate(plus_plays, 1):
-            lines.append(format_play_card(play, i))
-            lines.append("")
+    if total_idx == 0:
+        lines.append("\nNo qualifying plays today")
 
     if sgps or corr_parlays:
         lines.append("\n-- PARLAYS --")
@@ -2693,9 +2831,8 @@ def build_whatsapp_message(
             lines.append(format_ladder_card(ladder))
             lines.append("")
 
-    total_bets = len(straights) + len(plus_plays)
-    total_kelly = sum(p.get("bet_size", 0) for p in straights + plus_plays)
-    lines.append(f"Total action: ${total_kelly:.0f} across {total_bets} plays")
+    total_kelly = sum(p.get("bet_size", 0) for p in all_plays[:total_idx])
+    lines.append(f"Total: ${total_kelly:.0f} across {total_idx} plays")
 
     return "\n".join(lines)
 
