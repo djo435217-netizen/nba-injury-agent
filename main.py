@@ -248,13 +248,22 @@ def _season_year(dt: datetime = None) -> int:
     return year          # Oct 2026 -> 2026 (new season starting)
 
 
-def _parse_minutes(min_str: str) -> float:
-    """Convert 'MM:SS' to float minutes."""
-    if not min_str or min_str == "0:00":
+def _parse_minutes(min_str) -> float:
+    """Convert 'MM:SS' or plain number to float minutes."""
+    if not min_str:
+        return 0.0
+    # Handle numeric input (int or float)
+    if isinstance(min_str, (int, float)):
+        return float(min_str)
+    min_str = str(min_str).strip()
+    if min_str in ("0:00", "0", ""):
         return 0.0
     try:
-        parts = min_str.split(":")
-        return float(parts[0]) + float(parts[1]) / 60.0
+        if ":" in min_str:
+            parts = min_str.split(":")
+            return float(parts[0]) + float(parts[1]) / 60.0
+        else:
+            return float(min_str)
     except:
         return 0.0
 
@@ -771,6 +780,13 @@ def bdl_last_n_games_stats(player_id: int, stat_key: str, n: int = BASELINE_GAME
         print(f"[WARN] No stats for player {player_id} season {season}")
         return []
 
+    # Debug: print first game keys and values on first call
+    if games and not getattr(bdl_last_n_games_stats, '_debug_printed', False):
+        g0 = games[0]
+        print(f"[DEBUG] Stats game[0] keys: {list(g0.keys())}")
+        print(f"[DEBUG] Stats game[0] sample: pts={g0.get('pts')}, reb={g0.get('reb')}, ast={g0.get('ast')}, min={g0.get('min')}, fg3m={g0.get('fg3m')}")
+        bdl_last_n_games_stats._debug_printed = True
+
     result = []
     for game in games:
         if not game:
@@ -1263,6 +1279,10 @@ def compute_projection(
         print(f"[SKIP] {player_name}: only {len(games)} games")
         return None
 
+    # Debug: show first game value for this player
+    if games:
+        print(f"[DEBUG] {player_name} {prop_type}: {len(games)} games, first val={games[0].get('value', '?')}, last val={games[-1].get('value', '?')}")
+
     # Step 2: Window averages
     base_games = _slice_last(games, BASELINE_GAMES)
     l10_games = _slice_last(games, LOOKBACK_GAMES)
@@ -1367,8 +1387,8 @@ def compute_projection(
     raw_prob = _norm_cdf(z)
     prob_over = calibrated_prob(raw_prob)
 
-    # Step 12: Edge and EV
-    edge = proj - line
+    # Step 12: Edge and EV (edge as percentage, not absolute)
+    edge_pct = ((proj - line) / line * 100) if line > 0 else 0.0
     implied_prob = american_to_prob(over_odds)
     ev = ev_per_dollar(prob_over, over_odds)
 
@@ -1377,12 +1397,12 @@ def compute_projection(
 
     # Step 14: Confidence tier
     confidence_tier = compute_confidence_tier(
-        edge, prob_over, consistency, is_breakout
+        edge_pct, prob_over, consistency, is_breakout
     )
 
     return ProjectionResult(
         proj=proj,
-        edge=edge,
+        edge=edge_pct,
         prob_over=prob_over,
         raw_prob=raw_prob,
         sigma=sigma,
@@ -1781,6 +1801,11 @@ def slate_scan_edges(
 
             if not proj_result:
                 continue
+
+            # Debug: show projection values
+            print(f"[PROJ] {player_name} {prop_type}: line={best_line}, proj={proj_result.proj:.1f}, "
+                  f"edge={proj_result.edge:.1f}%, prob={proj_result.prob_over:.3f}, ev={proj_result.ev:.3f}, "
+                  f"base={proj_result.base_avg:.1f}, l10={proj_result.l10_avg:.1f}, l5={proj_result.l5_avg:.1f}")
 
             if proj_result.edge < MIN_EDGE:
                 continue
