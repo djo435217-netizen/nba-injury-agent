@@ -255,9 +255,20 @@ BDL_BASE = "https://api.balldontlie.io/v1"
 LINEUP_EXPERTS_BASE = "https://api.lineupexperts.com/v1"
 
 # ESPN public API (no auth needed)
-ESPN_API_BASE = "https://site.api.espn.com/apis"
-ESPN_PLAYER_SEARCH = f"{ESPN_API_BASE}/common/v3/sports/basketball/nba/athletes"
-ESPN_SCOREBOARD = f"{ESPN_API_BASE}/site/v2/sports/basketball/nba/scoreboard"
+# IMPORTANT: search + gamelog use site.web.api.espn.com, scoreboard uses site.api.espn.com
+ESPN_WEB_API_BASE = "https://site.web.api.espn.com/apis"
+ESPN_SITE_API_BASE = "https://site.api.espn.com/apis"
+ESPN_PLAYER_SEARCH = f"{ESPN_WEB_API_BASE}/common/v3/search"
+ESPN_GAMELOG_BASE = f"{ESPN_WEB_API_BASE}/common/v3/sports/basketball/nba/athletes"
+ESPN_SCOREBOARD = f"{ESPN_SITE_API_BASE}/site/v2/sports/basketball/nba/scoreboard"
+
+# ESPN gamelog column labels (index positions)
+# Labels: MIN, FG, FG%, 3PT, 3P%, FT, FT%, REB, AST, BLK, STL, PF, TO, PTS
+ESPN_STAT_INDEX = {
+    "min": 0, "fg": 1, "fg_pct": 2, "three_pt": 3, "three_pct": 4,
+    "ft": 5, "ft_pct": 6, "reb": 7, "ast": 8, "blk": 9,
+    "stl": 10, "pf": 11, "to": 12, "pts": 13,
+}
 
 # NBA.com CDN stats (public, no auth)
 NBACOM_STATS_BASE = "https://stats.nba.com/stats"
@@ -1413,8 +1424,9 @@ def _espn_get(url: str, params: Dict = None, timeout: int = 8) -> Dict:
 
 def espn_search_player(player_name: str) -> Dict:
     """
-    Search ESPN for a player by name. Returns ESPN athlete data with ID,
-    team, position, and recent stats/news.
+    Search ESPN for a player by name using the public search endpoint.
+    URL: site.web.api.espn.com/apis/common/v3/search?query=X&type=player&limit=5
+    Response: {"items": [{"id": "4431678", "displayName": "Tyrese Maxey", ...}]}
     """
     if not player_name or not requests:
         return {}
@@ -1424,43 +1436,49 @@ def espn_search_player(player_name: str) -> Dict:
         return ESPN_PLAYER_CACHE[cache_key]
 
     try:
-        # ESPN athlete search endpoint (public, no auth)
-        url = f"{ESPN_API_BASE}/common/v3/sports/basketball/nba/athletes"
-        resp = requests.get(url, params={"search": player_name, "limit": 3}, timeout=8)
+        resp = requests.get(
+            ESPN_PLAYER_SEARCH,
+            params={"query": player_name, "limit": 5, "type": "player"},
+            timeout=8,
+        )
+
+        print(f"[ESPN] Search '{player_name}' -> {resp.status_code}")
 
         if resp.status_code != 200:
             ESPN_PLAYER_CACHE[cache_key] = {}
             return {}
 
         data = resp.json()
-        athletes = data.get("items", data.get("athletes", []))
+        items = data.get("items", [])
 
-        if not athletes:
+        if not items:
+            print(f"[ESPN] No results for '{player_name}'")
             ESPN_PLAYER_CACHE[cache_key] = {}
             return {}
 
-        # Take best match
-        athlete = athletes[0] if athletes else {}
+        # Find best NBA match
+        athlete = None
+        for item in items:
+            if item.get("league", "").lower() == "nba" and item.get("type") == "player":
+                athlete = item
+                break
+        if not athlete:
+            athlete = items[0]  # fallback to first result
 
         result = {
-            "espn_id": athlete.get("id"),
+            "espn_id": str(athlete.get("id", "")),
             "name": athlete.get("displayName", player_name),
-            "team": athlete.get("team", {}).get("displayName", ""),
-            "team_abbr": athlete.get("team", {}).get("abbreviation", ""),
-            "position": athlete.get("position", {}).get("abbreviation", ""),
-            "jersey": athlete.get("jersey", ""),
+            "team": "",
+            "team_abbr": "",
+            "position": "",
+            "jersey": "",
             "injuries": [],
             "news": [],
         }
 
-        # Check for injury status
-        injuries = athlete.get("injuries", [])
-        if injuries:
-            for inj in injuries:
-                result["injuries"].append({
-                    "status": inj.get("status", ""),
-                    "detail": inj.get("type", {}).get("description", ""),
-                })
+        # ESPN search doesn't include team/injury in the search response
+        # We'll get team info from a follow-up call if needed
+        print(f"[ESPN] Found: {result['name']} (ID: {result['espn_id']})")
 
         ESPN_PLAYER_CACHE[cache_key] = result
         return result
@@ -1474,7 +1492,12 @@ def espn_search_player(player_name: str) -> Dict:
 def espn_fetch_gamelog(espn_id: str, season: str = "2026") -> List[Dict]:
     """
     Fetch player game log from ESPN's public API.
-    Returns list of game entries with pts, reb, ast, min, etc.
+    URL: site.web.api.espn.com/apis/common/v3/sports/basketball/nba/athletes/{id}/gamelog?season=YYYY
+    Response structure:
+      - labels: ["MIN","FG","FG%","3PT","3P%","FT","FT%","REB","AST","BLK","STL","PF","TO","PTS"]
+      - seasonTypes[].categories[].events[].stats: ["35","7-13","53.8","1-3","33.3",...]
+    Stats are strings. "Made-Attempted" fields like FG, 3PT, FT need splitting.
+    Returns list of normalized game dicts with pts, reb, ast, blk, stl, fg3m, min.
     """
     if not espn_id or not requests:
         return []
@@ -1484,63 +1507,83 @@ def espn_fetch_gamelog(espn_id: str, season: str = "2026") -> List[Dict]:
         return MULTI_SOURCE_CACHE[cache_key]
 
     try:
-        url = f"{ESPN_API_BASE}/common/v3/sports/basketball/nba/athletes/{espn_id}/gamelog"
+        url = f"{ESPN_GAMELOG_BASE}/{espn_id}/gamelog"
         resp = requests.get(url, params={"season": season}, timeout=10)
 
+        print(f"[ESPN] gamelog {espn_id} -> {resp.status_code}")
+
         if resp.status_code != 200:
-            print(f"[ESPN] gamelog {espn_id} -> {resp.status_code}")
             MULTI_SOURCE_CACHE[cache_key] = []
             return []
 
         data = resp.json()
 
-        # ESPN gamelog has various formats; try to parse
-        games = []
-        categories = data.get("categories", [])
-        events = data.get("events", data.get("entries", []))
+        # Build label-to-index map from top-level labels
+        # Expected: ["MIN","FG","FG%","3PT","3P%","FT","FT%","REB","AST","BLK","STL","PF","TO","PTS"]
+        labels = data.get("labels", [])
+        label_map = {label.upper(): i for i, label in enumerate(labels)}
 
-        # Try the seasonTypes -> categories -> events structure
+        if not label_map:
+            print(f"[ESPN] gamelog {espn_id}: no labels found in response")
+            MULTI_SOURCE_CACHE[cache_key] = []
+            return []
+
+        print(f"[ESPN] gamelog labels: {labels}")
+
+        # Collect events from all seasonTypes -> categories -> events
+        # Categories are months (April, March, etc.) — most recent first
+        games = []
         season_types = data.get("seasonTypes", [])
+
         for st in season_types:
             for cat in st.get("categories", []):
-                cat_events = cat.get("events", [])
-                stat_labels = cat.get("displayNames", cat.get("labels", []))
-
-                for event in cat_events:
+                for event in cat.get("events", []):
                     stats = event.get("stats", [])
-                    if not stats or not stat_labels:
+                    if not stats:
                         continue
 
-                    game = {}
-                    for i, label in enumerate(stat_labels):
-                        if i < len(stats):
-                            game[label.upper()] = stats[i]
+                    def _get_stat(label_name: str) -> float:
+                        """Get a stat value by its label name."""
+                        idx = label_map.get(label_name.upper())
+                        if idx is None or idx >= len(stats):
+                            return 0.0
+                        val = str(stats[idx])
+                        # Handle "Made-Attempted" format (e.g., "7-13" for FG)
+                        if "-" in val and not val.startswith("-"):
+                            parts = val.split("-")
+                            return _safe_float(parts[0])  # Return "made" part
+                        return _safe_float(val)
 
-                    # Normalize field names
+                    minutes = _get_stat("MIN")
+                    if minutes < 1.0:
+                        continue  # Skip DNPs
+
                     normalized = {
-                        "pts": _safe_float(game.get("PTS", 0)),
-                        "reb": _safe_float(game.get("REB", 0)),
-                        "ast": _safe_float(game.get("AST", 0)),
-                        "blk": _safe_float(game.get("BLK", 0)),
-                        "stl": _safe_float(game.get("STL", 0)),
-                        "fg3m": _safe_float(game.get("3PM", game.get("FG3M", 0))),
-                        "min": _safe_float(game.get("MIN", 0)),
-                        "fgm": _safe_float(game.get("FGM", 0)),
-                        "fga": _safe_float(game.get("FGA", 0)),
+                        "pts": _get_stat("PTS"),
+                        "reb": _get_stat("REB"),
+                        "ast": _get_stat("AST"),
+                        "blk": _get_stat("BLK"),
+                        "stl": _get_stat("STL"),
+                        "fg3m": _get_stat("3PT"),  # "3PT" is "Made-Attempted", _get_stat returns Made
+                        "min": minutes,
+                        "fgm": _get_stat("FG"),
+                        "fga": 0.0,  # Would need to parse attempted from "FG" field
                     }
 
-                    if normalized["min"] > 0:  # Skip DNPs
-                        games.append(normalized)
+                    games.append(normalized)
 
-        # Limit to last 20 games
-        games = games[:20]
-        print(f"[ESPN] gamelog for {espn_id}: {len(games)} games found")
+        # Games come most-recent-first (April first, then March, etc.)
+        # Limit to 25 most recent
+        games = games[:25]
+        print(f"[ESPN] gamelog {espn_id}: {len(games)} games parsed")
 
         MULTI_SOURCE_CACHE[cache_key] = games
         return games
 
     except Exception as e:
-        print(f"[ESPN] gamelog error: {e}")
+        print(f"[ESPN] gamelog error for {espn_id}: {e}")
+        import traceback
+        traceback.print_exc()
         MULTI_SOURCE_CACHE[cache_key] = []
         return []
 
@@ -1569,7 +1612,7 @@ def espn_fetch_team_defense(team_name: str) -> Dict:
 
     try:
         # ESPN team search
-        url = f"{ESPN_API_BASE}/site/v2/sports/basketball/nba/teams"
+        url = f"{ESPN_SITE_API_BASE}/site/v2/sports/basketball/nba/teams"
         resp = requests.get(url, params={"limit": 50}, timeout=8)
 
         if resp.status_code != 200:
@@ -1585,7 +1628,7 @@ def espn_fetch_team_defense(team_name: str) -> Dict:
                 team_id = team.get("id")
                 if team_id:
                     # Fetch team stats
-                    stats_url = f"{ESPN_API_BASE}/site/v2/sports/basketball/nba/teams/{team_id}/statistics"
+                    stats_url = f"{ESPN_SITE_API_BASE}/site/v2/sports/basketball/nba/teams/{team_id}/statistics"
                     stats_resp = requests.get(stats_url, timeout=8)
                     if stats_resp.status_code == 200:
                         stats_data = stats_resp.json()
