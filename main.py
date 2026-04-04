@@ -221,6 +221,7 @@ ROSTER_CACHE = {}
 TEAM_ID_CACHE = {}
 LINEUPS_CACHE = {}
 DEF_RATINGS_CACHE = {}
+PLAYER_NAME_CACHE = {}
 
 # State tracking
 RUNTIME_START = time.time()
@@ -606,7 +607,8 @@ def _bdl_get(endpoint: str, params: Dict = None, retries: int = 3) -> Dict:
 def bdl_games_today(dt: datetime = None) -> List[Dict]:
     """
     Get all NBA games for today.
-    Returns list of game dicts with keys: id, home_team, away_team, status, scheduled_at.
+    BDL uses: home_team, visitor_team (NOT away_team), datetime (NOT scheduled_at).
+    We normalize to consistent keys for downstream use.
     """
     if dt is None:
         dt = _now_et()
@@ -616,18 +618,26 @@ def bdl_games_today(dt: datetime = None) -> List[Dict]:
 
     games = resp.get("data", []) if resp else []
 
-    # DEBUG: dump first game to see structure
-    if games:
-        print(f"[DEBUG] game[0] keys: {list(games[0].keys())}")
-        print(f"[DEBUG] game[0]: {json.dumps(games[0], default=str)[:500]}")
-
-    # Parse and enrich games with time info
+    # Normalize BDL field names for consistency downstream
     for game in games:
-        if "scheduled_at" in game:
+        # BDL uses "visitor_team" not "away_team"
+        if "visitor_team" in game and "away_team" not in game:
+            game["away_team"] = game["visitor_team"]
+        # BDL uses "datetime" not "scheduled_at"
+        if "datetime" in game and "scheduled_at" not in game:
+            game["scheduled_at"] = game["datetime"]
+        # Parse datetime
+        dt_str = game.get("datetime") or game.get("scheduled_at") or ""
+        if dt_str:
             try:
-                game["scheduled_dt"] = datetime.fromisoformat(game["scheduled_at"].replace("Z", "+00:00"))
+                game["scheduled_dt"] = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
             except:
                 pass
+
+    if games:
+        home = games[0].get("home_team", {}).get("full_name", "?")
+        away = games[0].get("away_team", {}).get("full_name", "?")
+        print(f"[INFO] First game: {away} @ {home}")
 
     return games
 
@@ -651,6 +661,55 @@ def bdl_team_name_to_id(team_name: str) -> Optional[int]:
             return team_id
 
     return None
+
+
+def bdl_player_name(player_id: int) -> str:
+    """
+    Look up player name from BDL player ID.
+    Caches results to avoid repeated API calls.
+    """
+    if not player_id:
+        return ""
+
+    if player_id in PLAYER_NAME_CACHE:
+        return PLAYER_NAME_CACHE[player_id]
+
+    resp = _bdl_get(f"players/{player_id}", {})
+    name = ""
+    if resp and resp.get("data"):
+        data = resp["data"]
+        first = data.get("first_name", "")
+        last = data.get("last_name", "")
+        name = f"{first} {last}".strip()
+    elif resp:
+        # Some BDL endpoints return data at top level
+        first = resp.get("first_name", "")
+        last = resp.get("last_name", "")
+        name = f"{first} {last}".strip()
+
+    PLAYER_NAME_CACHE[player_id] = name
+    return name
+
+
+def bdl_batch_player_names(player_ids: List[int]) -> Dict[int, str]:
+    """
+    Batch look up player names. Uses cache where possible.
+    For uncached IDs, fetches individually (BDL has no batch player endpoint).
+    """
+    result = {}
+    to_fetch = []
+
+    for pid in player_ids:
+        if pid in PLAYER_NAME_CACHE:
+            result[pid] = PLAYER_NAME_CACHE[pid]
+        else:
+            to_fetch.append(pid)
+
+    for pid in to_fetch:
+        name = bdl_player_name(pid)
+        result[pid] = name
+
+    return result
 
 
 def bdl_active_roster(team_id: int) -> List[Dict]:
@@ -692,14 +751,24 @@ def bdl_find_player_id_on_team(player_name: str, team_id: int) -> Optional[int]:
 def bdl_last_n_games_stats(player_id: int, stat_key: str, n: int = BASELINE_GAMES) -> List[Dict]:
     """
     Fetch last n games for a player, extracting specific stat.
+    BDL endpoint: /v1/stats?player_ids[]=X&seasons[]=YEAR&per_page=N
     stat_key should be: pts, reb, ast, blk, stl, or 'min' for minutes.
     Returns list of dicts with 'value' key.
     """
     if not player_id:
         return []
 
-    resp = _bdl_get(f"players/{player_id}/games", {"per_page": n, "cursor": 0})
+    season = _season_year()
+    resp = _bdl_get("stats", {
+        "player_ids[]": player_id,
+        "seasons[]": season,
+        "per_page": n,
+    })
     games = resp.get("data", [])
+
+    if not games:
+        print(f"[WARN] No stats for player {player_id} season {season}")
+        return []
 
     result = []
     for game in games:
@@ -707,13 +776,13 @@ def bdl_last_n_games_stats(player_id: int, stat_key: str, n: int = BASELINE_GAME
             continue
         val = 0.0
         if stat_key == "min":
-            val = _parse_minutes(game.get("min", "0:00"))
+            val = _parse_minutes(str(game.get("min", "0:00")))
         else:
-            val = float(game.get(stat_key, 0.0))
+            val = float(game.get(stat_key, 0) or 0)
         result.append({
             "value": val,
-            "game_id": game.get("game_id"),
-            "date": game.get("game", {}).get("date") if game.get("game") else None,
+            "game_id": game.get("game", {}).get("id") if isinstance(game.get("game"), dict) else game.get("game_id"),
+            "date": game.get("game", {}).get("date") if isinstance(game.get("game"), dict) else None,
         })
 
     return result
@@ -721,23 +790,28 @@ def bdl_last_n_games_stats(player_id: int, stat_key: str, n: int = BASELINE_GAME
 
 def bdl_last_n_games_threes(player_id: int, n: int = BASELINE_GAMES) -> List[Dict]:
     """
-    Fetch 3-pointers made from last n games.
+    Fetch 3-pointers made from last n games using /v1/stats endpoint.
     Returns list of dicts with 'value' key (3PM).
     """
     if not player_id:
         return []
 
-    resp = _bdl_get(f"players/{player_id}/games", {"per_page": n, "cursor": 0})
+    season = _season_year()
+    resp = _bdl_get("stats", {
+        "player_ids[]": player_id,
+        "seasons[]": season,
+        "per_page": n,
+    })
     games = resp.get("data", [])
 
     result = []
     for game in games:
         if not game:
             continue
-        val = float(game.get("fg3m", 0.0))
+        val = float(game.get("fg3m", 0) or 0)
         result.append({
             "value": val,
-            "game_id": game.get("game_id"),
+            "game_id": game.get("game", {}).get("id") if isinstance(game.get("game"), dict) else None,
         })
 
     return result
@@ -747,6 +821,12 @@ def bdl_fetch_props_for_game(game_id: int, prop_types: List[str] = None) -> Dict
     """
     Fetch player prop lines for a game from BDL God Tier API.
     Endpoint: /v2/odds/player_props?game_id=XXX
+
+    Actual BDL v2 response format per item:
+      {id, game_id, player_id (int!), vendor, prop_type, line_value (string!), market, updated_at}
+      market = {type: "over_under", over_odds: -102, under_odds: -132}
+           or {type: "milestone", odds: -1400}
+
     Returns dict: {player_name: {prop_type: [{book, line, odds}]}}
     """
     if not game_id or not prop_types:
@@ -756,78 +836,111 @@ def bdl_fetch_props_for_game(game_id: int, prop_types: List[str] = None) -> Dict
     if cache_key in PROPS_CACHE:
         return PROPS_CACHE[cache_key]
 
-    # BDL player props live at /v2/odds/player_props (not /v1/props)
     if not BALLDONTLIE_API_KEY or not requests:
         return {}
 
     url = "https://api.balldontlie.io/v2/odds/player_props"
     headers = {"Authorization": BALLDONTLIE_API_KEY}
 
+    # BDL prop_type names -> our internal names
+    PROP_TYPE_MAP = {
+        "points": "player_points",
+        "rebounds": "player_rebounds",
+        "assists": "player_assists",
+        "threes": "player_threes",
+        "blocks": "player_blocks",
+        "steals": "player_steals",
+    }
+
     result = {}
     try:
         resp = requests.get(url, headers=headers, params={"game_id": game_id}, timeout=REQUEST_TIMEOUT)
         print(f"[API] v2/odds/player_props -> {resp.status_code} (game {game_id})")
 
-        if resp.status_code == 200:
-            data = resp.json()
-            # DEBUG: dump raw response structure
-            print(f"[DEBUG] props keys: {list(data.keys())}")
-            raw_items = data.get("data", [])
-            if raw_items and len(raw_items) > 0:
-                print(f"[DEBUG] props[0] keys: {list(raw_items[0].keys())}")
-                print(f"[DEBUG] props[0]: {json.dumps(raw_items[0], default=str)[:500]}")
-            else:
-                print(f"[DEBUG] props raw (first 500): {json.dumps(data, default=str)[:500]}")
-            for prop in raw_items:
-                # BDL v2 response: player info, prop_type, line_value, vendor, market
-                player_info = prop.get("player", {})
-                player_name = ""
-                if isinstance(player_info, dict):
-                    first = player_info.get("first_name", "")
-                    last = player_info.get("last_name", "")
-                    player_name = f"{first} {last}".strip()
-
-                raw_prop_type = prop.get("prop_type", "")
-                # Map BDL prop types to our internal format
-                prop_type_map = {
-                    "points": "player_points",
-                    "rebounds": "player_rebounds",
-                    "assists": "player_assists",
-                    "threes": "player_threes",
-                    "blocks": "player_blocks",
-                    "steals": "player_steals",
-                }
-                prop_type = prop_type_map.get(raw_prop_type, "")
-
-                if not player_name or not prop_type:
-                    continue
-
-                if player_name not in result:
-                    result[player_name] = {}
-                if prop_type not in result[player_name]:
-                    result[player_name][prop_type] = []
-
-                # Parse line and odds from BDL v2 response
-                line_value = prop.get("line_value", 0.0)
-                vendor = prop.get("vendor", "Consensus")
-                market = prop.get("market", {})
-
-                over_odds = -110
-                if isinstance(market, dict):
-                    over_odds = market.get("over_odds", market.get("odds", -110))
-
-                result[player_name][prop_type].append({
-                    "book": vendor,
-                    "line": float(line_value) if line_value else 0.0,
-                    "odds": float(over_odds) if over_odds else -110,
-                })
-
-            print(f"[API] player_props: {len(result)} players found")
-        else:
+        if resp.status_code != 200:
             print(f"[API] player_props error: {resp.text[:200]}")
+            PROPS_CACHE[cache_key] = result
+            return result
+
+        data = resp.json()
+        raw_items = data.get("data", [])
+        print(f"[API] player_props raw: {len(raw_items)} entries")
+
+        # Step 1: Collect unique player_ids so we can batch-resolve names
+        unique_pids = set()
+        for prop in raw_items:
+            pid = prop.get("player_id")
+            if pid:
+                unique_pids.add(pid)
+
+        # Step 2: Batch resolve player names
+        if unique_pids:
+            print(f"[API] Resolving {len(unique_pids)} player names...")
+            bdl_batch_player_names(list(unique_pids))
+
+        # Step 3: Parse each prop entry
+        skipped_milestone = 0
+        parsed = 0
+        for prop in raw_items:
+            pid = prop.get("player_id")
+            if not pid:
+                continue
+
+            player_name = PLAYER_NAME_CACHE.get(pid, "")
+            if not player_name:
+                continue
+
+            raw_prop_type = prop.get("prop_type", "")
+            prop_type = PROP_TYPE_MAP.get(raw_prop_type, "")
+            if not prop_type:
+                continue
+
+            # Parse market - only use over_under, skip milestone
+            market = prop.get("market", {})
+            market_type = market.get("type", "")
+
+            if market_type == "milestone":
+                skipped_milestone += 1
+                continue  # Milestone bets aren't standard over/under
+
+            # Get over odds from market
+            over_odds = market.get("over_odds", -110)
+            if over_odds is None:
+                over_odds = -110
+
+            # line_value is a STRING in BDL response
+            line_str = prop.get("line_value", "0")
+            try:
+                line_val = float(line_str)
+            except (ValueError, TypeError):
+                continue
+
+            if line_val <= 0:
+                continue
+
+            vendor = prop.get("vendor", "Consensus")
+
+            # Store by player_name -> prop_type -> [offers]
+            if player_name not in result:
+                result[player_name] = {}
+            if prop_type not in result[player_name]:
+                result[player_name][prop_type] = []
+
+            result[player_name][prop_type].append({
+                "book": vendor,
+                "line": line_val,
+                "odds": float(over_odds),
+                "player_id": pid,
+            })
+            parsed += 1
+
+        total_players = len(result)
+        total_props = sum(len(v) for p in result.values() for v in p.values())
+        print(f"[API] player_props: {total_players} players, {total_props} lines ({skipped_milestone} milestones skipped)")
 
     except Exception as e:
         print(f"[API] player_props exception: {e}")
+        traceback.print_exc()
 
     PROPS_CACHE[cache_key] = result
     return result
@@ -881,15 +994,6 @@ def bdl_fetch_game_odds_full(game_id: int) -> Dict:
 
     # BDL odds endpoint: /v1/odds?game_id=XXX (singular, no brackets)
     resp = _bdl_get("odds", {"game_id": game_id})
-
-    # DEBUG: dump raw response keys and first item to see actual structure
-    if resp:
-        print(f"[DEBUG] odds keys: {list(resp.keys())}")
-        if resp.get("data") and len(resp["data"]) > 0:
-            print(f"[DEBUG] odds[0] keys: {list(resp['data'][0].keys())}")
-            print(f"[DEBUG] odds[0]: {json.dumps(resp['data'][0], default=str)[:500]}")
-        else:
-            print(f"[DEBUG] odds raw (first 500): {json.dumps(resp, default=str)[:500]}")
 
     result = {
         "game_total": 220.0,
@@ -1643,34 +1747,25 @@ def slate_scan_edges(
 
             best_line, best_odds = best_odds_offer
 
-            # Get player ID
-            home_team = game_info.get("home_team", {})
-            away_team = game_info.get("away_team", {})
-            team_ids = [
-                bdl_team_name_to_id(home_team.get("name", "")),
-                bdl_team_name_to_id(away_team.get("name", "")),
-            ]
-
+            # Get player ID from props data (already resolved by bdl_fetch_props)
             player_id = None
-            for tid in team_ids:
-                player_id = bdl_find_player_id_on_team(player_name, tid)
-                if player_id:
+            for bl in book_lines:
+                if bl.get("player_id"):
+                    player_id = bl["player_id"]
                     break
 
             if not player_id:
                 continue
 
             # Determine opponent and home/away
-            is_home = False
-            opp_team = ""
-            for tid in team_ids:
-                roster = bdl_active_roster(tid)
-                for p in roster:
-                    p_full = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
-                    if _clean_name(p_full) == _clean_name(player_name):
-                        is_home = (tid == bdl_team_name_to_id(home_team.get("name", "")))
-                        opp_team = away_team.get("name", "") if is_home else home_team.get("name", "")
-                        break
+            home_team = game_info.get("home_team", {})
+            away_team = game_info.get("away_team", {})
+            # BDL team objects have "full_name" (e.g., "Boston Celtics") and "name" (e.g., "Celtics")
+            home_name = home_team.get("full_name", home_team.get("name", ""))
+            away_name = away_team.get("full_name", away_team.get("name", ""))
+            # Default to away team as opponent (simplified)
+            is_home = True  # Will refine if we have team info
+            opp_team = away_name
 
             game_context = {
                 "opp_team": opp_team,
@@ -1856,36 +1951,24 @@ def plus_odds_hunt_edges(
 
                 best_line = consensus_line(all_lines)
 
-                home_team = game_info.get("home_team", {})
-                away_team = game_info.get("away_team", {})
-                team_ids = [
-                    bdl_team_name_to_id(home_team.get("name", "")),
-                    bdl_team_name_to_id(away_team.get("name", "")),
-                ]
-
+                # Get player_id from props data
                 player_id = None
-                for tid in team_ids:
-                    player_id = bdl_find_player_id_on_team(player_name, tid)
-                    if player_id:
+                for bl in book_lines:
+                    if bl.get("player_id"):
+                        player_id = bl["player_id"]
                         break
-
                 if not player_id:
                     continue
 
                 if has_recent_play(state, player_name, prop_type):
                     continue
 
-                # Determine opponent and home/away
-                is_home = False
-                opp_team = ""
-                for tid in team_ids:
-                    roster = bdl_active_roster(tid)
-                    for p in roster:
-                        p_full = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
-                        if _clean_name(p_full) == _clean_name(player_name):
-                            is_home = (tid == bdl_team_name_to_id(home_team.get("name", "")))
-                            opp_team = away_team.get("name", "") if is_home else home_team.get("name", "")
-                            break
+                home_team = game_info.get("home_team", {})
+                away_team = game_info.get("away_team", {})
+                home_name = home_team.get("full_name", home_team.get("name", ""))
+                away_name = away_team.get("full_name", away_team.get("name", ""))
+                is_home = True
+                opp_team = away_name
 
                 game_context = {
                     "opp_team": opp_team,
@@ -2163,32 +2246,21 @@ def scan_ladder_plays(
             if avg_line < 18.0:
                 continue
 
-            home_team = game_info.get("home_team", {})
-            away_team = game_info.get("away_team", {})
-            team_ids = [
-                bdl_team_name_to_id(home_team.get("name", "")),
-                bdl_team_name_to_id(away_team.get("name", "")),
-            ]
-
+            # Get player_id from props data
             player_id = None
-            for tid in team_ids:
-                player_id = bdl_find_player_id_on_team(player_name, tid)
-                if player_id:
+            for bl in book_lines:
+                if bl.get("player_id"):
+                    player_id = bl["player_id"]
                     break
-
             if not player_id:
                 continue
 
-            is_home = False
-            opp_team = ""
-            for tid in team_ids:
-                roster = bdl_active_roster(tid)
-                for p in roster:
-                    p_full = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
-                    if _clean_name(p_full) == _clean_name(player_name):
-                        is_home = (tid == bdl_team_name_to_id(home_team.get("name", "")))
-                        opp_team = away_team.get("name", "") if is_home else home_team.get("name", "")
-                        break
+            home_team = game_info.get("home_team", {})
+            away_team = game_info.get("away_team", {})
+            home_name = home_team.get("full_name", home_team.get("name", ""))
+            away_name = away_team.get("full_name", away_team.get("name", ""))
+            is_home = True
+            opp_team = away_name
 
             game_context = {
                 "opp_team": opp_team,
@@ -2196,7 +2268,6 @@ def scan_ladder_plays(
                 "pace": game_info.get("pace", 100.0),
             }
 
-            # BUG FIX: Fixed signature
             proj_result = compute_projection(
                 player_id, player_name, game_id, avg_line, "player_points",
                 -110, game_info, game_context
