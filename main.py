@@ -741,6 +741,7 @@ def bdl_last_n_games_threes(player_id: int, n: int = BASELINE_GAMES) -> List[Dic
 def bdl_fetch_props_for_game(game_id: int, prop_types: List[str] = None) -> Dict:
     """
     Fetch player prop lines for a game from BDL God Tier API.
+    Endpoint: /v2/odds/player_props?game_id=XXX
     Returns dict: {player_name: {prop_type: [{book, line, odds}]}}
     """
     if not game_id or not prop_types:
@@ -750,26 +751,70 @@ def bdl_fetch_props_for_game(game_id: int, prop_types: List[str] = None) -> Dict
     if cache_key in PROPS_CACHE:
         return PROPS_CACHE[cache_key]
 
-    resp = _bdl_get(f"props", {"game_ids[]": game_id})
+    # BDL player props live at /v2/odds/player_props (not /v1/props)
+    if not BALLDONTLIE_API_KEY or not requests:
+        return {}
+
+    url = "https://api.balldontlie.io/v2/odds/player_props"
+    headers = {"Authorization": BALLDONTLIE_API_KEY}
 
     result = {}
-    if resp and resp.get("data"):
-        # Parse props response
-        for prop in resp.get("data", []):
-            player_name = prop.get("player", {}).get("name", "")
-            prop_type = prop.get("prop_type", "")
+    try:
+        resp = requests.get(url, headers=headers, params={"game_id": game_id}, timeout=REQUEST_TIMEOUT)
+        print(f"[API] v2/odds/player_props -> {resp.status_code} (game {game_id})")
 
-            if player_name and prop_type:
+        if resp.status_code == 200:
+            data = resp.json()
+            for prop in data.get("data", []):
+                # BDL v2 response: player info, prop_type, line_value, vendor, market
+                player_info = prop.get("player", {})
+                player_name = ""
+                if isinstance(player_info, dict):
+                    first = player_info.get("first_name", "")
+                    last = player_info.get("last_name", "")
+                    player_name = f"{first} {last}".strip()
+
+                raw_prop_type = prop.get("prop_type", "")
+                # Map BDL prop types to our internal format
+                prop_type_map = {
+                    "points": "player_points",
+                    "rebounds": "player_rebounds",
+                    "assists": "player_assists",
+                    "threes": "player_threes",
+                    "blocks": "player_blocks",
+                    "steals": "player_steals",
+                }
+                prop_type = prop_type_map.get(raw_prop_type, "")
+
+                if not player_name or not prop_type:
+                    continue
+
                 if player_name not in result:
                     result[player_name] = {}
                 if prop_type not in result[player_name]:
                     result[player_name][prop_type] = []
 
+                # Parse line and odds from BDL v2 response
+                line_value = prop.get("line_value", 0.0)
+                vendor = prop.get("vendor", "Consensus")
+                market = prop.get("market", {})
+
+                over_odds = -110
+                if isinstance(market, dict):
+                    over_odds = market.get("over_odds", market.get("odds", -110))
+
                 result[player_name][prop_type].append({
-                    "book": prop.get("league_name", "Consensus"),
-                    "line": prop.get("over_under", 0.0),
-                    "odds": prop.get("over_odds", -110),
+                    "book": vendor,
+                    "line": float(line_value) if line_value else 0.0,
+                    "odds": float(over_odds) if over_odds else -110,
                 })
+
+            print(f"[API] player_props: {len(result)} players found")
+        else:
+            print(f"[API] player_props error: {resp.text[:200]}")
+
+    except Exception as e:
+        print(f"[API] player_props exception: {e}")
 
     PROPS_CACHE[cache_key] = result
     return result
@@ -788,7 +833,7 @@ def bdl_fetch_advanced_stats(player_id: int) -> Dict:
         return ADV_STATS_CACHE[cache_key]
 
     season = _season_year()
-    resp = _bdl_get("season_averages", {"player_ids[]": player_id, "season": season})
+    resp = _bdl_get("season_averages", {"player_id": player_id, "season": season})
 
     result = {
         "usage_pct": 25.0,
@@ -821,7 +866,8 @@ def bdl_fetch_game_odds_full(game_id: int) -> Dict:
     if cache_key in GAME_ODDS_CACHE:
         return GAME_ODDS_CACHE[cache_key]
 
-    resp = _bdl_get("odds", {"game_ids[]": game_id})
+    # BDL odds endpoint: /v1/odds?game_id=XXX (singular, no brackets)
+    resp = _bdl_get("odds", {"game_id": game_id})
 
     result = {
         "game_total": 220.0,
@@ -831,12 +877,18 @@ def bdl_fetch_game_odds_full(game_id: int) -> Dict:
     }
 
     if resp and resp.get("data"):
-        for odds in resp.get("data", []):
-            if odds.get("game_id") == game_id:
-                result["game_total"] = odds.get("over_under", 220.0)
-                result["home_spread"] = odds.get("home_spread", -3.5)
-                result["away_spread"] = odds.get("away_spread", 3.5)
-                break
+        for odds_entry in resp.get("data", []):
+            # BDL v1/v2 odds response fields
+            total = odds_entry.get("total_value") or odds_entry.get("over_under") or odds_entry.get("total")
+            if total:
+                result["game_total"] = float(total)
+            spread_home = odds_entry.get("spread_home_value") or odds_entry.get("home_spread")
+            if spread_home:
+                result["home_spread"] = float(spread_home)
+            spread_away = odds_entry.get("spread_away_value") or odds_entry.get("away_spread")
+            if spread_away:
+                result["away_spread"] = float(spread_away)
+            break  # Take first entry
 
     GAME_ODDS_CACHE[cache_key] = result
     return result
