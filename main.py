@@ -210,7 +210,7 @@ TEAM_DEFENSE_RATINGS = {
 }
 
 # API endpoints
-BDL_BASE = "https://api.balldontlie.io/api/v1"
+BDL_BASE = "https://api.balldontlie.io/v1"
 LINEUP_EXPERTS_BASE = "https://api.lineupexperts.com/v1"
 
 # Caches
@@ -575,6 +575,7 @@ def _bdl_get(endpoint: str, params: Dict = None, retries: int = 3) -> Dict:
     Returns response JSON or empty dict on failure.
     """
     if not BALLDONTLIE_API_KEY or not requests:
+        print(f"[WARN] BDL skipped: key={'set' if BALLDONTLIE_API_KEY else 'MISSING'}, requests={'ok' if requests else 'MISSING'}")
         return {}
 
     url = f"{BDL_BASE}/{endpoint}"
@@ -584,14 +585,18 @@ def _bdl_get(endpoint: str, params: Dict = None, retries: int = 3) -> Dict:
         try:
             resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
             if resp.status_code == 200:
-                return resp.json()
+                data = resp.json()
+                print(f"[API] {endpoint} -> {resp.status_code} ({len(data.get('data', []))} items)")
+                return data
             elif resp.status_code == 429:
                 wait = int(resp.headers.get("Retry-After", 2))
+                print(f"[API] {endpoint} -> 429 rate limit, waiting {wait}s")
                 time.sleep(wait)
             else:
+                print(f"[API] {endpoint} -> {resp.status_code}: {resp.text[:200]}")
                 break
         except Exception as e:
-            print(f"BDL request error: {e}")
+            print(f"[API] {endpoint} error: {e}")
             if attempt < retries - 1:
                 time.sleep(1)
 
