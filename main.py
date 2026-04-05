@@ -2807,12 +2807,12 @@ def odds_api_fetch_player_props(event_id: str, market: str = "player_points") ->
                 is_alt = "_alternate" in mkt_key
 
                 for outcome in mkt.get("outcomes", []):
-                    # Only "Over" outcomes (we bet overs)
-                    desc = outcome.get("description", "").lower()
-                    if desc != "over":
+                    # Odds API format: name="Over"/"Under", description="Player Name"
+                    over_under = outcome.get("name", "").lower()
+                    if over_under != "over":
                         continue
 
-                    player_name = outcome.get("name", "")
+                    player_name = outcome.get("description", "")
                     point = outcome.get("point", 0)
                     price = outcome.get("price", -110)
 
