@@ -1093,6 +1093,68 @@ def bdl_find_player_id_on_team(player_name: str, team_id: int) -> Optional[int]:
     return None
 
 
+BDL_PLAYER_TEAM_CACHE: Dict[int, int] = {}
+
+
+def bdl_player_team_id(player_id: int) -> int:
+    """
+    Resolve a BDL player's current team ID from their most recent stat line.
+    BDL stats endpoint includes player.team_id for each game.
+    Returns the team_id (int), or 0 if unknown.
+    """
+    if player_id in BDL_PLAYER_TEAM_CACHE:
+        return BDL_PLAYER_TEAM_CACHE[player_id]
+
+    season = _season_year()
+    resp = _bdl_get("stats", {
+        "player_ids[]": player_id,
+        "seasons[]": season,
+        "per_page": 1,
+    })
+    games = resp.get("data", [])
+    team_id = 0
+    if games:
+        g = games[0]
+        # BDL v1 stats: team is nested under player or at top level
+        team_obj = g.get("team", {})
+        if isinstance(team_obj, dict):
+            team_id = team_obj.get("id", 0)
+        elif isinstance(team_obj, int):
+            team_id = team_obj
+        # Also check player.team_id
+        if not team_id:
+            player_obj = g.get("player", {})
+            if isinstance(player_obj, dict):
+                team_id = player_obj.get("team_id", 0)
+
+    BDL_PLAYER_TEAM_CACHE[player_id] = team_id
+    return team_id
+
+
+def determine_home_away(player_id: int, game_info: Dict) -> Tuple[bool, str, str]:
+    """
+    Determine if a player is home or away by matching their BDL team_id
+    against the game's home_team/away_team IDs.
+    Returns (is_home, opp_team_name, player_team_name).
+    """
+    home_team = game_info.get("home_team", {})
+    away_team = game_info.get("away_team", {})
+    home_name = home_team.get("full_name", home_team.get("name", ""))
+    away_name = away_team.get("full_name", away_team.get("name", ""))
+    home_id = home_team.get("id", 0)
+    away_id = away_team.get("id", 0)
+
+    player_team_id = bdl_player_team_id(player_id)
+
+    if player_team_id and player_team_id == home_id:
+        return True, away_name, home_name
+    elif player_team_id and player_team_id == away_id:
+        return False, home_name, away_name
+    else:
+        # Fallback: can't determine, default to home
+        return True, away_name, home_name
+
+
 def bdl_last_n_games_stats(player_id: int, stat_key: str, n: int = BASELINE_GAMES) -> List[Dict]:
     """
     Fetch last n games for a player, extracting specific stat.
@@ -1875,26 +1937,36 @@ def cross_reference_player(
 
     # --- Compare sources ---
     if result["espn_avg"] > 0 and result["bdl_avg"] > 0:
-        # Use ESPN as denominator since it's our truth
-        diff_pct = abs(result["espn_avg"] - result["bdl_avg"]) / result["espn_avg"] * 100
-        result["discrepancy"] = diff_pct
-
-        if diff_pct > 15:
-            result["agreement"] = False
-            if result["confidence"] != "low":  # Don't override injury-based low
-                result["confidence"] = "low"
-            result["notes"].append(
-                f"DATA MISMATCH: ESPN avg {result['espn_avg']:.1f} vs "
-                f"BDL avg {result['bdl_avg']:.1f} ({diff_pct:.0f}% off) — trusting ESPN"
-            )
-        elif diff_pct > 8:
-            if result["confidence"] == "high":
-                result["confidence"] = "medium"
-            result["notes"].append(
-                f"Minor diff: ESPN {result['espn_avg']:.1f} vs BDL {result['bdl_avg']:.1f}"
-            )
+        # Sanity check: if BDL avg is implausibly low compared to ESPN
+        # (e.g., BDL returns 1.2 for points when ESPN shows 16.6),
+        # BDL data is likely wrong player or wrong stat — discard it
+        ratio = result["bdl_avg"] / result["espn_avg"] if result["espn_avg"] > 0 else 1.0
+        if ratio < 0.25 and result["espn_avg"] > 3.0:
+            # BDL is less than 25% of ESPN — likely bad data
+            result["notes"].append(f"BDL data unreliable ({result['bdl_avg']:.1f} vs ESPN {result['espn_avg']:.1f}) — using ESPN only")
+            result["bdl_avg"] = 0  # Zero it out so it doesn't confuse display
+            result["sources"] = [s for s in result["sources"] if s != "BDL"]
         else:
-            result["notes"].append(f"Sources agree ({diff_pct:.0f}% diff)")
+            # Use ESPN as denominator since it's our truth
+            diff_pct = abs(result["espn_avg"] - result["bdl_avg"]) / result["espn_avg"] * 100
+            result["discrepancy"] = diff_pct
+
+            if diff_pct > 15:
+                result["agreement"] = False
+                if result["confidence"] != "low":  # Don't override injury-based low
+                    result["confidence"] = "low"
+                result["notes"].append(
+                    f"DATA MISMATCH: ESPN avg {result['espn_avg']:.1f} vs "
+                    f"BDL avg {result['bdl_avg']:.1f} ({diff_pct:.0f}% off) — trusting ESPN"
+                )
+            elif diff_pct > 8:
+                if result["confidence"] == "high":
+                    result["confidence"] = "medium"
+                result["notes"].append(
+                    f"Minor diff: ESPN {result['espn_avg']:.1f} vs BDL {result['bdl_avg']:.1f}"
+                )
+            else:
+                result["notes"].append(f"Sources agree ({diff_pct:.0f}% diff)")
     elif result["espn_avg"] > 0:
         result["notes"].append("ESPN only — no BDL cross-check")
     elif result["bdl_avg"] > 0:
@@ -2642,15 +2714,12 @@ def slate_scan_edges(
             if not player_id:
                 continue
 
-            # Determine opponent and home/away
+            # Determine opponent and home/away using BDL team matching
+            is_home, opp_team, player_team_name = determine_home_away(player_id, game_info)
             home_team = game_info.get("home_team", {})
             away_team = game_info.get("away_team", {})
-            # BDL team objects have "full_name" (e.g., "Boston Celtics") and "name" (e.g., "Celtics")
             home_name = home_team.get("full_name", home_team.get("name", ""))
             away_name = away_team.get("full_name", away_team.get("name", ""))
-            # Default to away team as opponent (simplified)
-            is_home = True  # Will refine if we have team info
-            opp_team = away_name
 
             game_context = {
                 "opp_team": opp_team,
@@ -2681,6 +2750,16 @@ def slate_scan_edges(
             if proj_result.prob_over < min_prob_for_stat:
                 continue
             if proj_result.ev < 0.02:
+                continue
+
+            # Kill picks where the player has NEVER hit the line
+            # Model-only projections without empirical support are unreliable
+            hr_data_check = proj_result.hit_rates or {}
+            l5_h = hr_data_check.get("l5_hits", 0)
+            l10_h = hr_data_check.get("l10_hits", 0)
+            base_h = hr_data_check.get("base_hits", 0)
+            if l5_h == 0 and l10_h == 0 and base_h == 0:
+                print(f"[SKIP] {player_name} {prop_type}: 0/0/0 hit rates — no empirical support")
                 continue
 
             if has_recent_play(state, player_name, prop_type):
@@ -2790,7 +2869,7 @@ def slate_scan_edges(
                 "base_avg": proj_result.base_avg,
                 "opp_team": opp_team,
                 "is_home": is_home,
-                "player_team": xref.get("espn_team", home_name if is_home else away_name),
+                "player_team": player_team_name or xref.get("espn_team", home_name if is_home else away_name),
                 "hit_rates": hr_data,
                 "xref": xref,
                 "xref_confidence": xref_confidence,
@@ -3540,8 +3619,8 @@ def scan_ladder_plays(
             if not player_id:
                 continue
 
-            is_home = True
-            opp_team = away_name
+            # Determine home/away using BDL team matching
+            is_home, opp_team, player_team_name = determine_home_away(player_id, game_info)
 
             game_context = {
                 "opp_team": opp_team,
@@ -3596,22 +3675,37 @@ def scan_ladder_plays(
                         break
 
                 # Estimate odds for alt lines based on distance from main line
+                # Real FanDuel alt lines: 15pt gap = +2000-5000, not +800
                 if best_odds is None:
                     dist = rung - avg_line
-                    if dist < -10:
+                    if dist < -15:
+                        best_odds = -550
+                    elif dist < -10:
                         best_odds = -350
                     elif dist < -5:
                         best_odds = -200
+                    elif dist < -2:
+                        best_odds = -140
                     elif dist < 0:
-                        best_odds = -130
+                        best_odds = -120
+                    elif dist < 3:
+                        best_odds = +130
                     elif dist < 5:
-                        best_odds = +150
+                        best_odds = +200
+                    elif dist < 8:
+                        best_odds = +350
                     elif dist < 10:
-                        best_odds = +250
-                    elif dist < 15:
-                        best_odds = +450
-                    else:
+                        best_odds = +500
+                    elif dist < 13:
                         best_odds = +800
+                    elif dist < 16:
+                        best_odds = +1500
+                    elif dist < 20:
+                        best_odds = +2500
+                    elif dist < 25:
+                        best_odds = +4000
+                    else:
+                        best_odds = +6000
 
                 z = (projection - rung) / proj_result.sigma if proj_result.sigma > 0 else 0
                 raw_prob = _norm_cdf(z)
