@@ -428,10 +428,15 @@ def prop_type_is_threes(prop_type: str) -> bool:
 
 
 def _slice_last(lst: List, n: int) -> List:
-    """Get last n elements of list."""
+    """
+    Get the first n elements of list (most recent games).
+    ESPN and BDL both return games most-recent-first,
+    so [:n] gives us the last n games played.
+    FIX: Was using [-n:] which gave OLDEST games, completely backwards.
+    """
     if not lst:
         return []
-    return lst[-n:] if n < len(lst) else lst
+    return lst[:n]
 
 
 def _role_trend(l3: float, l10: float, base: float) -> str:
@@ -559,6 +564,8 @@ def build_deep_analysis(
     breakout_evidence: Dict = None,
     hit_rates: Dict = None,
     xref: Dict = None,
+    explosion: Dict = None,
+    breakout_signals: Dict = None,
 ) -> str:
     """
     Build a multi-line research-style analysis for a pick.
@@ -706,7 +713,47 @@ def build_deep_analysis(
         label = "Verified" if len(sources) > 1 else "Source"
         parts.append(f"  {label}: {' | '.join(xref_parts)}")
 
-    # ---- Line 6: Why this play (the verdict) ----
+    # ---- Line 6: Explosion profile (how they score, not just how much) ----
+    if explosion:
+        exp_parts = []
+        profile_type = explosion.get("profile_type", "")
+        vol = explosion.get("volatility", 0)
+        exp_rate = explosion.get("explosion_rate", 0)
+        boom_avg = explosion.get("boom_avg", 0)
+        season_max = explosion.get("season_max", 0)
+
+        PROFILE_LABELS = {
+            "boom_or_bust": "Boom-or-bust",
+            "ceiling_hunter": "Ceiling hunter",
+            "steady_eddie": "Steady",
+            "volatile": "High variance",
+            "moderate": "Moderate",
+        }
+        exp_parts.append(PROFILE_LABELS.get(profile_type, profile_type))
+
+        if exp_rate >= 0.15:
+            exp_parts.append(f"explodes {exp_rate*100:.0f}% of games")
+        if boom_avg > 0:
+            exp_parts.append(f"boom avg {boom_avg:.0f}")
+        if season_max > 0 and season_max > line * 1.3:
+            exp_parts.append(f"szn high {season_max:.0f}")
+
+        if exp_parts:
+            parts.append(f"  Profile: {' | '.join(exp_parts)}")
+
+    # ---- Line 7: Tonight's breakout signals ----
+    if breakout_signals:
+        bk_tier = breakout_signals.get("breakout_tier", "NEUTRAL")
+        bk_score = breakout_signals.get("breakout_score", 0)
+        bk_signals = breakout_signals.get("signals", [])
+
+        if bk_tier in ("PRIME", "ELEVATED") and bk_signals:
+            signal_str = " + ".join(bk_signals[:4])  # Max 4 signals shown
+            parts.append(f"  Tonight: {bk_tier} breakout ({bk_score:.0f}/100) — {signal_str}")
+        elif bk_tier == "SUPPRESSED" and bk_signals:
+            parts.append(f"  Caution: {bk_signals[0]}")
+
+    # ---- Line 8: Why this play (the verdict) ----
     reasons = []
     hr = hit_rates or {}
     composite_hr = hr.get("composite", 0)
@@ -732,9 +779,12 @@ def build_deep_analysis(
         if opp_def > 112.0:
             reasons.append("soft matchup")
 
-    # Add cross-ref agreement as a reason
     if xref and xref.get("agreement", False) and len(xref.get("sources", [])) > 1:
         reasons.append("multi-source verified")
+
+    # Breakout signal as a reason
+    if breakout_signals and breakout_signals.get("breakout_tier") == "PRIME":
+        reasons.append("breakout conditions stacked")
 
     if reasons:
         parts.append(f"  Why: {' + '.join(reasons)}")
@@ -2673,11 +2723,36 @@ def slate_scan_edges(
             # Get vendor from the book line data
             play_vendor = book_lines[0].get("book", "FanDuel") if book_lines else "FanDuel"
 
+            # ---- Explosion Profile + Breakout Signals ----
+            stat_k_exp = prop_type_to_stat_key(prop_type)
+            exp_games, _ = fetch_player_games_multisource(
+                player_name, player_id, stat_k_exp, BASELINE_GAMES,
+                is_threes=prop_type_is_threes(prop_type)
+            )
+            explosion = compute_explosion_profile(exp_games, stat_k_exp)
+            breakout_signals = compute_pregame_breakout_score(
+                player_name, player_id, stat_k_exp, game_info, explosion, xref
+            )
+
+            print(f"[BOOM] {player_name}: profile={explosion.get('profile_type')} "
+                  f"explode={explosion.get('explosion_rate', 0)*100:.0f}% "
+                  f"volatility={explosion.get('volatility', 0):.2f} "
+                  f"breakout={breakout_signals.get('breakout_tier')} "
+                  f"({breakout_signals.get('breakout_score', 0):.0f}/100) "
+                  f"signals: {breakout_signals.get('signals', [])}")
+
             # Compute composite score: weight EV and probability most heavily
             hr_data = proj_result.hit_rates or {}
             # Boost score for multi-source agreement, penalize for disagreement
             xref_score_bonus = 5 if xref.get("agreement", True) and len(xref.get("sources", [])) > 1 else 0
             xref_score_penalty = -8 if not xref.get("agreement", True) else 0
+
+            # Breakout signals boost — when conditions are PRIME, weight the pick higher
+            breakout_bonus = 0
+            if breakout_signals.get("breakout_tier") == "PRIME":
+                breakout_bonus = 12
+            elif breakout_signals.get("breakout_tier") == "ELEVATED":
+                breakout_bonus = 5
 
             composite_score = (
                 proj_result.ev * 40 +           # EV is king
@@ -2686,7 +2761,8 @@ def slate_scan_edges(
                 proj_result.consistency * 10 +  # Consistency bonus
                 (5 if proj_result.is_breakout else 0) +  # Breakout bonus
                 xref_score_bonus +              # Multi-source agreement bonus
-                xref_score_penalty              # Data mismatch penalty
+                xref_score_penalty +            # Data mismatch penalty
+                breakout_bonus                  # Pre-game signal boost
             )
 
             play = {
@@ -2714,11 +2790,14 @@ def slate_scan_edges(
                 "base_avg": proj_result.base_avg,
                 "opp_team": opp_team,
                 "is_home": is_home,
+                "player_team": xref.get("espn_team", home_name if is_home else away_name),
                 "hit_rates": hr_data,
-                "xref": xref,  # Cross-reference data from ESPN
+                "xref": xref,
                 "xref_confidence": xref_confidence,
                 "adjusted_edge": adjusted_edge,
                 "adjusted_prob": adjusted_prob,
+                "explosion": explosion,
+                "breakout_signals": breakout_signals,
             }
 
             # Build deep analysis narrative (ESPN-first data + cross-ref)
@@ -2732,6 +2811,7 @@ def slate_scan_edges(
                 player_name, player_id, stat_k, best_line,
                 proj_result.proj, raw_games, opp_team, is_home,
                 proj_result.breakout_evidence, hr_data, xref,
+                explosion, breakout_signals,
             )
 
             plays.append(play)
@@ -3116,6 +3196,236 @@ def find_correlated_parlays(
 LADDER_RUNGS = [10.5, 15.5, 20.5, 25.5, 30.5, 35.5]
 
 
+# ============================================================================
+# SECTION 9b: EXPLOSION PROFILE + BREAKOUT SIGNAL ENGINE
+# ============================================================================
+
+def compute_explosion_profile(games: List[Dict], stat_key: str = "pts") -> Dict:
+    """
+    Model the player's scoring DISTRIBUTION, not just the average.
+    This is what makes alt line bets profitable — you're betting on the
+    right tail of the distribution, not the center.
+
+    Returns:
+      - explosion_rate: % of games they exceed 1.5x their average (boom games)
+      - ceiling_rate: % of games in the top 20% of their range
+      - volatility: coefficient of variation (high = wide range = good for alt lines)
+      - boom_avg: average score in their boom games (what their ceiling looks like)
+      - bust_rate: % of games below 0.6x their average (duds)
+      - best_window: are they MORE volatile recently? (opportunity signal)
+    """
+    if not games or len(games) < 8:
+        return {"explosion_rate": 0, "volatility": 0, "boom_avg": 0,
+                "ceiling_rate": 0, "bust_rate": 0, "best_window": "none",
+                "profile_type": "unknown"}
+
+    values = [g.get("value", 0) for g in games]
+    n = len(values)
+    avg = sum(values) / n
+    if avg < 1.0:
+        return {"explosion_rate": 0, "volatility": 0, "boom_avg": 0,
+                "ceiling_rate": 0, "bust_rate": 0, "best_window": "none",
+                "profile_type": "unknown"}
+
+    # Standard deviation and coefficient of variation
+    variance = sum((v - avg) ** 2 for v in values) / n
+    std_dev = variance ** 0.5
+    volatility = std_dev / avg  # CV: higher = more spread
+
+    # Explosion rate: games at 1.5x average or higher
+    boom_threshold = avg * 1.5
+    boom_games = [v for v in values if v >= boom_threshold]
+    explosion_rate = len(boom_games) / n
+    boom_avg = sum(boom_games) / len(boom_games) if boom_games else 0
+
+    # Ceiling rate: games in top 20% of their range
+    sorted_vals = sorted(values, reverse=True)
+    top_20_cutoff = sorted_vals[max(0, int(n * 0.2) - 1)] if n >= 5 else sorted_vals[0]
+    ceiling_games = [v for v in values if v >= top_20_cutoff]
+    ceiling_rate = len(ceiling_games) / n
+
+    # Bust rate: games below 0.6x average
+    bust_threshold = avg * 0.6
+    bust_rate = sum(1 for v in values if v < bust_threshold) / n
+
+    # Is their variance INCREASING recently? (more boom potential now)
+    l5 = values[:5] if n >= 5 else values
+    l5_max = max(l5) if l5 else 0
+    l5_avg = sum(l5) / len(l5) if l5 else 0
+    season_max = max(values)
+    recent_boom = l5_max >= boom_threshold
+
+    best_window = "none"
+    if recent_boom and l5_avg > avg * 1.10:
+        best_window = "hot_and_booming"
+    elif recent_boom:
+        best_window = "recent_boom"
+    elif l5_avg > avg * 1.10:
+        best_window = "trending_up"
+
+    # Profile type: tells you WHAT kind of bets this player suits
+    if volatility > 0.40 and explosion_rate >= 0.15:
+        profile_type = "boom_or_bust"      # High variance, frequent explosions -> ALT LINES
+    elif volatility < 0.25 and explosion_rate < 0.10:
+        profile_type = "steady_eddie"       # Low variance, few explosions -> STRAIGHTS only
+    elif explosion_rate >= 0.20:
+        profile_type = "ceiling_hunter"     # Frequent big games -> prime ALT LINE candidate
+    elif volatility > 0.35:
+        profile_type = "volatile"           # Wide range but not always up -> risky ALT
+    else:
+        profile_type = "moderate"           # Middle ground
+
+    return {
+        "explosion_rate": explosion_rate,
+        "boom_threshold": boom_threshold,
+        "boom_avg": boom_avg,
+        "volatility": volatility,
+        "std_dev": std_dev,
+        "ceiling_rate": ceiling_rate,
+        "bust_rate": bust_rate,
+        "best_window": best_window,
+        "recent_boom": recent_boom,
+        "profile_type": profile_type,
+        "season_max": season_max,
+    }
+
+
+def compute_pregame_breakout_score(
+    player_name: str,
+    player_id: int,
+    stat_key: str,
+    game_info: Dict,
+    explosion_profile: Dict,
+    xref: Dict = None,
+) -> Dict:
+    """
+    Pre-game signal aggregator: identifies spots where conditions STACK
+    to make a breakout game more likely TONIGHT. This is how you catch
+    the 35-point game before it happens.
+
+    Signals scored 0-10 each, summed into a composite breakout score.
+    Score >= 6 means conditions are primed for a ceiling game.
+
+    Signals checked:
+      1. Opponent pace (fast = more possessions = more points)
+      2. Opponent defensive rating (weak = easier scoring)
+      3. Opponent on back-to-back (fatigued defense)
+      4. Player rest advantage (extra rest = fresher legs)
+      5. Teammate injuries creating usage vacuum
+      6. Player's recent explosion window (hot + booming)
+      7. Historical ceiling frequency (has the player SHOWN this ceiling?)
+      8. Vegas total (high O/U = market expects scoring)
+    """
+    signals = []
+    total_score = 0.0
+
+    # ---- Signal 1: Opponent pace ----
+    opp_pace = game_info.get("pace", 100.0)
+    if opp_pace >= 102.0:
+        pace_score = min((opp_pace - 100.0) * 1.5, 10.0)
+        signals.append(f"Pace-up ({opp_pace:.0f})")
+        total_score += pace_score
+    elif opp_pace <= 96.0:
+        signals.append(f"Pace-down ({opp_pace:.0f})")
+        total_score -= 2.0
+
+    # ---- Signal 2: Opponent defensive weakness ----
+    opp_team = game_info.get("away_team", {}).get("full_name", "")
+    if not opp_team:
+        opp_team = game_info.get("home_team", {}).get("full_name", "")
+    opp_def = fetch_def_rating(opp_team, stat_key)
+    if opp_def > 114.0:
+        signals.append(f"Bottom-5 defense ({opp_def:.0f} DRTG)")
+        total_score += 8.0
+    elif opp_def > 112.0:
+        signals.append(f"Weak defense ({opp_def:.0f} DRTG)")
+        total_score += 5.0
+    elif opp_def > 110.0:
+        signals.append(f"Below-avg defense ({opp_def:.0f} DRTG)")
+        total_score += 2.0
+    elif opp_def < 107.0:
+        signals.append(f"Elite defense ({opp_def:.0f} DRTG)")
+        total_score -= 4.0
+
+    # ---- Signal 3: Opponent on back-to-back ----
+    # Check from ESPN scoreboard data if available
+    opp_b2b = game_info.get("opp_back_to_back", False)
+    if opp_b2b:
+        signals.append("Opp on B2B (tired legs)")
+        total_score += 6.0
+
+    # ---- Signal 4: Player rest advantage ----
+    player_rest_days = game_info.get("player_rest_days", 1)
+    if player_rest_days >= 3:
+        signals.append(f"Well-rested ({player_rest_days} days off)")
+        total_score += 4.0
+    elif player_rest_days >= 2:
+        signals.append("Extra rest")
+        total_score += 2.0
+
+    # ---- Signal 5: Teammate injury creating usage vacuum ----
+    # Check xref for injury news on teammates
+    injury_boost = game_info.get("teammate_injury_boost", 0)
+    if injury_boost > 0:
+        signals.append(f"Usage vacuum (+{injury_boost:.0f}% boost)")
+        total_score += min(injury_boost, 8.0)
+
+    # ---- Signal 6: Player's recent explosion window ----
+    exp = explosion_profile
+    if exp.get("best_window") == "hot_and_booming":
+        signals.append("HOT + recent boom game")
+        total_score += 8.0
+    elif exp.get("best_window") == "recent_boom":
+        signals.append("Recent boom game in L5")
+        total_score += 5.0
+    elif exp.get("best_window") == "trending_up":
+        signals.append("Trending up")
+        total_score += 3.0
+
+    # ---- Signal 7: Historical ceiling frequency ----
+    exp_rate = exp.get("explosion_rate", 0)
+    if exp_rate >= 0.25:
+        signals.append(f"Explodes {exp_rate*100:.0f}% of games")
+        total_score += 6.0
+    elif exp_rate >= 0.15:
+        signals.append(f"Boom rate {exp_rate*100:.0f}%")
+        total_score += 3.0
+
+    # ---- Signal 8: Vegas implied total ----
+    vegas_total = game_info.get("over_under", 0)
+    if vegas_total >= 230:
+        signals.append(f"High total ({vegas_total})")
+        total_score += 5.0
+    elif vegas_total >= 220:
+        signals.append(f"Elevated total ({vegas_total})")
+        total_score += 2.0
+    elif vegas_total > 0 and vegas_total < 210:
+        signals.append(f"Low total ({vegas_total})")
+        total_score -= 3.0
+
+    # ---- Composite ----
+    # Normalize to 0-100 scale
+    breakout_score = max(0, min(total_score * 2.5, 100))
+
+    # Tier the breakout potential
+    if breakout_score >= 60:
+        breakout_tier = "PRIME"       # Multiple signals stacking — tonight's the night
+    elif breakout_score >= 40:
+        breakout_tier = "ELEVATED"    # Good conditions, not overwhelming
+    elif breakout_score >= 20:
+        breakout_tier = "NEUTRAL"     # Nothing special either way
+    else:
+        breakout_tier = "SUPPRESSED"  # Bad conditions, avoid alt lines
+
+    return {
+        "breakout_score": breakout_score,
+        "breakout_tier": breakout_tier,
+        "signals": signals,
+        "raw_score": total_score,
+        "signal_count": len(signals),
+    }
+
+
 def _player_scoring_profile(games: List[Dict], line: float) -> Dict:
     """
     Build a scoring profile: floor, ceiling, consistency, hot streak, ceiling games.
@@ -3249,9 +3559,27 @@ def scan_ladder_plays(
 
             projection = proj_result.proj
 
-            # Build scoring profile from raw game data
-            games = bdl_last_n_games_stats(player_id, "pts", BASELINE_GAMES)
+            # Build scoring profile from ESPN-first data
+            games, data_src = fetch_player_games_multisource(
+                player_name, player_id, "pts", BASELINE_GAMES
+            )
             profile = _player_scoring_profile(games, avg_line)
+
+            # Explosion profile — determines if this player is ALT LINE material
+            explosion = compute_explosion_profile(games, "pts")
+
+            # Skip steady eddies for ladders — they don't boom
+            if explosion.get("profile_type") == "steady_eddie":
+                continue
+
+            # Cross-reference once, reuse for breakout + narrative
+            ladder_xref = cross_reference_player(player_name, player_id, "pts", games)
+
+            # Pre-game breakout signals — catch the boom BEFORE tip-off
+            breakout = compute_pregame_breakout_score(
+                player_name, player_id, "pts", game_info, explosion,
+                xref=ladder_xref,
+            )
 
             # Hit rates at each rung
             ladder_legs = []
@@ -3370,8 +3698,24 @@ def scan_ladder_plays(
             if streak >= 3:
                 narrative_parts.append(f"{streak}-game streak over line")
 
-            # ESPN cross-reference for ladders
-            ladder_xref = cross_reference_player(player_name, player_id, "pts", games)
+            # Explosion profile in narrative
+            exp_type = explosion.get("profile_type", "moderate")
+            exp_rate = explosion.get("explosion_rate", 0)
+            boom_avg = explosion.get("boom_avg", 0)
+            if exp_type in ("boom_or_bust", "ceiling_hunter"):
+                narrative_parts.append(f"Profile: {exp_type.upper()} (explodes {exp_rate*100:.0f}% of games, boom avg {boom_avg:.0f})")
+            elif exp_type == "volatile":
+                narrative_parts.append(f"Profile: VOLATILE (explodes {exp_rate*100:.0f}%)")
+
+            # Breakout signals in narrative
+            breakout_tier = breakout.get("breakout_tier", "NEUTRAL")
+            breakout_score = breakout.get("breakout_score", 0)
+            breakout_signals = breakout.get("signals", [])
+            if breakout_tier in ("PRIME", "ELEVATED"):
+                sig_str = ", ".join(breakout_signals[:3])
+                narrative_parts.append(f"BREAKOUT {breakout_tier} ({breakout_score:.0f}/100): {sig_str}")
+
+            # ESPN cross-reference for ladders (computed above, reused here)
             if ladder_xref and len(ladder_xref.get("sources", [])) > 1:
                 bdl_a = ladder_xref.get("bdl_avg", 0)
                 espn_a = ladder_xref.get("espn_avg", 0)
@@ -3406,6 +3750,8 @@ def scan_ladder_plays(
                 "bet_size": kelly_bet_size(best_leg["ev"] * 100, best_leg["prob"], BANKROLL),
                 "type": "ladder",
                 "profile": profile,
+                "explosion": explosion,
+                "breakout": breakout,
                 "narrative": narrative,
                 "vendor": vendor,
                 "opp_team": opp_team,
@@ -3414,12 +3760,20 @@ def scan_ladder_plays(
             }
             ladders.append(ladder)
 
-    # Sort by combination of EV and ceiling potential
-    ladders.sort(key=lambda l: -(
-        l["ev"] * 30 +
-        l["profile"].get("ceiling", 0) * 0.5 +
-        (10 if l.get("sweet_spot") else 0)
-    ))
+    # Sort by combination of EV, ceiling potential, explosion profile, and breakout score
+    def _ladder_sort_score(l):
+        ev_component = l["ev"] * 30
+        ceiling_component = l["profile"].get("ceiling", 0) * 0.5
+        sweet_bonus = 10 if l.get("sweet_spot") else 0
+        # Explosion bonus — boom_or_bust and ceiling_hunter profiles get priority
+        exp_type = l.get("explosion", {}).get("profile_type", "moderate")
+        exp_bonus = {"boom_or_bust": 15, "ceiling_hunter": 12, "volatile": 6}.get(exp_type, 0)
+        # Breakout bonus — PRIME and ELEVATED get priority
+        breakout_score = l.get("breakout", {}).get("breakout_score", 0)
+        breakout_bonus = breakout_score * 0.2  # 0-20 points from breakout
+        return ev_component + ceiling_component + sweet_bonus + exp_bonus + breakout_bonus
+
+    ladders.sort(key=lambda l: -_ladder_sort_score(l))
     return ladders[:6]
 
 
@@ -3429,106 +3783,46 @@ def scan_ladder_plays(
 
 def format_play_card(play: Dict, index: int) -> str:
     """
-    Format play card with full research-style analysis.
-    Multi-line output showing the STORY behind each pick.
+    Sharp bettor format — one clean card per pick with the full story.
+    No clutter. Every line earns its place.
     """
     player = play.get("player", "?")
     prop_type = play.get("prop_type", "pts")
     line = play.get("line", 0)
     proj = play.get("proj", 0)
     odds = play.get("odds", -110)
-    vendor = play.get("vendor", "FanDuel")
-    bet_size = play.get("bet_size", 0)
     prob = play.get("prob", play.get("prob_over", 0))
     ev = play.get("ev", 0)
     edge = play.get("edge", 0)
-
-    PROP_NAMES = {
-        "player_points": "PTS",
-        "player_rebounds": "REB",
-        "player_assists": "AST",
-        "player_threes": "3PM",
-        "player_blocks": "BLK",
-        "player_steals": "STL",
-    }
-    prop_name = PROP_NAMES.get(prop_type, "?")
-
-    breakout_tag = " *BREAKOUT*" if play.get("is_breakout") else ""
     tier = play.get("confidence_tier", "LEAN")
 
+    PROP_NAMES = {
+        "player_points": "PTS", "player_rebounds": "REB",
+        "player_assists": "AST", "player_threes": "3PM",
+        "player_blocks": "BLK", "player_steals": "STL",
+    }
+    prop_name = PROP_NAMES.get(prop_type, "?")
     odds_str = f"+{odds}" if odds > 0 else str(odds)
+    breakout_tag = " BREAKOUT" if play.get("is_breakout") else ""
 
-    # Hit rate line
+    # Hit rate — the most important number
     hr = play.get("hit_rates", {})
     l5_hits = hr.get("l5_hits", 0)
     l10_hits = hr.get("l10_hits", 0)
     base_hits = hr.get("base_hits", 0)
-    hit_line = f"  Hit Rate: {l5_hits}/5 L5 | {l10_hits}/10 L10 | {base_hits}/20 Szn"
 
-    # Use deep analysis if available, fall back to explain_play
+    # Build the card
+    lines = []
+    lines.append(f"{index}. {player} — {prop_name} OVER {line} ({odds_str})")
+    lines.append(f"   [{tier}]{breakout_tag} Proj {proj:.1f} | Edge {edge:.0f}% | EV +{ev:.2f}")
+    lines.append(f"   Hits: {l5_hits}/5 L5 | {l10_hits}/10 L10 | {base_hits}/20 szn")
+
+    # Deep analysis narrative — the "why"
     analysis = play.get("analysis", "")
-    if not analysis:
-        analysis = "  " + explain_play(play)
+    if analysis:
+        lines.append(analysis)
 
-    card = (
-        f"{index}. [{tier}] {player}{breakout_tag}\n"
-        f"  {prop_name} OVER {line} | {vendor} {odds_str} | ${bet_size:.0f}\n"
-        f"  Proj {proj:.1f} | Edge {edge:.1f}% | P={prob*100:.0f}% | EV +{ev:.2f}\n"
-        f"{hit_line}\n"
-        f"{analysis}"
-    )
-    return card
-
-
-def explain_play(play: Dict) -> str:
-    """
-    Generate analysis-style context: averages, trend, matchup, why this play.
-    """
-    parts = []
-
-    # Averages
-    l5_avg = play.get("l5_avg", 0)
-    l10_avg = play.get("l10_avg", 0)
-    base_avg = play.get("base_avg", 0)
-
-    if l5_avg > 0:
-        parts.append(f"Avg: {l5_avg:.1f} L5 / {l10_avg:.1f} L10 / {base_avg:.1f} Szn")
-
-    # Trend detection
-    if l5_avg > 0 and l10_avg > 0:
-        if l5_avg > l10_avg * 1.10:
-            parts.append("HEATING UP")
-        elif l5_avg < l10_avg * 0.90:
-            parts.append("cooling off")
-
-    # Matchup
-    opp_team = play.get("opp_team", "")
-    if opp_team:
-        short_opp = opp_team.split()[-1] if opp_team else ""
-        opp_def = fetch_def_rating(opp_team, play.get("stat_key", "pts"))
-        if opp_def > 112.0:
-            parts.append(f"vs {short_opp} (weak def)")
-        elif opp_def < 109.5:
-            parts.append(f"vs {short_opp} (elite def)")
-        else:
-            parts.append(f"vs {short_opp}")
-
-    # Home/away
-    parts.append("HOME" if play.get("is_home") else "ROAD")
-
-    # Breakout evidence
-    breakout_ev = play.get("breakout_evidence", {})
-    if breakout_ev:
-        if breakout_ev.get("minutes_trending_up"):
-            parts.append("mins trending up")
-        if breakout_ev.get("usage_pct"):
-            parts.append(f"USG {breakout_ev['usage_pct']:.0f}%")
-        cs = breakout_ev.get("consistency_score", 0)
-        if cs > 0.7:
-            parts.append("very consistent")
-
-    context = " | ".join(parts)
-    return context if context else "Neutral matchup"
+    return "\n".join(lines)
 
 
 def format_parlay_card(parlay: Dict) -> str:
@@ -3551,58 +3845,41 @@ def format_parlay_card(parlay: Dict) -> str:
 
 def format_ladder_card(ladder: Dict) -> str:
     """
-    Format ladder card with full analysis narrative.
-    Shows: player profile, why they're a ladder candidate, each rung with
-    hit rate evidence, and the recommended sweet spot play.
+    Clean ladder card — just the sweet spot play with the full story.
+    No rung-by-rung noise. Show what to bet and why.
     """
     player = ladder.get("player", "?")
     proj = ladder.get("projection", 0)
     main_line = ladder.get("main_line", 0)
     narrative = ladder.get("narrative", "")
-    vendor = ladder.get("vendor", "FanDuel")
-    legs = ladder.get("all_legs", [])
     sweet = ladder.get("sweet_spot")
+    best = ladder.get("best_leg", {})
     profile = ladder.get("profile", {})
+    explosion = ladder.get("explosion", {})
+    breakout = ladder.get("breakout", {})
+
+    # Pick the recommended rung
+    rec = sweet if sweet else best
+    if not rec:
+        return ""
+
+    rung = rec.get("rung", 0)
+    odds_str = rec.get("odds_str", str(rec.get("odds", -110)))
+    prob = rec.get("prob", 0)
+    hits = rec.get("hits", 0)
+    total = rec.get("total", 20)
+    ev = rec.get("ev", 0)
+    hr_pct = (hits / total * 100) if total > 0 else 0
+
+    # Breakout tag
+    breakout_tier = breakout.get("breakout_tier", "NEUTRAL")
+    breakout_tag = f" BREAKOUT" if breakout_tier in ("PRIME", "ELEVATED") else ""
 
     lines = []
-    lines.append(f"LADDER: {player} (Proj {proj:.1f} | Line {main_line})")
-    lines.append(f"  {narrative}")
-
-    # Show each rung with hit rate evidence
-    lines.append(f"  Rungs:")
-    for leg in legs:
-        rung = leg["rung"]
-        odds_str = leg.get("odds_str", str(leg["odds"]))
-        prob = leg["prob"]
-        hr = leg.get("hit_rate", 0)
-        hits = leg.get("hits", 0)
-        total = leg.get("total", 20)
-        ev = leg.get("ev", 0)
-
-        marker = ""
-        if sweet and leg["rung"] == sweet["rung"]:
-            marker = " << SWEET SPOT"
-        elif leg == ladder.get("best_leg"):
-            marker = " << BEST EV"
-
-        lines.append(
-            f"    {rung}+ {odds_str} | P={prob*100:.0f}% | "
-            f"Hit {hits}/{total} | EV {'+' if ev >= 0 else ''}{ev:.2f}{marker}"
-        )
-
-    # Recommendation
-    if sweet:
-        lines.append(
-            f"  PLAY: {player} {sweet['rung']}+ PTS {sweet.get('odds_str', '')} "
-            f"(hit {sweet.get('hits', 0)}/{sweet.get('total', 20)} szn, "
-            f"P={sweet['prob']*100:.0f}%)"
-        )
-    else:
-        best = ladder.get("best_leg", {})
-        lines.append(
-            f"  PLAY: {player} {best.get('rung', 0)}+ PTS "
-            f"(best EV at {best.get('odds_str', str(best.get('odds', -110)))})"
-        )
+    lines.append(f"{player} — {rung}+ PTS ({odds_str}){breakout_tag}")
+    lines.append(f"   Main line {main_line} | Proj {proj:.1f} | EV +{ev:.2f}")
+    lines.append(f"   Szn hit rate at {rung}+: {hits}/{total} ({hr_pct:.0f}%)")
+    lines.append(f"   {narrative}")
 
     return "\n".join(lines)
 
@@ -3710,6 +3987,47 @@ def record_sent(state: Dict, plays: List[Dict], now_ts: float) -> None:
         })
 
 
+def _enforce_one_per_team(plays: List[Dict]) -> List[Dict]:
+    """
+    Keep only the best play per team. Prevents 3 picks from the same roster.
+    Uses composite score to pick the strongest from each team.
+    """
+    best_by_team = {}
+    for play in plays:
+        # Try to extract team from opponent/home context
+        # The play's "team" is whoever the player is on
+        opp = play.get("opp_team", "")
+        is_home = play.get("is_home", True)
+        # Rough team identification from player's perspective
+        player_team = play.get("player_team", "")
+        if not player_team:
+            # Infer: if player is home, their team is the home side
+            player_team = f"team_{play.get('game_id', 'x')}_{('home' if is_home else 'away')}"
+
+        if player_team not in best_by_team:
+            best_by_team[player_team] = play
+        elif play.get("score", 0) > best_by_team[player_team].get("score", 0):
+            best_by_team[player_team] = play
+
+    return list(best_by_team.values())
+
+
+def _enforce_one_per_team_ladders(ladders: List[Dict]) -> List[Dict]:
+    """Keep only the best ladder per team."""
+    best_by_team = {}
+    for ladder in ladders:
+        opp = ladder.get("opp_team", "")
+        is_home = ladder.get("is_home", True)
+        player_team = f"lad_{ladder.get('game_id', 'x')}_{('home' if is_home else 'away')}"
+
+        if player_team not in best_by_team:
+            best_by_team[player_team] = ladder
+        elif ladder.get("ev", 0) > best_by_team[player_team].get("ev", 0):
+            best_by_team[player_team] = ladder
+
+    return list(best_by_team.values())
+
+
 def build_whatsapp_message(
     straights: List[Dict],
     plus_plays: List[Dict],
@@ -3718,7 +4036,11 @@ def build_whatsapp_message(
     ladders: List[Dict],
     state: Dict = None,
 ) -> str:
-    """Assemble WhatsApp message grouped by stat type with hit rates."""
+    """
+    Clean WhatsApp output — sharp bettor format.
+    Max 1 straight pick per team + 1 ladder per team.
+    Deep narrative on each pick. No clutter.
+    """
     if state is None:
         state = load_state()
 
@@ -3731,63 +4053,50 @@ def build_whatsapp_message(
 
     hit_rate_str = get_hit_rate_summary(state)
     if "No plays" not in hit_rate_str:
-        lines.append(f"Season: {hit_rate_str}")
+        lines.append(f"Record: {hit_rate_str}")
 
-    # Combine straights + plus_plays, then group by stat type
+    # ---- STRAIGHT PLAYS ----
+    # Combine all plays, sort by score, then enforce 1 per team
     all_plays = straights + plus_plays
+    all_plays.sort(key=lambda p: -p.get("score", 0))
+    filtered = _enforce_one_per_team(all_plays)
+    # Re-sort after filtering
+    filtered.sort(key=lambda p: (
+        {"LOCK": 0, "STRONG": 1, "LEAN": 2, "SKIP": 3}.get(p.get("confidence_tier", "LEAN"), 3),
+        -p.get("score", 0)
+    ))
+    # Cap total straight plays at 6
+    filtered = filtered[:6]
 
-    # Group by stat category
-    STAT_ORDER = ["pts", "reb", "ast", "threes", "blk", "stl"]
-    STAT_LABELS = {
-        "pts": "POINTS", "reb": "REBOUNDS", "ast": "ASSISTS",
-        "threes": "THREES", "blk": "BLOCKS", "stl": "STEALS",
-    }
-    grouped = {}
-    for play in all_plays:
-        sk = play.get("stat_key", "pts")
-        if sk not in grouped:
-            grouped[sk] = []
-        grouped[sk].append(play)
-
-    # Apply per-stat max picks
-    total_idx = 0
-    for stat_key in STAT_ORDER:
-        if stat_key not in grouped:
-            continue
-        stat_plays = grouped[stat_key]
-        # Sort by score descending within each stat
-        stat_plays.sort(key=lambda p: -p.get("score", 0))
-        # Cap per stat type
-        max_for_stat = STAT_MAX_PICKS.get(stat_key, 2)
-        stat_plays = stat_plays[:max_for_stat]
-
-        label = STAT_LABELS.get(stat_key, stat_key.upper())
-        lines.append(f"\n-- {label} --")
-        for play in stat_plays:
-            total_idx += 1
-            lines.append(format_play_card(play, total_idx))
+    if filtered:
+        lines.append("\n-- PLAYS --")
+        for idx, play in enumerate(filtered, 1):
+            lines.append(format_play_card(play, idx))
             lines.append("")
 
-    if total_idx == 0:
+    if not filtered:
         lines.append("\nNo qualifying plays today")
 
+    # ---- PARLAYS (keep minimal) ----
     if sgps or corr_parlays:
-        lines.append("\n-- PARLAYS --")
-        for sgp in sgps:
+        lines.append("-- PARLAYS --")
+        for sgp in (sgps + corr_parlays)[:3]:
             lines.append(format_parlay_card(sgp))
             lines.append("")
-        for parlay in corr_parlays:
-            lines.append(format_parlay_card(parlay))
-            lines.append("")
 
+    # ---- LADDERS ----
     if ladders:
-        lines.append("\n-- LADDERS --")
-        for ladder in ladders:
-            lines.append(format_ladder_card(ladder))
-            lines.append("")
+        # Enforce 1 ladder per team
+        filtered_ladders = _enforce_one_per_team_ladders(ladders)
+        filtered_ladders.sort(key=lambda l: -l.get("ev", 0))
+        filtered_ladders = filtered_ladders[:4]
 
-    total_kelly = sum(p.get("bet_size", 0) for p in all_plays[:total_idx])
-    lines.append(f"Total: ${total_kelly:.0f} across {total_idx} plays")
+        lines.append("-- ALT LINES --")
+        for ladder in filtered_ladders:
+            card = format_ladder_card(ladder)
+            if card:
+                lines.append(card)
+                lines.append("")
 
     return "\n".join(lines)
 
