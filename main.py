@@ -16,6 +16,8 @@ from dataclasses import dataclass, asdict
 from functools import lru_cache
 import traceback
 
+print("[INIT] ====== V2 ODDS API BUILD — IF YOU SEE THIS, NEW CODE IS RUNNING ======")
+
 try:
     import requests
     print("[INIT] requests loaded OK")
