@@ -3291,7 +3291,9 @@ def slate_scan_edges(
             l5_h = hr_data_check.get("l5_hits", 0)
             l10_h = hr_data_check.get("l10_hits", 0)
             base_h = hr_data_check.get("base_hits", 0)
-            if l5_h == 0 and l10_h == 0 and base_h == 0:
+            total_hits = l5_h + l10_h + base_h
+            print(f"[HR CHECK] {player_name} {prop_type}: L5={l5_h} L10={l10_h} SZN={base_h} (total={total_hits})")
+            if total_hits == 0:
                 print(f"[SKIP] {player_name} {prop_type}: 0/0/0 hit rates — no empirical support")
                 continue
 
@@ -4231,75 +4233,71 @@ def scan_ladder_plays(
                 xref=ladder_xref,
             )
 
-            # Hit rates at each rung
+            # Build alt line legs from REAL FanDuel lines only — no estimated odds
+            # Iterate the actual book_lines for this player, filter to +200 or higher
+            all_book_odds = [(bl.get("line", 0), bl.get("odds", 0)) for bl in book_lines]
+            plus200_lines = [(l, o) for l, o in all_book_odds if o >= 200]
+            print(f"[LADDER] {player_name}: main={avg_line}, proj={projection:.1f}, "
+                  f"total book lines={len(all_book_odds)}, +200 lines={len(plus200_lines)}")
+            if plus200_lines:
+                print(f"[LADDER] {player_name} +200 lines: {plus200_lines[:6]}")
             ladder_legs = []
-            for rung in LADDER_RUNGS:
-                if rung > projection * 1.8:
-                    continue  # Skip unreachable rungs
+            seen_lines = set()
 
-                # Find matching book line for this rung
-                best_odds = None
-                for bl in book_lines:
-                    line = bl.get("line", 0)
-                    if abs(line - rung) < 1.0:
-                        best_odds = bl.get("odds", -110)
-                        break
+            for bl in book_lines:
+                rung = bl.get("line", 0)
+                odds = bl.get("odds", -110)
 
-                # Estimate odds for alt lines based on distance from main line
-                # Real FanDuel alt lines: 15pt gap = +2000-5000, not +800
-                if best_odds is None:
-                    dist = rung - avg_line
-                    if dist < -15:
-                        best_odds = -550
-                    elif dist < -10:
-                        best_odds = -350
-                    elif dist < -5:
-                        best_odds = -200
-                    elif dist < -2:
-                        best_odds = -140
-                    elif dist < 0:
-                        best_odds = -120
-                    elif dist < 3:
-                        best_odds = +130
-                    elif dist < 5:
-                        best_odds = +200
-                    elif dist < 8:
-                        best_odds = +350
-                    elif dist < 10:
-                        best_odds = +500
-                    elif dist < 13:
-                        best_odds = +800
-                    elif dist < 16:
-                        best_odds = +1500
-                    elif dist < 20:
-                        best_odds = +2500
-                    elif dist < 25:
-                        best_odds = +4000
-                    else:
-                        best_odds = +6000
+                if not rung or rung <= 0:
+                    continue
+
+                # Only alt lines with +200 or higher odds
+                if odds < 200:
+                    continue
+
+                # Skip duplicates at same line
+                if rung in seen_lines:
+                    continue
+                seen_lines.add(rung)
+
+                # Sanity: skip rungs more than 2x the main line (unreachable)
+                if rung > avg_line * 2.2:
+                    continue
+
+                # Sanity: skip if projection is less than 60% of the rung
+                if projection < rung * 0.60:
+                    continue
 
                 z = (projection - rung) / proj_result.sigma if proj_result.sigma > 0 else 0
                 raw_prob = _norm_cdf(z)
                 prob = calibrated_prob(raw_prob)
 
-                # Also compute empirical hit rate at this rung
+                # Empirical hit rate at this rung
                 rung_hits = sum(1 for g in games if g.get("value", 0) > rung)
                 rung_hr = rung_hits / len(games) if games else 0
+
+                # Must have AT LEAST 1 historical hit at this rung
+                if rung_hits == 0:
+                    continue
 
                 # Blend model + empirical
                 blended_prob = 0.40 * prob + 0.60 * rung_hr
 
-                if blended_prob < 0.15:
+                if blended_prob < 0.05:
                     continue
 
-                ev = ev_per_dollar(blended_prob, best_odds)
+                ev = ev_per_dollar(blended_prob, odds)
 
-                odds_str = f"+{best_odds}" if best_odds > 0 else str(best_odds)
+                # Only keep if +EV
+                if ev < 0.05:
+                    continue
+
+                odds_str = f"+{odds}" if odds > 0 else str(odds)
 
                 ladder_legs.append({
                     "rung": rung,
                     "line": rung,
-                    "odds": best_odds,
+                    "odds": odds,
                     "odds_str": odds_str,
                     "prob": blended_prob,
                     "model_prob": prob,
@@ -4307,9 +4305,10 @@ def scan_ladder_plays(
                     "hits": rung_hits,
                     "total": len(games),
                     "ev": ev,
+                    "real_odds": True,  # Flag: these are REAL FanDuel odds
                 })
 
-            if len(ladder_legs) < 2:
+            if not ladder_legs:
                 continue
 
             best_leg = max(ladder_legs, key=lambda x: x["ev"])
@@ -4396,12 +4395,8 @@ def scan_ladder_plays(
 
             narrative = " | ".join(narrative_parts)
 
-            # Ladder recommendation
-            # Find the "sweet spot" rung — highest rung with prob > 0.45 and EV > 0
-            plus_odds_legs = [l for l in ladder_legs if l["odds"] >= 200]
-            sweet_spot = None
-            if plus_odds_legs:
-                sweet_spot = max(plus_odds_legs, key=lambda x: x["ev"])
+            # Sweet spot = the leg with the best EV (all legs are already +200)
+            sweet_spot = best_leg
 
             ladder = {
                 "player": player_name,
