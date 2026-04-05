@@ -43,6 +43,7 @@ RECIPIENT_WHATSAPP = os.getenv("RECIPIENT_WHATSAPP", "")
 
 BALLDONTLIE_API_KEY = os.getenv("BALLDONTLIE_API_KEY", "")
 LINEUP_EXPERTS_API_KEY = os.getenv("LINEUP_EXPERTS_API_KEY", "")
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 
 BANKROLL = float(os.getenv("BANKROLL", "500.0"))
 STATE_FILE = os.getenv("STATE_FILE", "/tmp/nba_props_state.json")
@@ -2669,6 +2670,357 @@ def compute_usage_vacuum(
 
 
 # ============================================================================
+# SECTION 4E: THE ODDS API — REAL FANDUEL ALT LINES
+# ============================================================================
+# BDL only returns 1 main line per player per prop (confirmed by logs).
+# The Odds API v4 provides real FanDuel alternate player props with actual odds.
+# Free tier: 500 credits. Each /events call = 1 credit, each /events/{id}/odds = 1 credit.
+# Strategy: fetch event list (1 credit), then alt props per event (1 credit each).
+# Total cost per run: ~1 + N_games credits.
+# ============================================================================
+
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+ODDS_API_SPORT = "basketball_nba"
+ODDS_API_CACHE: Dict[str, Any] = {}
+
+
+def odds_api_available() -> bool:
+    """Check if The Odds API is configured."""
+    return bool(ODDS_API_KEY) and requests is not None
+
+
+def odds_api_fetch_events() -> List[Dict]:
+    """
+    Fetch today's NBA events from The Odds API.
+    Returns list of events with id, home_team, away_team, commence_time.
+    Cost: 1 credit.
+    """
+    if not odds_api_available():
+        print("[ODDS-API] Skipped: no API key or requests missing")
+        return []
+
+    cache_key = "events_today"
+    if cache_key in ODDS_API_CACHE:
+        return ODDS_API_CACHE[cache_key]
+
+    url = f"{ODDS_API_BASE}/sports/{ODDS_API_SPORT}/events"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "dateFormat": "iso",
+    }
+
+    try:
+        resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        print(f"[ODDS-API] /events -> {resp.status_code}")
+
+        if resp.status_code != 200:
+            print(f"[ODDS-API] events error: {resp.text[:300]}")
+            remaining = resp.headers.get("x-requests-remaining", "?")
+            print(f"[ODDS-API] Credits remaining: {remaining}")
+            return []
+
+        remaining = resp.headers.get("x-requests-remaining", "?")
+        used = resp.headers.get("x-requests-used", "?")
+        print(f"[ODDS-API] Credits: used={used}, remaining={remaining}")
+
+        events = resp.json()
+        if not isinstance(events, list):
+            events = events.get("data", [])
+
+        print(f"[ODDS-API] Found {len(events)} NBA events")
+        ODDS_API_CACHE[cache_key] = events
+        return events
+
+    except Exception as e:
+        print(f"[ODDS-API] events exception: {e}")
+        return []
+
+
+def odds_api_fetch_player_props(event_id: str, market: str = "player_points") -> Dict:
+    """
+    Fetch alternate player prop lines for a single event from The Odds API.
+    Returns dict: {player_name_lower: [{line, odds, book}]}
+
+    Markets: player_points, player_rebounds, player_assists,
+             player_threes, player_blocks, player_steals
+
+    The alternate markets use suffix '_alternate':
+      player_points_alternate, player_rebounds_alternate, etc.
+
+    We fetch BOTH the main market AND the alternate market to get full coverage.
+    Cost: 1 credit per call.
+    """
+    if not odds_api_available():
+        return {}
+
+    cache_key = f"props_{event_id}_{market}"
+    if cache_key in ODDS_API_CACHE:
+        return ODDS_API_CACHE[cache_key]
+
+    # Fetch both main and alternate markets in one call
+    alt_market = f"{market}_alternate"
+    markets_str = f"{market},{alt_market}"
+
+    url = f"{ODDS_API_BASE}/sports/{ODDS_API_SPORT}/events/{event_id}/odds"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": "us",
+        "markets": markets_str,
+        "bookmakers": "fanduel",
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+    }
+
+    result: Dict[str, List[Dict]] = {}
+
+    try:
+        resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        print(f"[ODDS-API] /events/{event_id[:8]}.../odds ({market}) -> {resp.status_code}")
+
+        if resp.status_code != 200:
+            print(f"[ODDS-API] props error: {resp.text[:300]}")
+            ODDS_API_CACHE[cache_key] = result
+            return result
+
+        data = resp.json()
+
+        # Response structure:
+        # {id, bookmakers: [{key: "fanduel", markets: [{key: "player_points_alternate",
+        #   outcomes: [{name: "Stephen Curry", description: "Over", point: 29.5, price: 250}]}]}]}
+        bookmakers = data.get("bookmakers", [])
+        if not bookmakers:
+            print(f"[ODDS-API] No FanDuel data for event {event_id[:8]}...")
+            ODDS_API_CACHE[cache_key] = result
+            return result
+
+        total_lines = 0
+        alt_lines = 0
+
+        for bk in bookmakers:
+            if bk.get("key", "").lower() != "fanduel":
+                continue
+
+            for mkt in bk.get("markets", []):
+                mkt_key = mkt.get("key", "")
+                is_alt = "_alternate" in mkt_key
+
+                for outcome in mkt.get("outcomes", []):
+                    # Only "Over" outcomes (we bet overs)
+                    desc = outcome.get("description", "").lower()
+                    if desc != "over":
+                        continue
+
+                    player_name = outcome.get("name", "")
+                    point = outcome.get("point", 0)
+                    price = outcome.get("price", -110)
+
+                    if not player_name or not point:
+                        continue
+
+                    # Normalize player name for matching
+                    name_key = player_name.strip().lower()
+
+                    if name_key not in result:
+                        result[name_key] = []
+
+                    result[name_key].append({
+                        "line": float(point),
+                        "odds": int(price),
+                        "book": "FanDuel",
+                        "is_alt": is_alt,
+                        "source": "odds_api",
+                    })
+                    total_lines += 1
+                    if is_alt:
+                        alt_lines += 1
+
+        print(f"[ODDS-API] Event {event_id[:8]}...: {len(result)} players, "
+              f"{total_lines} total lines, {alt_lines} alt lines")
+
+        ODDS_API_CACHE[cache_key] = result
+        return result
+
+    except Exception as e:
+        print(f"[ODDS-API] props exception: {e}")
+        ODDS_API_CACHE[cache_key] = result
+        return result
+
+
+def _normalize_name(name: str) -> str:
+    """Normalize a player name for fuzzy matching: lowercase, strip suffixes like Jr./III/II."""
+    n = name.strip().lower()
+    # Remove common suffixes
+    for suffix in [" jr.", " jr", " sr.", " sr", " iii", " ii", " iv", " v"]:
+        if n.endswith(suffix):
+            n = n[: -len(suffix)].strip()
+    # Remove periods and extra spaces
+    n = n.replace(".", "").replace("  ", " ")
+    return n
+
+
+def _match_odds_api_player(odds_api_names: Dict, bdl_player_name: str) -> Optional[str]:
+    """
+    Match a BDL player name to an Odds API player name key.
+    Tries exact match first, then normalized match, then last-name match.
+    Returns the odds_api name key or None.
+    """
+    bdl_lower = bdl_player_name.strip().lower()
+
+    # Exact match
+    if bdl_lower in odds_api_names:
+        return bdl_lower
+
+    # Normalized match
+    bdl_norm = _normalize_name(bdl_player_name)
+    for oa_key in odds_api_names:
+        if _normalize_name(oa_key) == bdl_norm:
+            return oa_key
+
+    # Last name + first initial match (handles "S. Curry" vs "Stephen Curry")
+    bdl_parts = bdl_norm.split()
+    if len(bdl_parts) >= 2:
+        bdl_last = bdl_parts[-1]
+        bdl_first_init = bdl_parts[0][0] if bdl_parts[0] else ""
+        for oa_key in odds_api_names:
+            oa_norm = _normalize_name(oa_key)
+            oa_parts = oa_norm.split()
+            if len(oa_parts) >= 2:
+                oa_last = oa_parts[-1]
+                oa_first_init = oa_parts[0][0] if oa_parts[0] else ""
+                if bdl_last == oa_last and bdl_first_init == oa_first_init:
+                    return oa_key
+
+    return None
+
+
+def _match_bdl_game_to_odds_event(game_info: Dict, events: List[Dict]) -> Optional[str]:
+    """
+    Match a BDL game to an Odds API event by team names.
+    Returns the Odds API event_id or None.
+    """
+    home = game_info.get("home_team", {})
+    away = game_info.get("away_team", {})
+
+    # BDL uses full_name like "Los Angeles Lakers" or abbreviation
+    home_name = (home.get("full_name") or home.get("name") or "").lower()
+    away_name = (away.get("full_name") or away.get("name") or "").lower()
+    home_abbr = (home.get("abbreviation") or "").lower()
+    away_abbr = (away.get("abbreviation") or "").lower()
+
+    for ev in events:
+        # Odds API uses team names like "Los Angeles Lakers"
+        ev_home = (ev.get("home_team") or "").lower()
+        ev_away = (ev.get("away_team") or "").lower()
+
+        # Match by full name containment (handles slight name differences)
+        home_match = (
+            home_name and ev_home and (
+                home_name in ev_home or ev_home in home_name
+                or home_name.split()[-1] in ev_home  # Last word match (e.g. "Lakers")
+            )
+        )
+        away_match = (
+            away_name and ev_away and (
+                away_name in ev_away or ev_away in away_name
+                or away_name.split()[-1] in ev_away
+            )
+        )
+
+        if home_match and away_match:
+            return ev.get("id")
+
+    return None
+
+
+def enrich_lines_map_with_odds_api(lines_map: Dict, games_map: Dict) -> int:
+    """
+    Enrich the lines_map with real FanDuel alt lines from The Odds API.
+    For each game, fetches alt player_points lines and merges them into the
+    existing book_lines list for each player.
+
+    Returns the total number of alt lines added.
+    """
+    if not odds_api_available():
+        print("[ODDS-API] Not configured — skipping alt line enrichment")
+        return 0
+
+    print("[ODDS-API] Fetching events for alt line enrichment...")
+    events = odds_api_fetch_events()
+    if not events:
+        print("[ODDS-API] No events found")
+        return 0
+
+    total_added = 0
+    games_matched = 0
+
+    for game_id, game_info in games_map.items():
+        event_id = _match_bdl_game_to_odds_event(game_info, events)
+        if not event_id:
+            home_name = game_info.get("home_team", {}).get("full_name", "?")
+            away_name = game_info.get("away_team", {}).get("full_name", "?")
+            print(f"[ODDS-API] No event match for BDL game {game_id} ({away_name} @ {home_name})")
+            continue
+
+        games_matched += 1
+
+        # Fetch alt lines for player_points (primary ladder market)
+        alt_data = odds_api_fetch_player_props(event_id, "player_points")
+        if not alt_data:
+            continue
+
+        # Merge into lines_map
+        game_lines = lines_map.get(game_id, {})
+        points_lines = game_lines.get("player_points", {})
+
+        for bdl_player_name, bdl_book_lines in points_lines.items():
+            # Try to match this BDL player to an Odds API player
+            oa_key = _match_odds_api_player(alt_data, bdl_player_name)
+            if not oa_key:
+                continue
+
+            oa_lines = alt_data[oa_key]
+
+            # Get existing lines for dedup
+            existing_lines = {bl.get("line") for bl in bdl_book_lines}
+
+            # Get player_id from existing BDL lines
+            player_id = None
+            for bl in bdl_book_lines:
+                if bl.get("player_id"):
+                    player_id = bl["player_id"]
+                    break
+
+            added_for_player = 0
+            for oa_line in oa_lines:
+                line_val = oa_line["line"]
+                # Skip if we already have this exact line
+                if line_val in existing_lines:
+                    continue
+
+                # Add to the player's book_lines
+                new_entry = {
+                    "book": "FanDuel",
+                    "line": line_val,
+                    "odds": oa_line["odds"],
+                    "player_id": player_id,
+                    "source": "odds_api",
+                    "is_alt": oa_line.get("is_alt", True),
+                }
+                bdl_book_lines.append(new_entry)
+                existing_lines.add(line_val)
+                added_for_player += 1
+                total_added += 1
+
+            if added_for_player > 0:
+                print(f"[ODDS-API] {bdl_player_name}: +{added_for_player} alt lines "
+                      f"(now {len(bdl_book_lines)} total)")
+
+    print(f"[ODDS-API] Enrichment complete: {games_matched}/{len(games_map)} games matched, "
+          f"{total_added} alt lines added")
+    return total_added
+
+
+# ============================================================================
 # SECTION 5: PROJECTION ENGINE
 # ============================================================================
 
@@ -3176,6 +3528,11 @@ def build_today_props(now_et: datetime = None) -> Tuple[Dict, Dict]:
 
     # Enrich games with ESPN scoreboard data (Vegas O/U, B2B, spread)
     enrich_games_map_with_espn(games_map)
+
+    # Enrich lines with REAL FanDuel alt lines from The Odds API
+    # This adds alternate player_points lines (+200, +300, etc.) that BDL doesn't provide
+    alt_count = enrich_lines_map_with_odds_api(lines_map, games_map)
+    print(f"[INFO] Odds API enrichment: {alt_count} alt lines added to lines_map")
 
     return (lines_map, games_map)
 
