@@ -566,6 +566,8 @@ def build_deep_analysis(
     xref: Dict = None,
     explosion: Dict = None,
     breakout_signals: Dict = None,
+    matchup: Dict = None,
+    vacuum: Dict = None,
 ) -> str:
     """
     Build a multi-line research-style analysis for a pick.
@@ -753,7 +755,17 @@ def build_deep_analysis(
         elif bk_tier == "SUPPRESSED" and bk_signals:
             parts.append(f"  Caution: {bk_signals[0]}")
 
-    # ---- Line 8: Why this play (the verdict) ----
+    # ---- Line 8: Matchup history ----
+    if matchup and matchup.get("games_vs", 0) >= 2:
+        assessment = matchup.get("assessment", "NEUTRAL")
+        if assessment in ("FEAST", "STRUGGLE"):
+            parts.append(f"  Matchup: {matchup.get('narrative', '')}")
+
+    # ---- Line 9: Usage vacuum ----
+    if vacuum and vacuum.get("has_vacuum"):
+        parts.append(f"  {vacuum.get('narrative', '')}")
+
+    # ---- Line 10: Why this play (the verdict) ----
     reasons = []
     hr = hit_rates or {}
     composite_hr = hr.get("composite", 0)
@@ -785,6 +797,14 @@ def build_deep_analysis(
     # Breakout signal as a reason
     if breakout_signals and breakout_signals.get("breakout_tier") == "PRIME":
         reasons.append("breakout conditions stacked")
+
+    # Matchup history as a reason
+    if matchup and matchup.get("assessment") == "FEAST":
+        reasons.append(f"feasts on this matchup")
+
+    # Usage vacuum as a reason
+    if vacuum and vacuum.get("has_vacuum"):
+        reasons.append(f"usage vacuum (+{vacuum.get('total_boost', 0):.1f} boost)")
 
     if reasons:
         parts.append(f"  Why: {' + '.join(reasons)}")
@@ -2139,6 +2159,516 @@ def fetch_def_rating(opp_team: str, stat_key: str) -> float:
 
 
 # ============================================================================
+# SECTION 4B: ESPN SCOREBOARD ENRICHMENT (LIVE DATA)
+# ============================================================================
+
+ESPN_SCOREBOARD_CACHE: Dict = {}
+
+
+def espn_fetch_scoreboard(date_str: str = None) -> List[Dict]:
+    """
+    Fetch ESPN scoreboard for a date. Returns enriched game data including:
+    - Vegas O/U (over_under)
+    - Spread
+    - Team pace ratings
+    - Whether each team is on a back-to-back
+
+    ESPN scoreboard endpoint:
+      site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates=YYYYMMDD
+    Response: {events: [{competitions: [{odds: [...], competitors: [...]}]}]}
+    """
+    if not requests:
+        return []
+
+    if date_str is None:
+        date_str = _now_et().strftime("%Y%m%d")
+
+    cache_key = f"sb_{date_str}"
+    if cache_key in ESPN_SCOREBOARD_CACHE:
+        return ESPN_SCOREBOARD_CACHE[cache_key]
+
+    try:
+        resp = requests.get(
+            ESPN_SCOREBOARD,
+            params={"dates": date_str},
+            timeout=10,
+        )
+        print(f"[ESPN] Scoreboard {date_str} -> {resp.status_code}")
+
+        if resp.status_code != 200:
+            ESPN_SCOREBOARD_CACHE[cache_key] = []
+            return []
+
+        data = resp.json()
+        events = data.get("events", [])
+        print(f"[ESPN] Scoreboard: {len(events)} games found")
+
+        result = []
+        for event in events:
+            comps = event.get("competitions", [])
+            if not comps:
+                continue
+            comp = comps[0]
+
+            game = {
+                "espn_id": event.get("id", ""),
+                "name": event.get("name", ""),
+                "short_name": event.get("shortName", ""),
+                "status": comp.get("status", {}).get("type", {}).get("name", ""),
+            }
+
+            # --- Odds data (Vegas O/U, spread) ---
+            odds_list = comp.get("odds", [])
+            if odds_list:
+                odds = odds_list[0]
+                game["over_under"] = _safe_float(str(odds.get("overUnder", 0)))
+                game["spread"] = _safe_float(str(odds.get("spread", 0)))
+                game["home_ml"] = odds.get("homeTeamOdds", {}).get("moneyLine", 0)
+                game["away_ml"] = odds.get("awayTeamOdds", {}).get("moneyLine", 0)
+
+            # --- Team data ---
+            competitors = comp.get("competitors", [])
+            for team_data in competitors:
+                team_obj = team_data.get("team", {})
+                team_name = team_obj.get("displayName", "")
+                team_abbr = team_obj.get("abbreviation", "")
+                home_away = team_data.get("homeAway", "")
+
+                if home_away == "home":
+                    game["home_name"] = team_name
+                    game["home_abbr"] = team_abbr
+                    game["home_id"] = team_obj.get("id", "")
+                else:
+                    game["away_name"] = team_name
+                    game["away_abbr"] = team_abbr
+                    game["away_id"] = team_obj.get("id", "")
+
+            result.append(game)
+
+        ESPN_SCOREBOARD_CACHE[cache_key] = result
+        return result
+
+    except Exception as e:
+        print(f"[ESPN] Scoreboard error: {e}")
+        ESPN_SCOREBOARD_CACHE[cache_key] = []
+        return []
+
+
+def espn_detect_back_to_back(date_str: str = None) -> Dict[str, bool]:
+    """
+    Detect which teams are on a back-to-back by checking yesterday's scoreboard.
+    Returns: {team_name: True} for teams that played yesterday.
+    """
+    if date_str is None:
+        yesterday = _now_et() - timedelta(days=1)
+        date_str = yesterday.strftime("%Y%m%d")
+
+    games = espn_fetch_scoreboard(date_str)
+    b2b_teams = {}
+
+    for game in games:
+        status = game.get("status", "")
+        # Only count completed or in-progress games
+        if status in ("STATUS_FINAL", "STATUS_IN_PROGRESS", "STATUS_END_PERIOD"):
+            for key in ("home_name", "away_name"):
+                team = game.get(key, "")
+                if team:
+                    b2b_teams[team] = True
+                    # Also store abbreviation for matching
+                    abbr_key = key.replace("_name", "_abbr")
+                    abbr = game.get(abbr_key, "")
+                    if abbr:
+                        b2b_teams[abbr] = True
+
+    print(f"[B2B] Yesterday's games: {len(b2b_teams) // 2} teams played")
+    return b2b_teams
+
+
+def enrich_games_map_with_espn(games_map: Dict) -> None:
+    """
+    Enrich the BDL games_map with ESPN scoreboard data:
+    - over_under (Vegas O/U)
+    - opp_back_to_back for each team
+    - ESPN-sourced pace/spread
+
+    Mutates games_map in place.
+    """
+    # Get today's ESPN scoreboard
+    today_str = _now_et().strftime("%Y%m%d")
+    espn_games = espn_fetch_scoreboard(today_str)
+
+    # Build lookup by team names for matching BDL games to ESPN games
+    espn_by_teams = {}
+    for eg in espn_games:
+        home = eg.get("home_name", "")
+        away = eg.get("away_name", "")
+        if home and away:
+            espn_by_teams[(home, away)] = eg
+
+    # Detect B2Bs from yesterday
+    b2b_teams = espn_detect_back_to_back()
+
+    for game_id, game_info in games_map.items():
+        home_team = game_info.get("home_team", {})
+        away_team = game_info.get("away_team", {})
+        home_name = home_team.get("full_name", home_team.get("name", ""))
+        away_name = away_team.get("full_name", away_team.get("name", ""))
+
+        # Match to ESPN game
+        espn_game = espn_by_teams.get((home_name, away_name))
+        if not espn_game:
+            # Try fuzzy match — last word of team name
+            for (eh, ea), eg in espn_by_teams.items():
+                if (home_name.split()[-1:] == eh.split()[-1:] and
+                    away_name.split()[-1:] == ea.split()[-1:]):
+                    espn_game = eg
+                    break
+
+        if espn_game:
+            # Vegas O/U
+            ou = espn_game.get("over_under", 0)
+            if ou > 0:
+                game_info["over_under"] = ou
+                game_info["game_total"] = ou  # Also update the BDL field
+
+            # Spread
+            spread = espn_game.get("spread", 0)
+            if spread:
+                game_info["espn_spread"] = spread
+
+            print(f"[ENRICH] {away_name} @ {home_name}: O/U={ou}, spread={spread}")
+
+        # B2B detection for both teams
+        home_b2b = b2b_teams.get(home_name, False) or b2b_teams.get(
+            home_team.get("abbreviation", ""), False
+        )
+        away_b2b = b2b_teams.get(away_name, False) or b2b_teams.get(
+            away_team.get("abbreviation", ""), False
+        )
+
+        game_info["home_b2b"] = home_b2b
+        game_info["away_b2b"] = away_b2b
+
+        if home_b2b:
+            print(f"[B2B] {home_name} on back-to-back")
+        if away_b2b:
+            print(f"[B2B] {away_name} on back-to-back")
+
+
+# ============================================================================
+# SECTION 4C: MATCHUP HISTORY ENGINE
+# ============================================================================
+
+MATCHUP_HISTORY_CACHE: Dict = {}
+
+
+def fetch_matchup_history(
+    player_name: str,
+    player_id: int,
+    opp_team: str,
+    stat_key: str = "pts",
+    is_threes: bool = False,
+) -> Dict:
+    """
+    Fetch how a player performs against a SPECIFIC opponent historically.
+    Uses BDL stats endpoint filtered by opponent team.
+    Some players feast on certain teams — this catches that pattern.
+
+    Returns:
+    {
+        "games_vs": int,          # games found against this opponent
+        "avg_vs": float,          # average stat vs this opponent
+        "avg_all": float,         # season average for comparison
+        "matchup_delta": float,   # avg_vs - avg_all (positive = they feast)
+        "matchup_pct": float,     # percentage above/below season avg
+        "high_vs": float,         # best game vs this opponent
+        "hit_rate_vs": float,     # empirical rate of clearing avg_all against opp
+        "assessment": str,        # "FEAST" / "NEUTRAL" / "STRUGGLE"
+        "narrative": str,         # human-readable summary
+    }
+    """
+    cache_key = f"matchup_{player_id}_{_clean_name(opp_team)}_{stat_key}"
+    if cache_key in MATCHUP_HISTORY_CACHE:
+        return MATCHUP_HISTORY_CACHE[cache_key]
+
+    result = {
+        "games_vs": 0,
+        "avg_vs": 0.0,
+        "avg_all": 0.0,
+        "matchup_delta": 0.0,
+        "matchup_pct": 0.0,
+        "high_vs": 0.0,
+        "hit_rate_vs": 0.0,
+        "assessment": "NEUTRAL",
+        "narrative": "",
+    }
+
+    # Get the opponent's BDL team ID for filtering
+    opp_full = normalize_team_name(opp_team)
+    opp_team_id = bdl_team_name_to_id(opp_full)
+
+    if not opp_team_id or not player_id:
+        MATCHUP_HISTORY_CACHE[cache_key] = result
+        return result
+
+    # Fetch this season's stats for the player
+    season = _season_year()
+    resp = _bdl_get("stats", {
+        "player_ids[]": player_id,
+        "seasons[]": season,
+        "per_page": 82,  # Full season
+    })
+    all_games = resp.get("data", [])
+
+    if not all_games:
+        MATCHUP_HISTORY_CACHE[cache_key] = result
+        return result
+
+    # Also try prior season for more matchup data
+    prior_resp = _bdl_get("stats", {
+        "player_ids[]": player_id,
+        "seasons[]": season - 1,
+        "per_page": 82,
+    })
+    prior_games = prior_resp.get("data", [])
+
+    all_seasons = all_games + prior_games
+
+    # Extract stat field
+    field = "fg3m" if is_threes or stat_key == "threes" else stat_key
+
+    # Separate games vs this opponent from all games
+    vs_values = []
+    all_values = []
+
+    for game in all_seasons:
+        if not game:
+            continue
+        val = float(game.get(field, 0) or 0)
+
+        # Determine opponent from game object
+        game_obj = game.get("game", {})
+        if isinstance(game_obj, dict):
+            home_id = game_obj.get("home_team_id", 0)
+            away_id = game_obj.get("visitor_team_id", 0)
+            # If opponent's team ID matches home or away, this was a matchup
+            if home_id == opp_team_id or away_id == opp_team_id:
+                vs_values.append(val)
+
+        all_values.append(val)
+
+    if not all_values:
+        MATCHUP_HISTORY_CACHE[cache_key] = result
+        return result
+
+    avg_all = sum(all_values) / len(all_values)
+    result["avg_all"] = avg_all
+    result["games_vs"] = len(vs_values)
+
+    if vs_values:
+        avg_vs = sum(vs_values) / len(vs_values)
+        result["avg_vs"] = avg_vs
+        result["high_vs"] = max(vs_values)
+        result["matchup_delta"] = avg_vs - avg_all
+        result["matchup_pct"] = ((avg_vs - avg_all) / avg_all * 100) if avg_all > 0 else 0
+
+        # Hit rate vs this opponent at their own season average
+        hits_vs = sum(1 for v in vs_values if v > avg_all)
+        result["hit_rate_vs"] = hits_vs / len(vs_values) if vs_values else 0
+
+        # Assessment
+        if result["matchup_pct"] > 15 and len(vs_values) >= 2:
+            result["assessment"] = "FEAST"
+            result["narrative"] = (
+                f"Feasts on {opp_full.split()[-1]}: {avg_vs:.1f} avg in "
+                f"{len(vs_values)} games vs ({avg_all:.1f} szn avg, "
+                f"+{result['matchup_pct']:.0f}%), high of {result['high_vs']:.0f}"
+            )
+        elif result["matchup_pct"] < -15 and len(vs_values) >= 2:
+            result["assessment"] = "STRUGGLE"
+            result["narrative"] = (
+                f"Struggles vs {opp_full.split()[-1]}: {avg_vs:.1f} avg in "
+                f"{len(vs_values)} games ({result['matchup_pct']:.0f}% below szn avg)"
+            )
+        else:
+            result["assessment"] = "NEUTRAL"
+            if vs_values:
+                result["narrative"] = (
+                    f"vs {opp_full.split()[-1]}: {avg_vs:.1f} in "
+                    f"{len(vs_values)} games (szn avg {avg_all:.1f})"
+                )
+
+    print(f"[MATCHUP] {player_name} vs {opp_full}: {len(vs_values)} games, "
+          f"avg {result['avg_vs']:.1f} vs szn {avg_all:.1f} -> {result['assessment']}")
+
+    MATCHUP_HISTORY_CACHE[cache_key] = result
+    return result
+
+
+# ============================================================================
+# SECTION 4D: USAGE VACUUM MODEL
+# ============================================================================
+
+USAGE_VACUUM_CACHE: Dict = {}
+
+
+def compute_usage_vacuum(
+    player_name: str,
+    player_id: int,
+    game_info: Dict,
+    stat_key: str = "pts",
+) -> Dict:
+    """
+    When a key teammate is OUT, their shots/touches redistribute.
+    This model estimates HOW MUCH of an absent player's production
+    flows to the target player.
+
+    Logic:
+    1. Check team injury report for OUT players (via ESPN xref or game_info)
+    2. For each OUT player, estimate their per-game production in the target stat
+    3. Estimate redistribution share based on the target player's usage rate
+    4. Sum up the total boost
+
+    Returns:
+    {
+        "has_vacuum": bool,
+        "injured_out": [{"name": str, "avg_stat": float, "redistributed": float}],
+        "total_boost": float,       # projected stat boost from vacuums
+        "boost_pct": float,         # boost as percentage of player's avg
+        "narrative": str,
+    }
+    """
+    cache_key = f"vacuum_{player_id}_{game_info.get('id', 0)}_{stat_key}"
+    if cache_key in USAGE_VACUUM_CACHE:
+        return USAGE_VACUUM_CACHE[cache_key]
+
+    result = {
+        "has_vacuum": False,
+        "injured_out": [],
+        "total_boost": 0.0,
+        "boost_pct": 0.0,
+        "narrative": "",
+    }
+
+    # Determine player's team
+    player_team_id = bdl_player_team_id(player_id)
+    if not player_team_id:
+        USAGE_VACUUM_CACHE[cache_key] = result
+        return result
+
+    # Get team roster and check for injured/out players via BDL
+    roster = bdl_active_roster(player_team_id)
+    if not roster:
+        USAGE_VACUUM_CACHE[cache_key] = result
+        return result
+
+    # Get the target player's season stats for context
+    field = "fg3m" if stat_key == "threes" else stat_key
+    player_games, _ = fetch_player_games_multisource(
+        player_name, player_id, stat_key, BASELINE_GAMES,
+        is_threes=(stat_key == "threes"),
+    )
+    if not player_games:
+        USAGE_VACUUM_CACHE[cache_key] = result
+        return result
+
+    player_avg = sum(g.get("value", 0) for g in player_games) / len(player_games)
+
+    # Check ESPN for injury info on teammates
+    injured_out = []
+    for teammate in roster:
+        tm_name = f"{teammate.get('first_name', '')} {teammate.get('last_name', '')}".strip()
+        tm_id = teammate.get("id")
+
+        if not tm_name or not tm_id or tm_id == player_id:
+            continue
+
+        # Check ESPN for this teammate's injury status
+        espn_info = espn_search_player(tm_name)
+        if not espn_info:
+            continue
+
+        injuries = espn_info.get("injuries", [])
+        is_out = False
+        for inj in injuries:
+            status = str(inj.get("status", "")).lower()
+            if status in ("out", "doubtful"):
+                is_out = True
+                break
+
+        if not is_out:
+            continue
+
+        # This teammate is OUT — estimate their production
+        tm_resp = _bdl_get("stats", {
+            "player_ids[]": tm_id,
+            "seasons[]": _season_year(),
+            "per_page": 10,
+        })
+        tm_games = tm_resp.get("data", [])
+
+        if not tm_games:
+            continue
+
+        tm_values = [float(g.get(field, 0) or 0) for g in tm_games]
+        if not tm_values:
+            continue
+        tm_avg = sum(tm_values) / len(tm_values)
+
+        # Only care about significant production losses (>5 pts, >1 reb/ast, etc.)
+        min_production = {"pts": 8.0, "reb": 4.0, "ast": 3.0, "threes": 1.0,
+                          "blk": 1.0, "stl": 1.0}.get(stat_key, 5.0)
+        if tm_avg < min_production:
+            continue
+
+        # Redistribution model:
+        # When a player is out, their production redistributes roughly:
+        # - 40-50% to the team's top usage player
+        # - 20-30% spread among remaining starters
+        # - The rest is absorbed by the replacement player
+        # Use the target player's relative production to estimate share
+        team_total_guess = player_avg * 4.5  # rough team total for this stat
+        player_share = player_avg / team_total_guess if team_total_guess > 0 else 0.2
+        # Higher usage players get more of the vacuum
+        redistribution_rate = min(player_share * 1.8, 0.35)
+        redistributed = tm_avg * redistribution_rate
+
+        injured_out.append({
+            "name": tm_name,
+            "avg_stat": tm_avg,
+            "redistributed": redistributed,
+        })
+
+        print(f"[VACUUM] {tm_name} OUT (avg {tm_avg:.1f} {stat_key}) -> "
+              f"{redistributed:.1f} redistributed to {player_name}")
+
+    if injured_out:
+        total_boost = sum(io["redistributed"] for io in injured_out)
+        result["has_vacuum"] = True
+        result["injured_out"] = injured_out
+        result["total_boost"] = total_boost
+        result["boost_pct"] = (total_boost / player_avg * 100) if player_avg > 0 else 0
+
+        # Build narrative
+        names = [io["name"].split()[-1] for io in injured_out]
+        avgs = [f"{io['avg_stat']:.0f}" for io in injured_out]
+        if len(names) == 1:
+            result["narrative"] = (
+                f"Usage vacuum: {names[0]} OUT ({avgs[0]} {stat_key}/g) -> "
+                f"+{total_boost:.1f} projected boost ({result['boost_pct']:.0f}%)"
+            )
+        else:
+            pairs = [f"{n} ({a})" for n, a in zip(names, avgs)]
+            result["narrative"] = (
+                f"Usage vacuum: {', '.join(pairs)} OUT -> "
+                f"+{total_boost:.1f} projected boost ({result['boost_pct']:.0f}%)"
+            )
+
+    USAGE_VACUUM_CACHE[cache_key] = result
+    return result
+
+
+# ============================================================================
 # SECTION 5: PROJECTION ENGINE
 # ============================================================================
 
@@ -2644,6 +3174,9 @@ def build_today_props(now_et: datetime = None) -> Tuple[Dict, Dict]:
                     lines_map[game_id][prop_type] = {}
                 lines_map[game_id][prop_type][player_name] = book_lines
 
+    # Enrich games with ESPN scoreboard data (Vegas O/U, B2B, spread)
+    enrich_games_map_with_espn(games_map)
+
     return (lines_map, games_map)
 
 
@@ -2833,6 +3366,31 @@ def slate_scan_edges(
             elif breakout_signals.get("breakout_tier") == "ELEVATED":
                 breakout_bonus = 5
 
+            # ---- Matchup History ----
+            stat_k_match = prop_type_to_stat_key(prop_type)
+            matchup = fetch_matchup_history(
+                player_name, player_id, opp_team, stat_k_match,
+                is_threes=prop_type_is_threes(prop_type),
+            )
+            matchup_bonus = 0
+            if matchup.get("assessment") == "FEAST":
+                matchup_bonus = 8
+            elif matchup.get("assessment") == "STRUGGLE":
+                matchup_bonus = -6
+
+            # ---- Usage Vacuum ----
+            vacuum = compute_usage_vacuum(player_name, player_id, game_info, stat_k_match)
+            vacuum_bonus = 0
+            if vacuum.get("has_vacuum"):
+                # Scale bonus by magnitude of boost
+                boost_pct = vacuum.get("boost_pct", 0)
+                if boost_pct > 20:
+                    vacuum_bonus = 10
+                elif boost_pct > 10:
+                    vacuum_bonus = 6
+                elif boost_pct > 5:
+                    vacuum_bonus = 3
+
             composite_score = (
                 proj_result.ev * 40 +           # EV is king
                 proj_result.prob_over * 30 +    # Probability matters
@@ -2841,7 +3399,9 @@ def slate_scan_edges(
                 (5 if proj_result.is_breakout else 0) +  # Breakout bonus
                 xref_score_bonus +              # Multi-source agreement bonus
                 xref_score_penalty +            # Data mismatch penalty
-                breakout_bonus                  # Pre-game signal boost
+                breakout_bonus +                # Pre-game signal boost
+                matchup_bonus +                 # Matchup history (feast/struggle)
+                vacuum_bonus                    # Usage vacuum from injuries
             )
 
             play = {
@@ -2877,6 +3437,8 @@ def slate_scan_edges(
                 "adjusted_prob": adjusted_prob,
                 "explosion": explosion,
                 "breakout_signals": breakout_signals,
+                "matchup": matchup,
+                "vacuum": vacuum,
             }
 
             # Build deep analysis narrative (ESPN-first data + cross-ref)
@@ -2890,7 +3452,7 @@ def slate_scan_edges(
                 player_name, player_id, stat_k, best_line,
                 proj_result.proj, raw_games, opp_team, is_home,
                 proj_result.breakout_evidence, hr_data, xref,
-                explosion, breakout_signals,
+                explosion, breakout_signals, matchup, vacuum,
             )
 
             plays.append(play)
@@ -3427,8 +3989,17 @@ def compute_pregame_breakout_score(
         total_score -= 4.0
 
     # ---- Signal 3: Opponent on back-to-back ----
-    # Check from ESPN scoreboard data if available
+    # Derive from enriched game data: figure out which team is the opponent
+    # and check if they're on a B2B
     opp_b2b = game_info.get("opp_back_to_back", False)
+    if not opp_b2b:
+        # Determine which side is the opponent using player's team
+        p_team_id = bdl_player_team_id(player_id)
+        home_id = game_info.get("home_team", {}).get("id", 0)
+        if p_team_id and p_team_id == home_id:
+            opp_b2b = game_info.get("away_b2b", False)
+        else:
+            opp_b2b = game_info.get("home_b2b", False)
     if opp_b2b:
         signals.append("Opp on B2B (tired legs)")
         total_score += 6.0
