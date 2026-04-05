@@ -3583,13 +3583,22 @@ def slate_scan_edges(
             if not book_lines:
                 continue
 
-            all_lines = [bl.get("line") for bl in book_lines if bl.get("line")]
-            if not all_lines:
+            # FIX: Use only main lines for consensus, exclude alt lines from Odds API
+            main_bl = [bl for bl in book_lines if not bl.get("is_alt", False) and not bl.get("source") == "odds_api"]
+            if not main_bl:
+                # Fallback: lines with standard odds range (not extreme alts)
+                main_bl = [bl for bl in book_lines if bl.get("odds", -110) >= -500 and bl.get("odds", -110) <= 180]
+            if not main_bl:
+                main_bl = book_lines  # last resort, use everything
+
+            main_line_vals = [bl.get("line") for bl in main_bl if bl.get("line")]
+            if not main_line_vals:
                 continue
 
-            consensus = consensus_line(all_lines)
+            consensus = consensus_line(main_line_vals)
+            # Match odds near the main consensus line (not grabbing +4000 alts)
             best_odds_offer = best_offer_near_consensus(consensus,
-                [(bl["line"], bl["odds"]) for bl in book_lines])
+                [(bl["line"], bl["odds"]) for bl in book_lines], tolerance=1.0)
 
             if not best_odds_offer:
                 continue
@@ -3940,15 +3949,30 @@ def plus_odds_hunt_edges(
                 if not book_lines:
                     continue
 
-                best_odds = max([bl.get("odds", -110) for bl in book_lines], default=-110)
+                # FIX: Separate main lines from alt lines
+                # Main lines = NOT from odds_api alt enrichment (odds typically -500 to +180)
+                main_lines = [bl for bl in book_lines if not bl.get("is_alt", False) and not bl.get("source") == "odds_api"]
+                if not main_lines:
+                    main_lines = [bl for bl in book_lines if bl.get("odds", -110) >= -500 and bl.get("odds", -110) <= 180]
+                if not main_lines:
+                    continue
+
+                # Use main line for consensus, not alt lines
+                main_line_vals = [bl.get("line") for bl in main_lines if bl.get("line")]
+                if not main_line_vals:
+                    continue
+                best_line = consensus_line(main_line_vals)
+
+                # FIX: Get odds AT or NEAR the main line, not max of all alts
+                # Use best_offer_near_consensus to match odds to the actual line
+                all_offers = [(bl["line"], bl["odds"]) for bl in book_lines if bl.get("line") and bl.get("odds")]
+                matched = best_offer_near_consensus(best_line, all_offers, tolerance=1.0)
+                if not matched:
+                    continue
+                best_line, best_odds = matched
+
                 if best_odds < 100:
                     continue
-
-                all_lines = [bl.get("line") for bl in book_lines if bl.get("line")]
-                if not all_lines:
-                    continue
-
-                best_line = consensus_line(all_lines)
 
                 # Get player_id from props data
                 player_id = None
@@ -3991,6 +4015,30 @@ def plus_odds_hunt_edges(
                 ev = proj_result.ev
                 if ev < 0.03:
                     continue
+
+                # FIX: Cross-reference data quality check
+                stat_k = prop_type_to_stat_key(prop_type)
+                xref = cross_reference_player(player_name, player_id, stat_k, [])
+                if xref and len(xref.get("sources", [])) > 1:
+                    bdl_a = xref.get("bdl_avg", 0)
+                    espn_a = xref.get("espn_avg", 0)
+                    if bdl_a > 0 and espn_a > 0:
+                        avg_both = (bdl_a + espn_a) / 2
+                        pct_disc = abs(bdl_a - espn_a) / avg_both * 100 if avg_both > 0 else 0
+                        if pct_disc > 40:
+                            print(f"[PLUS-ODDS SKIP] {player_name}: BDL {bdl_a:.1f} vs ESPN {espn_a:.1f} ({pct_disc:.0f}% off) — data too unreliable")
+                            continue
+
+                # FIX: Empirical hit rate check — need at least SOME evidence
+                games_for_hr, _ = fetch_player_games_multisource(
+                    player_name, player_id, stat_k, BASELINE_GAMES,
+                    is_threes=prop_type_is_threes(prop_type)
+                )
+                if games_for_hr:
+                    hits_at_line = sum(1 for g in games_for_hr if g.get("value", 0) > best_line)
+                    if hits_at_line == 0:
+                        print(f"[PLUS-ODDS SKIP] {player_name}: 0/{len(games_for_hr)} hits at {best_line}+ — no empirical support")
+                        continue
 
                 value_edge = (prob - american_to_prob(best_odds)) * 100
                 score = ev * 100 + value_edge
@@ -4529,11 +4577,21 @@ def scan_ladder_plays(
             if not book_lines:
                 continue
 
-            all_lines = [bl.get("line") for bl in book_lines if bl.get("line")]
-            if not all_lines:
+            # FIX: Use main line (not alt lines) for the player's baseline
+            main_bl = [bl for bl in book_lines if not bl.get("is_alt", False) and not bl.get("source") == "odds_api"]
+            if not main_bl:
+                main_bl = [bl for bl in book_lines if bl.get("odds", -110) >= -500 and bl.get("odds", -110) <= 180]
+            if not main_bl:
+                # If only alt lines exist, use the line with odds closest to -110 as main
+                main_bl = sorted(book_lines, key=lambda b: abs(b.get("odds", -110) - (-110)))[:1]
+            if not main_bl:
                 continue
 
-            avg_line = sum(all_lines) / len(all_lines)
+            main_line_vals = [bl.get("line") for bl in main_bl if bl.get("line")]
+            if not main_line_vals:
+                continue
+
+            avg_line = sum(main_line_vals) / len(main_line_vals)
 
             # Lower floor to 8+ to catch role players with +200 upside
             if avg_line < 8.0:
@@ -4635,8 +4693,9 @@ def scan_ladder_plays(
                 rung_hits = sum(1 for g in games if g.get("value", 0) > rung)
                 rung_hr = rung_hits / len(games) if games else 0
 
-                # Must have AT LEAST 1 historical hit at this rung
-                if rung_hits == 0:
+                # FIX: Must have AT LEAST 2 historical hits at this rung (was 1)
+                # 1 hit in 20 games = 5% is noise, not signal. Require 2+ for confidence.
+                if rung_hits < 2:
                     continue
 
                 # Blend model + empirical
@@ -4739,18 +4798,32 @@ def scan_ladder_plays(
                 narrative_parts.append(f"BREAKOUT {breakout_tier} ({breakout_score:.0f}/100): {sig_str}")
 
             # ESPN cross-reference for ladders (computed above, reused here)
+            # FIX: Flag large discrepancies (>30%) as data quality warnings
+            skip_due_to_data = False
             if ladder_xref and len(ladder_xref.get("sources", [])) > 1:
                 bdl_a = ladder_xref.get("bdl_avg", 0)
                 espn_a = ladder_xref.get("espn_avg", 0)
                 if bdl_a > 0 and espn_a > 0:
                     disc = ladder_xref.get("discrepancy", 0)
+                    # Calculate percentage discrepancy
+                    avg_of_both = (bdl_a + espn_a) / 2
+                    pct_disc = abs(bdl_a - espn_a) / avg_of_both * 100 if avg_of_both > 0 else 0
                     if disc <= 8:
                         narrative_parts.append(f"Verified: BDL/ESPN agree")
+                    elif pct_disc > 40:
+                        # >40% disagreement = unreliable data, skip this player
+                        narrative_parts.append(f"DATA WARNING: BDL {bdl_a:.1f} vs ESPN {espn_a:.1f} ({pct_disc:.0f}% off)")
+                        skip_due_to_data = True
                     else:
                         narrative_parts.append(f"BDL {bdl_a:.1f} vs ESPN {espn_a:.1f}")
                 for note in ladder_xref.get("notes", []):
                     if "INJURY" in note:
                         narrative_parts.append(note)
+
+            # Skip players with badly mismatched data sources
+            if skip_due_to_data:
+                print(f"[LADDER] SKIP {player_name}: BDL/ESPN data >40% mismatch")
+                continue
 
             narrative = " | ".join(narrative_parts)
 
