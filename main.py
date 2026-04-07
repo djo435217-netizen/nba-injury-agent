@@ -4029,16 +4029,28 @@ def plus_odds_hunt_edges(
                             print(f"[PLUS-ODDS SKIP] {player_name}: BDL {bdl_a:.1f} vs ESPN {espn_a:.1f} ({pct_disc:.0f}% off) — data too unreliable")
                             continue
 
-                # FIX: Empirical hit rate check — need at least SOME evidence
+                # FIX: Empirical hit rate check — need real evidence, not just projections
                 games_for_hr, _ = fetch_player_games_multisource(
                     player_name, player_id, stat_k, BASELINE_GAMES,
                     is_threes=prop_type_is_threes(prop_type)
                 )
-                if games_for_hr:
-                    hits_at_line = sum(1 for g in games_for_hr if g.get("value", 0) > best_line)
-                    if hits_at_line == 0:
-                        print(f"[PLUS-ODDS SKIP] {player_name}: 0/{len(games_for_hr)} hits at {best_line}+ — no empirical support")
-                        continue
+                if not games_for_hr or len(games_for_hr) < 5:
+                    print(f"[PLUS-ODDS SKIP] {player_name}: insufficient game data ({len(games_for_hr) if games_for_hr else 0} games) — cannot verify")
+                    continue
+                hits_at_line = sum(1 for g in games_for_hr if g.get("value", 0) > best_line)
+                if hits_at_line < 2:
+                    print(f"[PLUS-ODDS SKIP] {player_name}: only {hits_at_line}/{len(games_for_hr)} hits at {best_line}+ — need 2+")
+                    continue
+
+                # Compute hit rates for display and filtering
+                l5_games = games_for_hr[:5]
+                l10_games = games_for_hr[:10]
+                hr_data = hit_rates_by_window(games_for_hr, l10_games, l5_games, best_line)
+
+                # Extra guard: if 0/5 L5 AND 0/10 L10, skip — no recent evidence
+                if hr_data.get("l5_hits", 0) == 0 and hr_data.get("l10_hits", 0) == 0:
+                    print(f"[PLUS-ODDS SKIP] {player_name}: 0/5 L5 + 0/10 L10 — no recent hits")
+                    continue
 
                 value_edge = (prob - american_to_prob(best_odds)) * 100
                 score = ev * 100 + value_edge
@@ -4062,6 +4074,7 @@ def plus_odds_hunt_edges(
                     "edge": value_edge,
                     "confidence_tier": "LEAN",
                     "type": "plus_odds",
+                    "hit_rates": hr_data,
                 }
                 plays.append(play)
 
